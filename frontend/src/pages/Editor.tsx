@@ -62,7 +62,6 @@ export default function EditorPage() {
   }
 
   // Active lines when a python line is clicked
-  const activePyLines = new Set<number>(activePyLine ? [activePyLine] : [])
   const activeCLines = new Set<number>()
   const activeAsmLines = new Set<number>()
 

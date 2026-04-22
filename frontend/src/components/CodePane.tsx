@@ -1,5 +1,3 @@
-import { LineMapping } from '../api'
-
 interface Props {
   title: string
   lines: string[]
