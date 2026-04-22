@@ -3,6 +3,7 @@ Compile endpoint logic: Python → C → x86 Assembly.
 All subprocess calls run in a thread-pool to avoid blocking the event loop.
 """
 import asyncio
+import logging
 import os
 import re
 import subprocess
@@ -11,6 +12,8 @@ from functools import partial
 from typing import Dict, List, Tuple
 
 from app.transpiler import TranspileError, build_line_map, transpile
+
+logger = logging.getLogger(__name__)
 
 MAX_LINES = 200
 MAX_CHARS = 10_000
@@ -28,23 +31,15 @@ def _run_gcc(c_source: str) -> str:
         asm_path = os.path.join(tmp, "code.s")
         with open(c_path, "w") as f:
             f.write(c_source)
-        try:
-            result = subprocess.run(
-                ["gcc", "-S", "-O0", "-m32", "-o", asm_path, c_path],
-                capture_output=True,
-                text=True,
-                timeout=TIMEOUT,
-            )
-        except FileNotFoundError:
-            # gcc not found — try without -m32 (64-bit fallback)
-            result = subprocess.run(
-                ["gcc", "-S", "-O0", "-o", asm_path, c_path],
-                capture_output=True,
-                text=True,
-                timeout=TIMEOUT,
-            )
+        result = subprocess.run(
+            ["gcc", "-S", "-O0", "-m32", "-o", asm_path, c_path],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+        )
         if result.returncode != 0:
-            raise CompileError(f"GCC error:\n{result.stderr}")
+            stderr_clean = result.stderr.replace(c_path, "input.c")
+            raise CompileError(f"GCC error:\n{stderr_clean}")
         with open(asm_path) as f:
             return f.read()
 
@@ -79,17 +74,19 @@ async def compile_python(python_source: str) -> dict:
     except TranspileError as e:
         raise CompileError(str(e))
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         asm_text = await asyncio.wait_for(
             loop.run_in_executor(None, partial(_run_gcc, c_source)),
             timeout=TIMEOUT + 1,
         )
     except asyncio.TimeoutError:
+        logger.error("GCC timed out after %ds", TIMEOUT)
         raise CompileError("Compilation timed out")
     except CompileError:
         raise
     except Exception as e:
+        logger.exception("Unexpected compilation failure")
         raise CompileError(f"Compilation failed: {e}")
 
     c_to_asm = _parse_asm_line_map(asm_text)

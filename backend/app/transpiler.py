@@ -127,7 +127,9 @@ class Transpiler(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign):
         e = self.emitter
-        name = node.target.id if isinstance(node.target, ast.Name) else "?"
+        if not isinstance(node.target, ast.Name):
+            raise TranspileError(f"Line {node.lineno}: only simple variable augmented assignment supported")
+        name = node.target.id
         op = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}.get(type(node.op), "+=")
         val = self._expr(node.value)
         e.emit(f"{name} {op} {val};", node.lineno)
@@ -149,7 +151,7 @@ class Transpiler(ast.NodeVisitor):
             c_args = []
             for a in args:
                 if isinstance(a, ast.Constant) and isinstance(a.value, str):
-                    fmt_parts.append(a.value.replace('"', '\\"'))
+                    fmt_parts.append(a.value.replace('"', '\\"').replace('%', '%%'))
                 elif isinstance(a, ast.Constant) and isinstance(a.value, float):
                     fmt_parts.append("%f")
                     c_args.append(self._expr(a))

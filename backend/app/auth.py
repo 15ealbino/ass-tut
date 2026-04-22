@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from jose import JWTError, jwt
@@ -21,7 +21,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def create_token(user_id: str) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
     return jwt.encode(
         {"sub": str(user_id), "exp": expire},
         settings.SECRET_KEY,

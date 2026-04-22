@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,6 +15,8 @@ from app.auth import (
 from app.compile import CompileError, compile_python
 from app.database import get_db
 from app.schemas import CompileRequest, CompileResponse, Token, UserLogin, UserRegister
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Assembly Tutorial API")
 
@@ -66,5 +70,6 @@ async def compile_code(
     try:
         result = await compile_python(body.code)
     except CompileError as e:
+        logger.warning("Compile error for user %s: %s", _user_id, e)
         raise HTTPException(status_code=422, detail=str(e))
     return result
