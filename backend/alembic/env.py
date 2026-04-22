@@ -1,7 +1,12 @@
 import asyncio
+import sys
+import os
 from logging.config import fileConfig
 from sqlalchemy.ext.asyncio import create_async_engine
 from alembic import context
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from app.database import Base
 from app.models import User  # noqa: F401 — registers model
 
