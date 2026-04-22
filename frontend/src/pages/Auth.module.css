@@ -1,0 +1,55 @@
+.container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: #0f1117;
+}
+
+.card {
+  background: #1a1d2e;
+  border: 1px solid #2d3148;
+  border-radius: 12px;
+  padding: 40px;
+  width: 100%;
+  max-width: 400px;
+}
+
+.title {
+  font-size: 24px;
+  font-weight: 700;
+  color: #7c6af5;
+  margin-bottom: 4px;
+}
+
+.subtitle {
+  color: #94a3b8;
+  font-size: 14px;
+  margin-bottom: 28px;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.error {
+  color: #f87171;
+  font-size: 13px;
+}
+
+.btn {
+  background: #7c6af5;
+  color: white;
+  padding: 11px;
+  font-size: 15px;
+  margin-top: 4px;
+}
+
+.link {
+  margin-top: 20px;
+  font-size: 13px;
+  color: #94a3b8;
+  text-align: center;
+}
