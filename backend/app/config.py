@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 60 * 24
+    DEBUG: bool = False
 
     @field_validator('SECRET_KEY')
     @classmethod

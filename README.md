@@ -56,6 +56,18 @@ Open `backend/.env` and set each variable:
 | `SECRET_KEY` | output of `openssl rand -hex 32` | JWT signing secret — change before deploying |
 | `JWT_ALGORITHM` | `HS256` | Algorithm used to sign tokens — do not change |
 | `JWT_EXPIRE_MINUTES` | `1440` | How long a login token stays valid (minutes) |
+| `DEBUG` | `true` | Seeds a dev account on startup (see below) |
+
+#### Debug / dev account
+
+When `DEBUG=true` is set in `backend/.env` (enabled by default in the checked-in `.env`), the backend automatically creates a test account on startup so you can log in immediately without registering:
+
+| Field | Value |
+|-------|-------|
+| Email | `dev@example.com` |
+| Password | `devpassword` |
+
+The seed is idempotent — if the account already exists it is left unchanged. To disable this behaviour, remove or set `DEBUG=false` in `backend/.env`. Do **not** add `DEBUG=true` to production deployments.
 
 ### 2. Create the database
 

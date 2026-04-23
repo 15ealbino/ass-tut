@@ -13,12 +13,30 @@ from app.auth import (
     verify_password,
 )
 from app.compile import CompileError, compile_python
-from app.database import get_db
+from app.config import settings
+from app.database import SessionLocal, get_db
 from app.schemas import CompileRequest, CompileResponse, Token, UserLogin, UserRegister
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Assembly Tutorial API")
+
+
+async def seed_dev_account() -> None:
+    """Create a default dev account if it does not already exist."""
+    async with SessionLocal() as db:
+        existing = await get_user_by_email(db, "dev@example.com")
+        if existing is None:
+            await create_user(db, "dev@example.com", "devpassword")
+            logger.info("Debug mode: created dev account dev@example.com")
+        else:
+            logger.info("Debug mode: dev account dev@example.com already exists, skipping")
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    if settings.DEBUG:
+        await seed_dev_account()
 
 app.add_middleware(
     CORSMiddleware,
