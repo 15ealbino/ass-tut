@@ -109,10 +109,25 @@ Open `http://localhost:5173` in your browser. The Vite dev server proxies all `/
 
 Docker Compose starts PostgreSQL, the backend (with migrations), and the frontend in one command.
 
+### 1. Set SECRET_KEY (optional for local dev)
+
+In production, set `SECRET_KEY` to a strong random value before running:
+
 ```bash
-cp .env.example .env        # only SECRET_KEY is read from the host environment
+export SECRET_KEY=$(openssl rand -hex 32)
+```
+
+For local development you can skip this step — `docker-compose.yml` provides a default value (`dev-secret-do-not-use-in-production-32x`) automatically. Never use that default in a production deployment.
+
+### 2. Start all services
+
+```bash
 docker-compose up --build
 ```
+
+The backend container automatically runs `alembic upgrade head` before starting uvicorn, so no manual migration step is needed.
+
+### 3. Open the app
 
 | Service | URL |
 |---------|-----|
@@ -120,13 +135,26 @@ docker-compose up --build
 | Backend API | `http://localhost:8000` |
 | PostgreSQL | `localhost:5432` (user: `postgres`, password: `postgres`, db: `asstut`) |
 
-To stop and remove containers (data volume is preserved):
+### 4. Dev / debug account
+
+The default docker-compose setup sets `DEBUG=true`, which seeds a test account on startup so you can log in immediately without registering:
+
+| Field | Value |
+|-------|-------|
+| Email | `dev@example.com` |
+| Password | `devpassword` |
+
+The seed is idempotent — restarting the stack will not duplicate the account.
+
+### 5. Stop the stack
+
+Preserve the postgres data volume:
 
 ```bash
 docker-compose down
 ```
 
-To also remove the database volume:
+Also delete the postgres data volume:
 
 ```bash
 docker-compose down -v
