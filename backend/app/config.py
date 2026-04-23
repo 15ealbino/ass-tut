@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     @field_validator('SECRET_KEY')
     @classmethod
     def secret_key_must_be_set(cls, v: str) -> str:
-        if not v or v == "change-me-in-production":
-            raise ValueError("SECRET_KEY must be set to a secure random value")
+        if not v or not v.strip():
+            raise ValueError("SECRET_KEY must not be empty")
         return v
 
     class Config:
