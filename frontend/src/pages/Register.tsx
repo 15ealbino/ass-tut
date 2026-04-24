@@ -32,7 +32,7 @@ export default function RegisterPage() {
         <p className={styles.subtitle}>Create your account</p>
         <form onSubmit={submit} className={styles.form}>
           <input type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} required />
-          <input type="password" placeholder="Password (min 8 chars)" value={password} onChange={e => setPassword(e.target.value)} minLength={8} maxLength={72} required />
+          <input type="password" placeholder="Password (min 8 chars)" value={password} onChange={e => setPassword(e.target.value)} minLength={8} maxLength={100} required />
           {error && <p className={styles.error}>{error}</p>}
           <button type="submit" className={styles.btn} disabled={loading}>
             {loading ? 'Creating account…' : 'Register'}

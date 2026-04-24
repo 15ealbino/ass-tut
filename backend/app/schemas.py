@@ -3,7 +3,7 @@ from typing import Dict, List
 
 class UserRegister(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=72)
+    password: str = Field(min_length=8, max_length=100)
 
 class UserLogin(BaseModel):
     email: EmailStr
