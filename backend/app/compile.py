@@ -32,7 +32,7 @@ def _run_gcc(c_source: str) -> str:
         with open(c_path, "w") as f:
             f.write(c_source)
         result = subprocess.run(
-            ["gcc", "-S", "-O0", "-m32", "-o", asm_path, c_path],
+            ["gcc", "-S", "-O0", "-m32", "-g1", "-o", asm_path, c_path],
             capture_output=True,
             text=True,
             timeout=TIMEOUT,
@@ -44,22 +44,53 @@ def _run_gcc(c_source: str) -> str:
             return f.read()
 
 
-def _parse_asm_line_map(asm_text: str) -> Dict[int, List[int]]:
+def _parse_asm_line_map(asm_text: str) -> Tuple[Dict[int, List[int]], str]:
     """
-    Parse GCC .loc directives to build c_lineno → [asm_lineno] mapping.
-    GCC emits:   .loc 1 <c_line> 0
+    Parse GCC .loc directives to build c_lineno → [display_asm_lineno] mapping.
+    Strips .loc and .file directives plus .debug_* sections from the returned
+    display text so the frontend never sees them.
     """
     c_to_asm: Dict[int, List[int]] = {}
     current_c_line: int | None = None
-    asm_lines = asm_text.splitlines()
-    for asm_lineno, line in enumerate(asm_lines, start=1):
+    display_lines: List[str] = []
+    in_debug_section = False
+
+    for line in asm_text.splitlines():
         stripped = line.strip()
+
+        # Enter / stay in a .debug_* section — skip everything in it
+        if re.match(r'\.section\s+\.debug', stripped):
+            in_debug_section = True
+        if in_debug_section:
+            # Leave when we hit a new .section that isn't .debug_*
+            if re.match(r'\.section\b', stripped) and not re.match(r'\.section\s+\.debug', stripped):
+                in_debug_section = False
+            else:
+                continue
+
+        # .file directives are debug-only noise
+        if stripped.startswith('.file'):
+            continue
+
+        # Parse .loc but don't emit it to the display
         m = re.match(r'\.loc\s+\d+\s+(\d+)', stripped)
         if m:
             current_c_line = int(m.group(1))
-        elif current_c_line is not None and not stripped.startswith('.') and stripped:
-            c_to_asm.setdefault(current_c_line, []).append(asm_lineno)
-    return c_to_asm
+            continue
+
+        display_lines.append(line)
+        display_lineno = len(display_lines)  # 1-indexed in the filtered output
+
+        is_instruction = (
+            current_c_line is not None
+            and stripped
+            and not stripped.startswith('.')
+            and not stripped.endswith(':')
+        )
+        if is_instruction:
+            c_to_asm.setdefault(current_c_line, []).append(display_lineno)
+
+    return c_to_asm, '\n'.join(display_lines)
 
 
 async def compile_python(python_source: str) -> dict:
@@ -89,14 +120,14 @@ async def compile_python(python_source: str) -> dict:
         logger.exception("Unexpected compilation failure")
         raise CompileError(f"Compilation failed: {e}")
 
-    c_to_asm = _parse_asm_line_map(asm_text)
+    c_to_asm, filtered_asm = _parse_asm_line_map(asm_text)
     line_map = build_line_map(lines, py_to_c, c_to_asm)
 
     return {
         "python_lines": lines,
         "c_code": c_source,
         "c_lines": c_source.splitlines(),
-        "asm_code": asm_text,
-        "asm_lines": asm_text.splitlines(),
+        "asm_code": filtered_asm,
+        "asm_lines": filtered_asm.splitlines(),
         "line_map": line_map,
     }

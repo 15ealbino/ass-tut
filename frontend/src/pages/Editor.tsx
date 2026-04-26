@@ -5,6 +5,7 @@ import { useState } from 'react'
 import { compile, clearToken, CompileResponse, LineMapping } from '../api'
 import { useNavigate } from 'react-router-dom'
 import CodePane from '../components/CodePane'
+import AsmPane, { AsmLineInfo } from '../components/AsmPane'
 
 const STARTER = `# Welcome! Write Python below and click Compile.
 x = 10
@@ -50,14 +51,19 @@ export default function EditorPage() {
   const pyHighlight: Record<number, string> = {}
   const cHighlight: Record<number, string> = {}
   const asmHighlight: Record<number, string> = {}
+  const asmToInfo: Record<number, AsmLineInfo> = {}
 
   if (result) {
     for (const [pyLineStr, mapping] of Object.entries(result.line_map)) {
       const m = mapping as LineMapping
       const pyLine = Number(pyLineStr)
+      const pyCode = result.python_lines[pyLine - 1] ?? ''
       pyHighlight[pyLine] = m.color
       for (const cl of m.c_lines) cHighlight[cl] = m.color
-      for (const al of m.asm_lines) asmHighlight[al] = m.color
+      for (const al of m.asm_lines) {
+        asmHighlight[al] = m.color
+        asmToInfo[al] = { pyLine, pyCode, color: m.color }
+      }
     }
   }
 
@@ -134,12 +140,13 @@ export default function EditorPage() {
 
         {/* Assembly pane */}
         {result ? (
-          <CodePane
+          <AsmPane
             title="x86 Assembly"
             badge="GCC -O0"
             lines={result.asm_lines}
             highlightMap={asmHighlight}
             activeLines={activeAsmLines}
+            infoMap={asmToInfo}
           />
         ) : (
           <PlaceholderPane title="x86 Assembly" message="Click Compile to see Assembly output" />
