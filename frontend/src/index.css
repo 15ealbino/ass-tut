@@ -1,37 +1,115 @@
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600;700&display=swap');
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+:root {
+  --bg-base:       #050a0e;
+  --bg-panel:      #080d12;
+  --bg-header:     #060b0f;
+  --border-dim:    #0d2a1a;
+  --border-mid:    #174d2a;
+  --border-bright: #1f6b38;
+  --green:         #00ff41;
+  --green-dim:     #00aa2a;
+  --green-faint:   #003310;
+  --cyan:          #00e5ff;
+  --cyan-dim:      #0099aa;
+  --red:           #ff003c;
+  --red-dim:       #660018;
+  --text-primary:  #b8ffcc;
+  --text-dim:      #2f6642;
+  --text-muted:    #1a4028;
+  --glow-green:    0 0 8px #00ff4155, 0 0 2px #00ff41aa;
+  --glow-cyan:     0 0 8px #00e5ff55, 0 0 2px #00e5ffaa;
+  --glow-red:      0 0 10px #ff003c88, 0 0 3px #ff003ccc;
+}
+
 body {
-  font-family: 'Segoe UI', system-ui, sans-serif;
-  background: #0f1117;
-  color: #e2e8f0;
+  font-family: 'Fira Code', 'JetBrains Mono', 'Cascadia Code', monospace;
+  background: var(--bg-base);
+  color: var(--text-primary);
   height: 100vh;
+  overflow: hidden;
 }
 
 #root { height: 100%; }
 
+/* ── Scrollbars ── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--green-dim) var(--bg-base);
+}
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-track { background: var(--bg-base); }
+*::-webkit-scrollbar-thumb {
+  background: var(--green-dim);
+  border-radius: 0;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--green); }
+
+/* ── Buttons ── */
 button {
   cursor: pointer;
-  border: none;
-  border-radius: 6px;
-  padding: 8px 16px;
-  font-size: 14px;
+  border: 1px solid var(--border-mid);
+  border-radius: 2px;
+  padding: 6px 14px;
+  font-size: 12px;
   font-weight: 600;
-  transition: opacity 0.15s;
+  font-family: 'Fira Code', monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  transition: all 0.12s;
+  background: transparent;
+  color: var(--green-dim);
 }
-button:hover { opacity: 0.85; }
-button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:hover {
+  border-color: var(--green);
+  color: var(--green);
+  box-shadow: var(--glow-green);
+  background: var(--green-faint);
+}
+button:disabled { opacity: 0.3; cursor: not-allowed; box-shadow: none; }
 
+/* ── Inputs ── */
 input {
-  background: #1e2130;
-  border: 1px solid #2d3148;
-  border-radius: 6px;
-  color: #e2e8f0;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-dim);
+  border-radius: 2px;
+  color: var(--text-primary);
   padding: 10px 14px;
-  font-size: 14px;
+  font-size: 13px;
+  font-family: 'Fira Code', monospace;
   width: 100%;
   outline: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
 }
-input:focus { border-color: #7c6af5; }
+input:focus {
+  border-color: var(--green);
+  box-shadow: var(--glow-green);
+}
 
-a { color: #7c6af5; text-decoration: none; }
-a:hover { text-decoration: underline; }
+a { color: var(--cyan); text-decoration: none; }
+a:hover { color: var(--green); text-decoration: underline; }
+
+/* ── Blinking cursor animation ── */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+.cursor-blink { animation: blink 1s step-end infinite; }
+
+/* ── Scanline overlay (subtle) ── */
+body::after {
+  content: '';
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 255, 65, 0.015) 2px,
+    rgba(0, 255, 65, 0.015) 4px
+  );
+  z-index: 9999;
+}

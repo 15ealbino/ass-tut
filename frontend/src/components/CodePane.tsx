@@ -9,12 +9,54 @@ interface Props {
 
 export default function CodePane({ title, lines, highlightMap, activeLines, onLineClick, badge }: Props) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, background: '#12151f', borderRadius: 8, overflow: 'hidden', border: '1px solid #2d3148' }}>
-      <div style={{ padding: '10px 16px', background: '#1a1d2e', borderBottom: '1px solid #2d3148', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontWeight: 700, fontSize: 13, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{title}</span>
-        {badge && <span style={{ background: '#7c6af522', color: '#7c6af5', borderRadius: 4, padding: '1px 8px', fontSize: 11, fontWeight: 600 }}>{badge}</span>}
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      flex: 1,
+      minWidth: 0,
+      background: 'var(--bg-panel)',
+      borderRadius: 2,
+      overflow: 'hidden',
+      border: '1px solid var(--border-dim)',
+    }}>
+      {/* Pane title bar */}
+      <div style={{
+        padding: '7px 14px',
+        background: 'var(--bg-header)',
+        borderBottom: '1px solid var(--border-dim)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+      }}>
+        <span style={{
+          fontWeight: 700,
+          fontSize: 11,
+          color: 'var(--text-dim)',
+          textTransform: 'uppercase',
+          letterSpacing: '0.14em',
+          fontFamily: 'Fira Code, monospace',
+        }}>
+          &gt;_ {title}
+        </span>
+        {badge && (
+          <span style={{
+            background: 'var(--cyan)18',
+            color: 'var(--cyan)',
+            border: '1px solid var(--cyan)44',
+            borderRadius: 2,
+            padding: '0 6px',
+            fontSize: 9,
+            fontWeight: 700,
+            letterSpacing: '0.1em',
+            fontFamily: 'Fira Code, monospace',
+          }}>
+            {badge}
+          </span>
+        )}
       </div>
-      <div style={{ overflowY: 'auto', flex: 1, padding: '8px 0' }}>
+
+      {/* Line list */}
+      <div style={{ overflowY: 'auto', flex: 1, padding: '4px 0' }}>
         {lines.map((line, i) => {
           const lineNo = i + 1
           const color = highlightMap[lineNo]
@@ -27,43 +69,52 @@ export default function CodePane({ title, lines, highlightMap, activeLines, onLi
                 display: 'flex',
                 alignItems: 'stretch',
                 cursor: onLineClick ? 'pointer' : 'default',
-                background: isActive && color ? `${color}22` : 'transparent',
-                transition: 'background 0.12s',
+                background: isActive && color ? `${color}18` : 'transparent',
+                boxShadow: isActive && color ? `inset 0 0 12px ${color}11` : 'none',
+                transition: 'background 0.1s, box-shadow 0.1s',
               }}
             >
-              {/* color stripe */}
+              {/* Color stripe */}
               <div style={{
-                width: 4,
+                width: 3,
                 flexShrink: 0,
                 background: color ?? 'transparent',
-                opacity: isActive ? 1 : color ? 0.35 : 0,
-                transition: 'opacity 0.12s',
+                opacity: isActive ? 1 : color ? 0.5 : 0,
+                boxShadow: isActive && color ? `0 0 6px ${color}` : 'none',
+                transition: 'opacity 0.1s',
               }} />
-              {/* line number */}
+
+              {/* Line number */}
               <div style={{
                 width: 36,
                 textAlign: 'right',
                 paddingRight: 10,
-                color: '#4a5568',
-                fontSize: 12,
-                fontFamily: 'monospace',
+                color: 'var(--text-muted)',
+                fontSize: 11,
+                fontFamily: 'Fira Code, monospace',
                 userSelect: 'none',
                 lineHeight: '22px',
                 flexShrink: 0,
-              }}>{lineNo}</div>
-              {/* code */}
+              }}>
+                {lineNo}
+              </div>
+
+              {/* Code text */}
               <pre style={{
                 flex: 1,
-                fontSize: 13,
+                fontSize: 12,
                 fontFamily: '"Fira Code", "Cascadia Code", monospace',
                 lineHeight: '22px',
-                color: isActive ? '#f8fafc' : '#cbd5e1',
+                color: isActive ? '#e8ffe8' : 'var(--text-primary)',
                 margin: 0,
                 paddingRight: 12,
                 whiteSpace: 'pre',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
-              }}>{line}</pre>
+                textShadow: isActive && color ? `0 0 8px ${color}66` : 'none',
+              }}>
+                {line}
+              </pre>
             </div>
           )
         })}

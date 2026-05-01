@@ -2,13 +2,11 @@ import logging
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import (
     create_token,
     create_user,
-    decode_token,
     get_user_by_email,
     verify_password,
 )
@@ -46,17 +44,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-bearer = HTTPBearer()
-
-
-async def get_current_user_id(
-    creds: HTTPAuthorizationCredentials = Depends(bearer),
-) -> str:
-    user_id = decode_token(creds.credentials)
-    if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    return user_id
-
 
 @app.get("/health")
 async def health():
@@ -81,13 +68,10 @@ async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/compile", response_model=CompileResponse)
-async def compile_code(
-    body: CompileRequest,
-    _user_id: str = Depends(get_current_user_id),
-):
+async def compile_code(body: CompileRequest):
     try:
         result = await compile_python(body.code)
     except CompileError as e:
-        logger.warning("Compile error for user %s: %s", _user_id, e)
+        logger.warning("Compile error: %s", e)
         raise HTTPException(status_code=422, detail=str(e))
     return result
