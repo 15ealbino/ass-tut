@@ -1,7 +1,15 @@
+import { useState } from 'react'
+
 export interface AsmLineInfo {
   pyLine: number
   pyCode: string
   color: string
+}
+
+export interface VulnAdvisory {
+  name: string
+  severity: string
+  explanation: string
 }
 
 interface Props {
@@ -11,6 +19,7 @@ interface Props {
   activeLines: Set<number>
   infoMap: Record<number, AsmLineInfo>
   badge?: string
+  vuln?: VulnAdvisory | null
 }
 
 const MNEMONIC_MAP: Record<string, string> = {
@@ -65,12 +74,18 @@ const MNEMONIC_MAP: Record<string, string> = {
   shrl: 'logical right shift (32-bit)',
   shrq: 'logical right shift (64-bit)',
   notl: 'bitwise NOT (32-bit)',
-  negl: 'negate (two\'s complement)',
+  negl: "negate (two's complement)",
   cdq: 'sign-extend eax → edx:eax',
   cltd: 'sign-extend for divide',
   nop: 'no operation',
   endbr32: 'control-flow enforcement hint',
   endbr64: 'control-flow enforcement hint',
+}
+
+const SEVERITY_COLOR: Record<string, string> = {
+  CRITICAL: 'var(--red)',
+  HIGH: '#ff8c00',
+  MEDIUM: 'var(--cyan)',
 }
 
 function explainAsm(line: string): string {
@@ -80,18 +95,145 @@ function explainAsm(line: string): string {
   return MNEMONIC_MAP[mnemonic] ?? ''
 }
 
-export default function AsmPane({ title, lines, highlightMap, activeLines, infoMap, badge }: Props) {
+export default function AsmPane({ title, lines, highlightMap, activeLines, infoMap, badge, vuln }: Props) {
+  const [advisoryOpen, setAdvisoryOpen] = useState(true)
+  const sevColor = vuln ? (SEVERITY_COLOR[vuln.severity] ?? 'var(--red)') : 'var(--red)'
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, background: '#12151f', borderRadius: 8, overflow: 'hidden', border: '1px solid #2d3148' }}>
-      {/* Header */}
-      <div style={{ padding: '10px 16px', background: '#1a1d2e', borderBottom: '1px solid #2d3148', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontWeight: 700, fontSize: 13, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{title}</span>
-        {badge && <span style={{ background: '#7c6af522', color: '#7c6af5', borderRadius: 4, padding: '1px 8px', fontSize: 11, fontWeight: 600 }}>{badge}</span>}
-        <span style={{ marginLeft: 'auto', fontSize: 11, color: '#475569' }}>click legend chip to highlight</span>
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      flex: 1,
+      minWidth: 0,
+      background: 'var(--bg-panel)',
+      borderRadius: 2,
+      overflow: 'hidden',
+      border: vuln ? `1px solid ${sevColor}55` : '1px solid var(--border-dim)',
+      boxShadow: vuln ? `0 0 14px ${sevColor}22` : 'none',
+      transition: 'border-color 0.2s, box-shadow 0.2s',
+    }}>
+
+      {/* Pane title bar */}
+      <div style={{
+        padding: '7px 14px',
+        background: 'var(--bg-header)',
+        borderBottom: '1px solid var(--border-dim)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        flexShrink: 0,
+      }}>
+        <span style={{
+          fontWeight: 700,
+          fontSize: 11,
+          color: 'var(--text-dim)',
+          textTransform: 'uppercase',
+          letterSpacing: '0.14em',
+          fontFamily: 'Fira Code, monospace',
+        }}>
+          &gt;_ {title}
+        </span>
+        {badge && (
+          <span style={{
+            background: '#00ff4118',
+            color: 'var(--green)',
+            border: '1px solid #00ff4144',
+            borderRadius: 2,
+            padding: '0 6px',
+            fontSize: 9,
+            fontWeight: 700,
+            letterSpacing: '0.1em',
+            fontFamily: 'Fira Code, monospace',
+          }}>
+            {badge}
+          </span>
+        )}
+        <span style={{
+          marginLeft: 'auto',
+          fontSize: 10,
+          color: 'var(--text-muted)',
+          letterSpacing: '0.06em',
+          fontFamily: 'Fira Code, monospace',
+        }}>
+          CLICK LEGEND TO TRACE
+        </span>
       </div>
 
-      {/* Lines */}
-      <div style={{ overflowY: 'auto', flex: 1, padding: '8px 0' }}>
+      {/* Security advisory banner — only shown when a vuln is active */}
+      {vuln && (
+        <div style={{
+          background: '#1a0008',
+          borderLeft: `3px solid ${sevColor}`,
+          borderBottom: `1px solid ${sevColor}55`,
+          boxShadow: `inset 0 0 20px ${sevColor}0a, 0 2px 8px ${sevColor}22`,
+          flexShrink: 0,
+        }}>
+          {/* Advisory header row */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '6px 10px',
+          }}>
+            <span style={{
+              fontSize: 10,
+              fontWeight: 700,
+              color: sevColor,
+              fontFamily: 'Fira Code, monospace',
+              letterSpacing: '0.08em',
+              flex: 1,
+            }}>
+              [!] SECURITY ADVISORY :: {vuln.name}
+            </span>
+            <span style={{
+              fontSize: 8,
+              fontWeight: 700,
+              color: sevColor,
+              border: `1px solid ${sevColor}`,
+              borderRadius: 2,
+              padding: '1px 5px',
+              fontFamily: 'Fira Code, monospace',
+              letterSpacing: '0.08em',
+              flexShrink: 0,
+            }}>
+              {vuln.severity}
+            </span>
+            {/* Collapse toggle */}
+            <button
+              onClick={() => setAdvisoryOpen(o => !o)}
+              style={{
+                fontSize: 10,
+                color: 'var(--text-dim)',
+                border: `1px solid var(--border-dim)`,
+                padding: '1px 6px',
+                flexShrink: 0,
+              }}
+              title={advisoryOpen ? 'Collapse advisory' : 'Expand advisory'}
+            >
+              {advisoryOpen ? '[-]' : '[+]'}
+            </button>
+          </div>
+
+          {/* Advisory body */}
+          {advisoryOpen && (
+            <div style={{
+              padding: '0 10px 8px 10px',
+              fontSize: 11,
+              color: 'var(--text-dim)',
+              fontFamily: 'Fira Code, monospace',
+              lineHeight: 1.6,
+              letterSpacing: '0.02em',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+            }}>
+              {vuln.explanation}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Assembly line list */}
+      <div style={{ overflowY: 'auto', flex: 1, padding: '4px 0' }}>
         {lines.map((line, i) => {
           const lineNo = i + 1
           const color = highlightMap[lineNo]
@@ -105,82 +247,94 @@ export default function AsmPane({ title, lines, highlightMap, activeLines, infoM
               style={{
                 display: 'flex',
                 alignItems: 'stretch',
-                background: isActive && color ? `${color}22` : 'transparent',
-                transition: 'background 0.12s',
+                background: isActive && color ? `${color}18` : 'transparent',
+                boxShadow: isActive && color ? `inset 0 0 16px ${color}0d` : 'none',
+                transition: 'background 0.1s',
               }}
             >
-              {/* color stripe */}
+              {/* Color stripe */}
               <div style={{
-                width: 4,
+                width: 3,
                 flexShrink: 0,
                 background: color ?? 'transparent',
-                opacity: isActive ? 1 : color ? 0.8 : 0,
-                transition: 'opacity 0.12s',
+                opacity: isActive ? 1 : color ? 0.7 : 0,
+                boxShadow: isActive && color ? `0 0 8px ${color}` : 'none',
+                transition: 'opacity 0.1s',
               }} />
 
-              {/* line number */}
+              {/* Line number */}
               <div style={{
                 width: 36,
                 textAlign: 'right',
                 paddingRight: 10,
-                color: '#4a5568',
-                fontSize: 12,
-                fontFamily: 'monospace',
+                color: 'var(--text-muted)',
+                fontSize: 11,
+                fontFamily: 'Fira Code, monospace',
                 userSelect: 'none',
                 lineHeight: '22px',
                 flexShrink: 0,
-              }}>{lineNo}</div>
+              }}>
+                {lineNo}
+              </div>
 
-              {/* code */}
+              {/* Assembly instruction */}
               <pre style={{
                 flex: 1,
-                fontSize: 13,
+                fontSize: 12,
                 fontFamily: '"Fira Code", "Cascadia Code", monospace',
                 lineHeight: '22px',
-                color: isActive ? '#f8fafc' : '#cbd5e1',
+                color: isActive ? '#ccffcc' : 'var(--text-primary)',
                 margin: 0,
                 paddingRight: 8,
                 whiteSpace: 'pre',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
-              }}>{line}</pre>
+                textShadow: isActive && color ? `0 0 8px ${color}55` : 'none',
+              }}>
+                {line}
+              </pre>
 
-              {/* comment column */}
+              {/* Annotation column */}
               <div style={{
-                width: 210,
+                width: 220,
                 flexShrink: 0,
                 display: 'flex',
                 alignItems: 'center',
                 gap: 5,
-                paddingRight: 10,
-                borderLeft: '1px solid #1e2235',
                 paddingLeft: 8,
+                paddingRight: 10,
+                borderLeft: '1px solid var(--border-dim)',
                 overflow: 'hidden',
               }}>
                 {info && (
                   <span style={{
-                    fontSize: 10,
+                    fontSize: 9,
                     fontWeight: 700,
                     color: info.color,
                     background: `${info.color}22`,
-                    borderRadius: 3,
+                    border: `1px solid ${info.color}44`,
+                    borderRadius: 2,
                     padding: '1px 5px',
                     flexShrink: 0,
-                    fontFamily: 'monospace',
+                    fontFamily: 'Fira Code, monospace',
+                    letterSpacing: '0.04em',
+                    boxShadow: isActive ? `0 0 4px ${info.color}55` : 'none',
                   }}>
-                    py.{info.pyLine}
+                    PY:{info.pyLine}
                   </span>
                 )}
                 {explanation && (
                   <span style={{
-                    fontSize: 11,
-                    color: isActive ? '#94a3b8' : '#475569',
+                    fontSize: 10,
+                    color: isActive ? 'var(--cyan)' : 'var(--text-dim)',
                     whiteSpace: 'nowrap',
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
-                    fontFamily: 'system-ui, sans-serif',
+                    fontFamily: 'Fira Code, monospace',
+                    letterSpacing: '0.02em',
+                    textShadow: isActive ? 'var(--glow-cyan)' : 'none',
                   }}>
-                    {explanation}
+                    // {explanation}
                   </span>
                 )}
               </div>
