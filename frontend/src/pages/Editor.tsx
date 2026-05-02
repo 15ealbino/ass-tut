@@ -24,145 +24,163 @@ const VULNS: Vuln[] = [
     name: 'STACK BUFFER OVERFLOW',
     severity: 'CRITICAL',
     category: 'Memory Corruption',
-    description: 'Loop writes past a fixed-size buffer boundary.',
+    description: 'Loop smashes past a fixed stack frame, clobbering the return address.',
     explanation:
-      'A stack buffer overflow occurs when a program writes beyond the end of a fixed-size buffer allocated on the stack. ' +
-      'An attacker supplies input larger than the buffer to overwrite adjacent stack data — including the saved return address — ' +
-      'redirecting execution to attacker-controlled shellcode. ' +
-      'In the assembly, watch for `subq` allocating a small fixed frame (e.g. -32(%rbp)) while a loop counter ' +
-      'driven by `addl`/`cmpl` iterates well past that boundary, overwriting the return address stored just above the frame.',
+      'Classic stack smashing: a fixed-size buffer lives on the stack, but the loop bound comes from ' +
+      'attacker-controlled input. Once the write index exceeds the buffer, subsequent iterations overwrite ' +
+      'adjacent stack slots — first local variables, then the saved frame pointer, then the return address. ' +
+      'The attacker points the return address at shellcode or a ROP gadget. ' +
+      'In the assembly, `subq $N, %rsp` allocates a small fixed frame while the loop\'s `cmpl` compares ' +
+      'against a much larger bound; the `movl` inside the loop reaches past %rbp once the index exceeds N/4.',
     code:
-`# Stack buffer overflow: fixed buffer of 8, loop runs 16 iterations
-def fill_buffer():
+`# CVE pattern: fixed stack buf[8], loop bound 64 — smashes return addr
+def copy_input():
     buf_size = 8
-    total_writes = 16
-    value = 0
+    input_len = 64
+    total = 0
     i = 0
-    while i < total_writes:
-        value += i
+    while i < input_len:
+        total += i
         if i >= buf_size:
-            print(value)
+            total += 1
         i += 1
-    return value
+    return total
 
-result = fill_buffer()
+result = copy_input()
 print(result)
 `,
   },
   {
-    id: 'int-overflow',
-    name: 'INTEGER OVERFLOW',
-    severity: 'HIGH',
-    category: 'Arithmetic Error',
-    description: 'Multiplication wraps past 32-bit signed maximum.',
-    explanation:
-      'Integer overflow happens when an arithmetic result exceeds the maximum value of its storage type, ' +
-      'silently wrapping to a small or negative number. ' +
-      'Attackers exploit this to cause under-allocated buffers: a size calculation overflows to a tiny value, ' +
-      'then the program copies full-sized data into the under-allocated region. ' +
-      'The assembly reveals this via `imull` operating on two large 32-bit operands — ' +
-      'the CPU truncates the 64-bit product to 32 bits and stores the wrapped result with `movl`.',
-    code:
-`# Integer overflow: 50000 * 50000 exceeds 32-bit signed max (2147483647)
-def calc_allocation():
-    width = 50000
-    height = 50000
-    total = width * height
-    max_int32 = 2147483647
-    if total > max_int32:
-        print(total)
-    else:
-        print(0)
-    return total
-
-size = calc_allocation()
-print(size)
-`,
-  },
-  {
-    id: 'format-string',
-    name: 'FORMAT STRING',
-    severity: 'HIGH',
-    category: 'Injection',
-    description: 'User input embedded in format output without sanitization.',
-    explanation:
-      'A format string vulnerability occurs when attacker-controlled data is passed directly as a format specifier ' +
-      'rather than as a plain argument, letting the attacker read stack memory or write arbitrary values. ' +
-      'Classically exploited via printf(user_input) instead of printf("%s", user_input). ' +
-      'In the assembly, the unsanitized value is loaded into %rdi (the first argument register) via `movq` ' +
-      'and passed directly to the `call` for the output function — no sanitization instructions appear between load and call.',
-    code:
-`# Format string: raw user-controlled value used as output argument
-def log_message():
-    user_input = 1094861636
-    prefix = 0
-    combined = prefix + user_input
-    print(combined)
-    return combined
-
-def process():
-    code = log_message()
-    if code > 0:
-        print(code)
-    return code
-
-process()
-`,
-  },
-  {
-    id: 'use-after-free',
-    name: 'USE-AFTER-FREE',
+    id: 'heap-uaf',
+    name: 'HEAP USE-AFTER-FREE',
     severity: 'CRITICAL',
     category: 'Memory Corruption',
-    description: 'Memory accessed after it has been freed/zeroed.',
+    description: 'Object fields accessed after the object is freed and its memory reclaimed.',
     explanation:
-      'Use-after-free occurs when a program dereferences a pointer after the memory it points to has been freed. ' +
-      'Attackers reclaim the freed memory with controlled data and wait for the dangling pointer to be used, ' +
-      'achieving arbitrary code execution or data corruption. ' +
-      'The assembly shows the pointer value loaded from the stack into a register, a zeroing sequence (simulating free), ' +
-      'and then a subsequent `movl`/`movq` that dereferences the same register address — ' +
-      'at runtime the memory region now contains attacker data.',
+      'Use-after-free is behind a huge share of browser CVEs (Chrome, Firefox, Safari). ' +
+      'The allocator is free to hand the released chunk to a different allocation; ' +
+      'if an attacker triggers a heap spray first, they control what bytes now occupy the old slot. ' +
+      'The object\'s method dispatch reads a function pointer from the now-attacker-controlled memory, ' +
+      'redirecting execution. ' +
+      'In the assembly, the struct is zeroed (ptr = 0, size = 0 simulates free), yet the subsequent ' +
+      '`movl` still reads from the same stack offset — at runtime that region holds attacker data.',
     code:
-`# Use-after-free: ptr is zeroed (freed) then dereferenced again
-def process_object():
-    ptr = 255
-    data = ptr * 2
-    ptr = 0
-    if data > 0:
-        result = data + ptr
-        print(result)
-    return data
+`# CVE pattern: object freed (zeroed), dangling field access follows
+class Chunk:
+    def __init__(self, size):
+        self.size = size
+        self.data = size * 4
+        self.freed = 0
 
-val = process_object()
-print(val)
+    def read(self):
+        result = self.data + self.size
+        return result
+
+c = Chunk(64)
+c.freed = 1
+c.size = 0
+c.data = 0
+stale = c.read()
+print(stale)
 `,
   },
   {
-    id: 'null-deref',
-    name: 'NULL POINTER DEREF',
-    severity: 'HIGH',
-    category: 'Memory Error',
-    description: 'Dereference of unvalidated null/zero pointer causes crash.',
+    id: 'vtable-hijack',
+    name: 'VTABLE HIJACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker overwrites a function-pointer field to redirect virtual dispatch.',
     explanation:
-      'A null pointer dereference occurs when code reads or writes through a pointer that holds address zero, ' +
-      'crashing the process or — on systems without null-page protection — executing attacker-mapped shellcode at address 0. ' +
-      'Attackers exploit missing null checks after allocation failures or error returns. ' +
-      'In the assembly, `testl %eax, %eax` or `cmpq $0` checks are absent before the pointer is used in a `movq (%rax)` ' +
-      'dereference — the CPU accesses address 0 and raises a segmentation fault.',
+      'C++ vtable hijacking is a cornerstone exploit technique. Every polymorphic object holds a pointer ' +
+      'to its vtable — a table of function pointers for virtual methods. ' +
+      'When a use-after-free or heap overflow lets an attacker write to the object\'s memory layout, ' +
+      'they overwrite the vtable pointer (or a specific slot) with an address they control. ' +
+      'The next virtual call becomes an indirect jump to attacker-chosen code. ' +
+      'In the assembly, `movl` writes 0x41414141 (AAAA) into the handler field, then `imull`/`movl` ' +
+      'uses that value directly — an attacker replaces it with a gadget or shellcode address.',
     code:
-`# Null pointer: ptr is zero; dereferencing crashes at address 0
-def read_config():
-    ptr = 0
-    default = 99
-    if ptr > 0:
-        result = ptr * default
-    else:
-        result = ptr + default
-    print(result)
-    return result
+`# CVE pattern: vtable-style handler pointer overwritten by attacker
+class VTable:
+    def __init__(self, handler):
+        self.handler = handler
+        self.refcount = 1
+        self.flags = 0
 
-cfg = read_config()
-print(cfg)
+    def dispatch(self):
+        result = self.handler * 2
+        self.flags += 1
+        return result
+
+vt = VTable(4196352)
+vt.handler = 1094795585
+result = vt.dispatch()
+print(result)
+`,
+  },
+  {
+    id: 'double-free',
+    name: 'DOUBLE FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Same memory block freed twice, corrupting allocator metadata.',
+    explanation:
+      'Double-free corrupts the heap allocator\'s free-list metadata. ' +
+      'Modern allocators (ptmalloc, jemalloc) use inline linked-list pointers in freed chunks. ' +
+      'Freeing the same chunk twice lets an attacker — who controls a subsequent allocation — ' +
+      'overwrite those pointers, turning the next malloc into an arbitrary-write primitive. ' +
+      'Exploited in CVE-2019-11477 (Linux TCP SACK), CVE-2022-0185, and many others. ' +
+      'The assembly shows free_count incremented twice from the same base address; ' +
+      'a real allocator would detect this via its tcache key check and abort, ' +
+      'but older versions silently corrupt the bin.',
+    code:
+`# CVE pattern: free() called twice on the same block
+class MemBlock:
+    def __init__(self, size):
+        self.size = size
+        self.ptr = size * 8
+        self.free_count = 0
+
+    def free(self):
+        self.ptr = 0
+        self.free_count += 1
+
+block = MemBlock(32)
+block.free()
+block.free()
+result = block.free_count
+print(result)
+`,
+  },
+  {
+    id: 'off-by-one',
+    name: 'OFF-BY-ONE OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: '<= instead of < lets the loop write one slot past the buffer end.',
+    explanation:
+      'Off-by-one overflows are deceptively simple: a single misplaced `<=` makes the loop run one ' +
+      'iteration too many, writing exactly one element past the buffer boundary. ' +
+      'On the stack this overwrites the low byte of the saved frame pointer (%rbp), ' +
+      'which the compiler uses to restore the caller\'s stack frame on return — ' +
+      'giving the attacker control of where the caller resumes execution. ' +
+      'Exploited in CVE-2021-3156 (sudo heap off-by-one), OpenSSH, and Sendmail. ' +
+      'In the assembly, the `cmpl` bound is buf_size (8) but the loop condition uses `<=` so it ' +
+      'executes with i=8, writing a 9th element one slot past the 8-element frame.',
+    code:
+`# CVE pattern: <= instead of < writes one element past the buffer
+def copy_buf():
+    buf_size = 8
+    i = 0
+    total = 0
+    while i <= buf_size:
+        total += i
+        if i == buf_size:
+            total += 9999
+        i += 1
+    return total
+
+result = copy_buf()
+print(result)
 `,
   },
   {
@@ -170,94 +188,108 @@ print(cfg)
     name: 'COMMAND INJECTION',
     severity: 'CRITICAL',
     category: 'Injection',
-    description: 'Unsanitized user input concatenated into a shell command.',
+    description: 'Unsanitized user-controlled value piped into a shell command.',
     explanation:
-      'Command injection lets an attacker embed shell metacharacters (;, &&, |, $()) in user-supplied input ' +
-      'that is passed to a shell interpreter, executing arbitrary commands with the application\'s privileges. ' +
-      'Even a numeric input field is dangerous if not strictly validated before concatenation. ' +
-      'The assembly reveals this pattern via a sequence of `leaq` (load string address) and `addq`/`movq` operations ' +
-      'that concatenate user data into a buffer which is then passed to `call system` — ' +
-      'no character-filtering instructions appear in between.',
+      'Command injection lets an attacker embed shell metacharacters — ; && | $() — in any field ' +
+      'that reaches a shell interpreter. Even a numeric parameter is dangerous if passed through ' +
+      'string concatenation: "ping -c 1 " + user_ip becomes "ping -c 1 127.0.0.1; cat /etc/passwd" ' +
+      'when the attacker supplies "127.0.0.1; cat /etc/passwd". ' +
+      'The assembly shows the user-supplied value loaded via `movl` then added directly into a buffer ' +
+      'passed to the output call — no range check or character-filter instructions appear between ' +
+      'the load and the `call`. In a real system this buffer feeds system() or execve().',
     code:
-`# Command injection: user_input concatenated into command string unsanitized
-def build_command():
-    base = 1000
-    user_input = 42
-    command = base + user_input
-    print(command)
-    return command
+`# CVE pattern: user value reaches exec pipeline without validation
+class ShellRunner:
+    def __init__(self, base_cmd):
+        self.base_cmd = base_cmd
+        self.user_input = 0
+        self.executed = 0
 
-def execute():
-    cmd = build_command()
-    if cmd > 0:
-        result = cmd * 2
-        print(result)
-    return cmd
+    def set_input(self, val):
+        self.user_input = val
 
-execute()
-`,
-  },
-  {
-    id: 'int-truncation',
-    name: 'INTEGER TRUNCATION',
-    severity: 'MEDIUM',
-    category: 'Arithmetic Error',
-    description: 'Large value silently truncated when stored in smaller type.',
-    explanation:
-      'Integer truncation occurs when a value computed in a wider type (e.g. 32-bit) is stored in a narrower one (e.g. 8-bit), ' +
-      'silently discarding the high bits. ' +
-      'Attackers use this to bypass length checks: a size of 256 truncates to 0 in a byte, ' +
-      'causing a zero-length allocation followed by a full-size copy. ' +
-      'In the assembly the result of `imull` or `addl` (32-bit) is stored via `movb` (byte store), ' +
-      'and the compiler emits no overflow check between the wide computation and the narrow store.',
-    code:
-`# Integer truncation: 300 cannot fit in a byte (max 255), high bits lost
-def store_byte():
-    large_val = 300
-    byte_max = 255
-    truncated = large_val - byte_max - 1
-    stored = truncated
-    if stored > 0:
-        print(stored)
-    else:
-        print(0)
-    return stored
+    def run(self):
+        payload = self.base_cmd + self.user_input
+        self.executed += 1
+        return payload
 
-result = store_byte()
+runner = ShellRunner(1000)
+runner.set_input(1094861636)
+result = runner.run()
 print(result)
 `,
   },
   {
-    id: 'uninit-var',
-    name: 'UNINITIALIZED VAR',
-    severity: 'MEDIUM',
-    category: 'Memory Error',
-    description: 'Variable read before guaranteed assignment on all paths.',
+    id: 'type-confusion',
+    name: 'TYPE CONFUSION',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Object reinterpreted as a different type; fields map to attacker-controlled offsets.',
     explanation:
-      'Reading an uninitialized variable exposes whatever bytes happened to be on the stack from a previous call frame — ' +
-      'potentially leaking sensitive data like passwords, keys, or addresses that defeat ASLR. ' +
-      'Attackers craft call sequences that place useful values in the stack slot before triggering the uninitialized read. ' +
-      'In the assembly, `result` is allocated on the stack via `subq` but no `movl` initialization appears before the ' +
-      'conditional branch that may skip assignment — the `movl` that reads it at the return can fetch stale stack data.',
+      'Type confusion vulnerabilities treat memory allocated as one type as if it were a different type. ' +
+      'In C++ this commonly happens via incorrect downcasts, union misuse, or corrupted vtable pointers. ' +
+      'The attacker arranges for an object of type A to be cast to type B; field offsets differ, ' +
+      'so reading "field 0 of B" actually reads an unrelated value from A\'s layout. ' +
+      'Exploited extensively in V8 (Chrome JS engine): JIT-compiled code assumes an object\'s type tag ' +
+      'is stable, but a side-channel trick changes the tag between the check and the use. ' +
+      'In the assembly, two structs share a stack frame; the second struct\'s field reads overlap ' +
+      'the first struct\'s data — the `movl` at offset -8(%rbp) reads what was written as a size, ' +
+      'not a handler.',
     code:
-`# Uninitialized variable: result is only set on one branch
-def compute():
-    flag = 0
-    result = 0
-    if flag > 0:
-        result = 42
-    elif flag < 0:
-        result = -1
-    print(result)
-    return result
+`# CVE pattern: two structs share memory; field offsets alias
+class TypeA:
+    def __init__(self, size, data):
+        self.size = size
+        self.data = data
+        self.checksum = size + data
 
-def run():
-    x = compute()
-    if x > 0:
-        print(x)
-    return x
+class TypeB:
+    def __init__(self, handler, flags):
+        self.handler = handler
+        self.flags = flags
+        self.refcount = 1
 
-run()
+a = TypeA(256, 1094795585)
+b = TypeB(a.data, a.size)
+confused = b.handler + b.flags
+print(confused)
+`,
+  },
+  {
+    id: 'rop-gadget',
+    name: 'ROP CHAIN SETUP',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Stack smash loads attacker addresses into saved registers for a ROP chain.',
+    explanation:
+      'Return-Oriented Programming (ROP) is the primary code-execution technique on systems with ' +
+      'non-executable stack (NX/DEP). Instead of injecting shellcode, the attacker overwrites the ' +
+      'stack with a chain of return addresses — each pointing to a short "gadget" (existing code ' +
+      'ending in `ret`) that performs one small operation. Chaining gadgets achieves arbitrary computation. ' +
+      'The setup stage: a stack overflow writes attacker-chosen values into saved register slots. ' +
+      'In the assembly, `movl` stores 0xdeadbeef and 0x400600 into stack slots that the epilogue\'s ' +
+      '`popq` will restore into %rbx and %r12 — those registers become the first two gadget addresses ' +
+      'once the function returns.',
+    code:
+`# ROP setup: overflow writes gadget addresses into callee-saved slots
+def build_rop_frame():
+    saved_rbx = 3735928559
+    saved_r12 = 4195840
+    saved_r13 = 4196096
+    chain_len = 0
+    i = 0
+    while i < 8:
+        if i == 0:
+            chain_len = saved_rbx
+        elif i == 1:
+            chain_len += saved_r12
+        elif i == 2:
+            chain_len += saved_r13
+        i += 1
+    return chain_len
+
+payload = build_rop_frame()
+print(payload)
 `,
   },
 ]

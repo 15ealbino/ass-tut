@@ -54,6 +54,11 @@ class Transpiler(ast.NodeVisitor):
         self.emitter = CEmitter()
         self._declared: set = set()
         self._in_func = False
+        self._classes: Dict[str, Dict] = {}       # class_name -> {fields, methods}
+        self._instance_types: Dict[str, str] = {} # var_name -> class_name
+        self._in_method: str | None = None        # class name when inside a method
+
+    # ── main entry ─────────────────────────────────────────────────────────
 
     def transpile(self, source: str) -> Tuple[str, Dict[int, List[int]]]:
         try:
@@ -66,21 +71,28 @@ class Transpiler(ast.NodeVisitor):
         e.emit('#include <string.h>')
         e.emit('')
 
-        # Collect top-level function defs first so we can forward-declare
-        funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        # ── Emit struct typedefs and method forward-decls for all classes ──
+        class_nodes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
+        for cls in class_nodes:
+            self._register_class(cls)
+            self._emit_class_struct(cls)
+
+        # ── Forward-declare top-level functions ────────────────────────────
+        funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
         for fn in funcs:
             ret = "int"
             args = ", ".join(f"int {a.arg}" for a in fn.args.args)
             e.emit(f"{ret} {fn.name}({args});")
 
-        if funcs:
+        if funcs or class_nodes:
             e.emit('')
 
+        # ── main() ─────────────────────────────────────────────────────────
         e.emit('int main() {')
         e.indent()
 
         for node in tree.body:
-            if not isinstance(node, ast.FunctionDef):
+            if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 self.visit(node)
 
         e.emit('return 0;')
@@ -88,11 +100,101 @@ class Transpiler(ast.NodeVisitor):
         e.emit('}')
         e.emit('')
 
+        # ── Emit top-level function bodies ─────────────────────────────────
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 self._emit_func(node)
 
+        # ── Emit class method bodies ────────────────────────────────────────
+        for cls in class_nodes:
+            for method in cls.body:
+                if isinstance(method, ast.FunctionDef):
+                    self._emit_method(cls.name, method)
+
         return e.source(), e.py_to_c
+
+    # ── Class helpers ───────────────────────────────────────────────────────
+
+    def _register_class(self, cls: ast.ClassDef):
+        fields: List[str] = []
+        seen: set = set()
+        for method in cls.body:
+            if isinstance(method, ast.FunctionDef) and method.name == '__init__':
+                for stmt in ast.walk(method):
+                    if isinstance(stmt, ast.Assign):
+                        for target in stmt.targets:
+                            if (isinstance(target, ast.Attribute)
+                                    and isinstance(target.value, ast.Name)
+                                    and target.value.id == 'self'
+                                    and target.attr not in seen):
+                                fields.append(target.attr)
+                                seen.add(target.attr)
+                    elif isinstance(stmt, ast.AugAssign):
+                        if (isinstance(stmt.target, ast.Attribute)
+                                and isinstance(stmt.target.value, ast.Name)
+                                and stmt.target.value.id == 'self'
+                                and stmt.target.attr not in seen):
+                            fields.append(stmt.target.attr)
+                            seen.add(stmt.target.attr)
+        method_names = [
+            m.name for m in cls.body if isinstance(m, ast.FunctionDef)
+        ]
+        self._classes[cls.name] = {'fields': fields, 'methods': method_names}
+
+    def _emit_class_struct(self, cls: ast.ClassDef):
+        e = self.emitter
+        info = self._classes[cls.name]
+        e.emit(f"typedef struct {{")
+        e.indent()
+        for field in info['fields']:
+            e.emit(f"int {field};")
+        e.dedent()
+        e.emit(f"}} {cls.name};")
+        e.emit('')
+        for method in cls.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            sig = self._method_sig(cls.name, method)
+            e.emit(f"{sig};")
+        e.emit('')
+
+    def _method_sig(self, class_name: str, method: ast.FunctionDef) -> str:
+        args_str = ", ".join(
+            f"int {a.arg}" for a in method.args.args if a.arg != 'self'
+        )
+        sep = ", " if args_str else ""
+        if method.name == '__init__':
+            return f"void {class_name}_init({class_name}* self{sep}{args_str})"
+        return f"int {class_name}_{method.name}({class_name}* self{sep}{args_str})"
+
+    def _emit_method(self, class_name: str, method: ast.FunctionDef):
+        e = self.emitter
+        sig = self._method_sig(class_name, method)
+        e.emit(f"{sig} {{", method.lineno)
+        e.indent()
+
+        saved_declared = self._declared.copy()
+        saved_types = self._instance_types.copy()
+        saved_in_func = self._in_func
+        self._declared = {a.arg for a in method.args.args if a.arg != 'self'}
+        self._in_method = class_name
+        self._in_func = True
+
+        for child in method.body:
+            self.visit(child)
+
+        self._in_func = saved_in_func
+        self._in_method = None
+        self._declared = saved_declared
+        self._instance_types = saved_types
+
+        if method.name != '__init__':
+            e.emit('return 0;', method.end_lineno)
+        e.dedent()
+        e.emit('}')
+        e.emit('')
+
+    # ── Function emit ───────────────────────────────────────────────────────
 
     def _emit_func(self, node: ast.FunctionDef):
         e = self.emitter
@@ -100,23 +202,61 @@ class Transpiler(ast.NodeVisitor):
         e.emit(f"int {node.name}({args}) {{", node.lineno)
         e.indent()
         saved = self._declared.copy()
+        saved_types = self._instance_types.copy()
         self._declared = set(a.arg for a in node.args.args)
         self._in_func = True
         for child in node.body:
             self.visit(child)
         self._in_func = False
         self._declared = saved
+        self._instance_types = saved_types
         e.emit('return 0;', node.end_lineno)
         e.dedent()
         e.emit('}')
         e.emit('')
 
+    # ── Visitors ────────────────────────────────────────────────────────────
+
     def visit_Assign(self, node: ast.Assign):
         e = self.emitter
         for target in node.targets:
+            # self.attr = val  (inside a method)
+            if (isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == 'self'
+                    and self._in_method):
+                val = self._expr(node.value)
+                e.emit(f"self->{target.attr} = {val};", node.lineno)
+                continue
+
+            # obj.attr = val  (instance field assignment outside a method)
+            if (isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in self._instance_types):
+                val = self._expr(node.value)
+                e.emit(f"{target.value.id}.{target.attr} = {val};", node.lineno)
+                continue
+
             if not isinstance(target, ast.Name):
-                raise TranspileError(f"Line {node.lineno}: only simple variable assignment supported")
+                raise TranspileError(
+                    f"Line {node.lineno}: only simple variable assignment supported"
+                )
             name = target.id
+
+            # Constructor call: n = ClassName(args)
+            if (isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in self._classes):
+                class_name = node.value.func.id
+                args_str = ", ".join(self._expr(a) for a in node.value.args)
+                sep = ", " if args_str else ""
+                if name not in self._declared:
+                    e.emit(f"{class_name} {name};", node.lineno)
+                    self._declared.add(name)
+                    self._instance_types[name] = class_name
+                e.emit(f"{class_name}_init(&{name}{sep}{args_str});", node.lineno)
+                continue
+
             val = self._expr(node.value)
             if name not in self._declared:
                 ctype = _type_for(node.value)
@@ -127,26 +267,53 @@ class Transpiler(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign):
         e = self.emitter
-        if not isinstance(node.target, ast.Name):
-            raise TranspileError(f"Line {node.lineno}: only simple variable augmented assignment supported")
-        name = node.target.id
-        op = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}.get(type(node.op), "+=")
+        op = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}.get(
+            type(node.op), "+="
+        )
         val = self._expr(node.value)
-        e.emit(f"{name} {op} {val};", node.lineno)
+
+        # self.attr += val  (inside a method)
+        if (isinstance(node.target, ast.Attribute)
+                and isinstance(node.target.value, ast.Name)
+                and node.target.value.id == 'self'
+                and self._in_method):
+            e.emit(f"self->{node.target.attr} {op} {val};", node.lineno)
+            return
+
+        if not isinstance(node.target, ast.Name):
+            raise TranspileError(
+                f"Line {node.lineno}: only simple variable augmented assignment supported"
+            )
+        e.emit(f"{node.target.id} {op} {val};", node.lineno)
 
     def visit_Expr(self, node: ast.Expr):
         if isinstance(node.value, ast.Call):
             self._emit_call(node.value, node.lineno)
-        # ignore bare expressions otherwise
 
     def _emit_call(self, node: ast.Call, py_line: int):
         e = self.emitter
+
+        # Method call: obj.method(args)
+        if isinstance(node.func, ast.Attribute):
+            obj = node.func.value
+            method_name = node.func.attr
+            if isinstance(obj, ast.Name) and obj.id in self._instance_types:
+                class_name = self._instance_types[obj.id]
+                args_str = ", ".join(self._expr(a) for a in node.args)
+                sep = ", " if args_str else ""
+                e.emit(f"{class_name}_{method_name}(&{obj.id}{sep}{args_str});", py_line)
+                return
+            # fall through to generic attribute call
+            func_expr = self._expr(node.func)
+            args_str = ", ".join(self._expr(a) for a in node.args)
+            e.emit(f"{func_expr}({args_str});", py_line)
+            return
+
         if isinstance(node.func, ast.Name) and node.func.id == "print":
             args = node.args
             if not args:
                 e.emit('printf("\\n");', py_line)
                 return
-            # Build a format string
             fmt_parts = []
             c_args = []
             for a in args:
@@ -212,10 +379,8 @@ class Transpiler(ast.NodeVisitor):
         if node.orelse:
             if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
                 e.emit("} else ", node.orelse[0].lineno)
-                # re-emit as else-if inline
                 elif_node = node.orelse[0]
                 cond2 = self._expr(elif_node.test)
-                # patch last line
                 last = e.lines[-1]
                 e.lines[-1] = last + f"if ({cond2}) {{"
                 e.indent()
@@ -246,6 +411,9 @@ class Transpiler(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef):
         pass  # handled separately
 
+    def visit_ClassDef(self, node: ast.ClassDef):
+        pass  # handled separately
+
     def visit_Pass(self, node: ast.Pass):
         self.emitter.emit("/* pass */", node.lineno)
 
@@ -256,7 +424,11 @@ class Transpiler(ast.NodeVisitor):
         self.emitter.emit("continue;", node.lineno)
 
     def generic_visit(self, node: ast.AST):
-        raise TranspileError(f"Unsupported Python construct: {type(node).__name__} at line {getattr(node, 'lineno', '?')}")
+        raise TranspileError(
+            f"Unsupported Python construct: {type(node).__name__} at line {getattr(node, 'lineno', '?')}"
+        )
+
+    # ── Expression lowering ─────────────────────────────────────────────────
 
     def _expr(self, node: ast.expr) -> str:
         if isinstance(node, ast.Constant):
@@ -299,11 +471,32 @@ class Transpiler(ast.NodeVisitor):
             op = "&&" if isinstance(node.op, ast.And) else "||"
             return f" {op} ".join(self._expr(v) for v in node.values)
         if isinstance(node, ast.Call):
+            # Constructor call inside an expression: ClassName(args)
+            if isinstance(node.func, ast.Name) and node.func.id in self._classes:
+                raise TranspileError(
+                    f"Constructor call in expression context not supported; assign to a variable first"
+                )
+            # Instance method call in expression context: obj.method(args)
+            if (isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self._instance_types):
+                obj_id = node.func.value.id
+                class_name = self._instance_types[obj_id]
+                method_name = node.func.attr
+                args_str = ", ".join(self._expr(a) for a in node.args)
+                sep = ", " if args_str else ""
+                return f"{class_name}_{method_name}(&{obj_id}{sep}{args_str})"
             func_name = self._expr(node.func)
             args = ", ".join(self._expr(a) for a in node.args)
             return f"{func_name}({args})"
         if isinstance(node, ast.Attribute):
-            return f"{self._expr(node.value)}.{node.attr}"
+            # self.attr inside a method → pointer dereference
+            if (isinstance(node.value, ast.Name)
+                    and node.value.id == 'self'
+                    and self._in_method):
+                return f"self->{node.attr}"
+            obj = self._expr(node.value)
+            return f"{obj}.{node.attr}"
         raise TranspileError(f"Unsupported expression: {type(node).__name__}")
 
 
