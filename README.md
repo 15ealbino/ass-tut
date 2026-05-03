@@ -243,6 +243,8 @@ Returns `{"status":"ok"}`. No auth required. Useful for liveness checks.
 
 ## Deployment
 
+### Docker (self-hosted)
+
 1. Generate a strong secret key:
    ```bash
    openssl rand -hex 32
@@ -255,3 +257,161 @@ Returns `{"status":"ok"}`. No auth required. Useful for liveness checks.
 4. Migrations run automatically on backend startup (`alembic upgrade head` is the container entrypoint).
 
 For production, put a TLS-terminating reverse proxy (nginx, Caddy, etc.) in front of port 5173.
+
+---
+
+### Vercel
+
+> **gcc requirement**: The `/compile` endpoint shells out to `gcc` at runtime. Vercel's serverless runtime does not ship gcc. The auth endpoints (`/auth/register`, `/auth/login`, `/health`) work fine; the compile feature requires a runtime with gcc installed. If you need compile functionality in production, use the Docker path above on Railway, Render, or Fly.io. If you only need the auth layer on Vercel, proceed below.
+
+#### Prerequisites
+
+- [Vercel CLI](https://vercel.com/docs/cli): `npm i -g vercel`
+- An external PostgreSQL database — [Neon](https://neon.tech) offers a free tier and works with `asyncpg`
+- `openssl` to generate the secret key
+
+---
+
+#### Step 1 — Provision a PostgreSQL database
+
+Create a database on Neon (or any managed PostgreSQL provider) and copy the connection string. Prefix it with `asyncpg`:
+
+```
+postgresql+asyncpg://user:password@host/dbname?sslmode=require
+```
+
+---
+
+#### Step 2 — Run migrations against the production database
+
+From your local machine, point Alembic at the production database and apply the schema:
+
+```bash
+cd backend
+DATABASE_URL="postgresql+asyncpg://user:password@host/dbname?sslmode=require" alembic upgrade head
+```
+
+---
+
+#### Step 3 — Add backend Vercel config
+
+Create `backend/vercel.json`:
+
+```json
+{
+  "builds": [
+    { "src": "app/main.py", "use": "@vercel/python" }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "app/main.py" }
+  ]
+}
+```
+
+---
+
+#### Step 4 — Deploy the backend
+
+```bash
+cd backend
+vercel --prod
+```
+
+In the Vercel dashboard under **Project → Settings → Environment Variables**, set:
+
+| Variable | Value |
+|----------|-------|
+| `DATABASE_URL` | `postgresql+asyncpg://user:password@host/dbname?sslmode=require` |
+| `SECRET_KEY` | output of `openssl rand -hex 32` |
+| `JWT_ALGORITHM` | `HS256` |
+| `JWT_EXPIRE_MINUTES` | `1440` |
+| `DEBUG` | `false` |
+
+Note the deployed backend URL (e.g., `https://ass-tut-backend.vercel.app`) — you need it in Step 7.
+
+---
+
+#### Step 5 — Update CORS to allow the production frontend
+
+The backend currently only allows `localhost` origins. Edit `backend/app/main.py`:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://your-frontend.vercel.app",   # replace with your actual frontend URL
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+Redeploy after this change:
+
+```bash
+cd backend
+vercel --prod
+```
+
+---
+
+#### Step 6 — Wire the frontend to the production backend URL
+
+The frontend sends all requests to the relative path `/api`, which the Vite dev proxy rewrites to `localhost:8000`. In production the Vite proxy is not active, so the frontend must target the backend URL directly.
+
+Edit `frontend/src/api.ts`, line 1:
+
+```diff
+-const BASE = '/api'
++const BASE = import.meta.env.VITE_API_BASE_URL ?? '/api'
+```
+
+---
+
+#### Step 7 — Add frontend Vercel config
+
+Create `frontend/vercel.json` to handle client-side routing (React Router requires all paths to serve `index.html`):
+
+```json
+{
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
+```
+
+---
+
+#### Step 8 — Deploy the frontend
+
+```bash
+cd frontend
+vercel --prod
+```
+
+In the Vercel dashboard for the **frontend** project under **Settings → Environment Variables**, set:
+
+| Variable | Value |
+|----------|-------|
+| `VITE_API_BASE_URL` | `https://your-backend.vercel.app` (no trailing slash) |
+
+Trigger a redeploy after setting the variable so Vite bakes it into the build:
+
+```bash
+cd frontend
+vercel --prod
+```
+
+---
+
+#### Step 9 — Verify
+
+```bash
+curl https://your-backend.vercel.app/health
+# → {"status":"ok"}
+```
+
+Open `https://your-frontend.vercel.app` in a browser, register an account, and confirm login succeeds.

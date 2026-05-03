@@ -1,0 +1,1 @@
+- [Transpiler rejection test patterns](feedback_transpile_test_patterns.md) — for-loop non-range guard fires differently than expected when a list literal precedes it
