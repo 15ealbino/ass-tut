@@ -361,6 +361,23 @@ export default function EditorPage() {
   function closePane(pane: string) { setClosedPanes(prev => new Set([...prev, pane])) }
   function openPane(pane: string) { setClosedPanes(prev => { const n = new Set(prev); n.delete(pane); return n }) }
 
+  function movePane(pane: string, direction: -1 | 1) {
+    setPaneOrder(prev => {
+      const o = [...prev] as Array<'python' | 'c' | 'asm'>
+      const idx = o.indexOf(pane as 'python' | 'c' | 'asm')
+      // Skip past any closed panes to find the nearest visible neighbour
+      let swapIdx = idx + direction
+      while (swapIdx >= 0 && swapIdx < o.length) {
+        if (!closedPanes.has(o[swapIdx])) {
+          ;[o[idx], o[swapIdx]] = [o[swapIdx], o[idx]]
+          return o
+        }
+        swapIdx += direction
+      }
+      return o
+    })
+  }
+
   function handlePaneDragStart(pane: string, e: React.DragEvent) {
     dragSrc.current = pane
     e.dataTransfer.effectAllowed = 'move'
@@ -648,9 +665,12 @@ export default function EditorPage() {
 
           {/* Panes row */}
           <div style={{ display: 'flex', flex: 1, overflow: 'hidden', gap: 6 }}>
-            {paneOrder
-              .filter(p => !closedPanes.has(p))
-              .map(pane => (
+            {(() => {
+              const visible = paneOrder.filter(p => !closedPanes.has(p))
+              return visible.map((pane, idx) => {
+                const canLeft  = idx > 0
+                const canRight = idx < visible.length - 1
+                return (
                 <div
                   key={pane}
                   onDragOver={e => handlePaneDragOver(pane, e)}
@@ -689,6 +709,8 @@ export default function EditorPage() {
                         badgeColor={activeVuln ? SEVERITY_COLOR[activeVuln.severity] : 'var(--green)'}
                         onClose={() => closePane('python')}
                         onDragStart={e => handlePaneDragStart('python', e)}
+                        onMoveLeft={canLeft ? () => movePane('python', -1) : undefined}
+                        onMoveRight={canRight ? () => movePane('python', 1) : undefined}
                       />
                       <div style={{ flex: 1, overflow: 'auto' }}>
                         <CodeMirror
@@ -713,6 +735,8 @@ export default function EditorPage() {
                       activeLines={activeCLines}
                       onClose={() => closePane('c')}
                       onDragStart={e => handlePaneDragStart('c', e)}
+                      onMoveLeft={canLeft ? () => movePane('c', -1) : undefined}
+                      onMoveRight={canRight ? () => movePane('c', 1) : undefined}
                     />
                   ) : (
                     <PlaceholderPane
@@ -720,6 +744,8 @@ export default function EditorPage() {
                       badge="TRANSPILED"
                       onClose={() => closePane('c')}
                       onDragStart={e => handlePaneDragStart('c', e)}
+                      onMoveLeft={canLeft ? () => movePane('c', -1) : undefined}
+                      onMoveRight={canRight ? () => movePane('c', 1) : undefined}
                     />
                   ))}
 
@@ -739,6 +765,8 @@ export default function EditorPage() {
                       } : null}
                       onClose={() => closePane('asm')}
                       onDragStart={e => handlePaneDragStart('asm', e)}
+                      onMoveLeft={canLeft ? () => movePane('asm', -1) : undefined}
+                      onMoveRight={canRight ? () => movePane('asm', 1) : undefined}
                     />
                   ) : (
                     <PlaceholderPane
@@ -746,10 +774,13 @@ export default function EditorPage() {
                       badge="GCC -O0"
                       onClose={() => closePane('asm')}
                       onDragStart={e => handlePaneDragStart('asm', e)}
+                      onMoveLeft={canLeft ? () => movePane('asm', -1) : undefined}
+                      onMoveRight={canRight ? () => movePane('asm', 1) : undefined}
                     />
                   ))}
                 </div>
-              ))}
+              )})
+            })()}
           </div>
         </div>
       </div>
@@ -816,19 +847,20 @@ export default function EditorPage() {
 // ─── Shared sub-components ─────────────────────────────────────────────────
 
 function PaneHeader({
-  title, badge, badgeColor, onClose, onDragStart,
+  title, badge, badgeColor, onClose, onDragStart, onMoveLeft, onMoveRight,
 }: {
   title: string; badge?: string; badgeColor?: string;
   onClose?: () => void; onDragStart?: (e: React.DragEvent) => void;
+  onMoveLeft?: () => void; onMoveRight?: () => void;
 }) {
   return (
     <div style={{
-      padding: '7px 14px',
+      padding: '7px 10px',
       background: 'var(--bg-header)',
       borderBottom: '1px solid var(--border-dim)',
       display: 'flex',
       alignItems: 'center',
-      gap: 8,
+      gap: 6,
       flexShrink: 0,
     }}>
       <span
@@ -869,30 +901,36 @@ function PaneHeader({
           {badge}
         </span>
       )}
+      <span style={{ flex: 1 }} />
+      {onMoveLeft && (
+        <button onClick={onMoveLeft} title="Move pane left" style={CTRL_BTN_STYLE}>◀</button>
+      )}
+      {onMoveRight && (
+        <button onClick={onMoveRight} title="Move pane right" style={CTRL_BTN_STYLE}>▶</button>
+      )}
       {onClose && (
-        <button
-          onClick={onClose}
-          title="Close pane"
-          style={{
-            marginLeft: 'auto',
-            padding: '1px 6px',
-            fontSize: 11,
-            color: 'var(--text-muted)',
-            border: '1px solid var(--border-dim)',
-            borderRadius: 2,
-            lineHeight: 1,
-          }}
-        >×</button>
+        <button onClick={onClose} title="Close pane" style={CTRL_BTN_STYLE}>×</button>
       )}
     </div>
   )
 }
 
+const CTRL_BTN_STYLE: React.CSSProperties = {
+  padding: '1px 5px',
+  fontSize: 10,
+  color: 'var(--text-muted)',
+  border: '1px solid var(--border-dim)',
+  borderRadius: 2,
+  lineHeight: 1,
+  flexShrink: 0,
+}
+
 function PlaceholderPane({
-  title, badge, onClose, onDragStart,
+  title, badge, onClose, onDragStart, onMoveLeft, onMoveRight,
 }: {
   title: string; badge?: string;
   onClose?: () => void; onDragStart?: (e: React.DragEvent) => void;
+  onMoveLeft?: () => void; onMoveRight?: () => void;
 }) {
   return (
     <div style={{
@@ -904,7 +942,7 @@ function PlaceholderPane({
       display: 'flex',
       flexDirection: 'column',
     }}>
-      <PaneHeader title={title} badge={badge} onClose={onClose} onDragStart={onDragStart} />
+      <PaneHeader title={title} badge={badge} onClose={onClose} onDragStart={onDragStart} onMoveLeft={onMoveLeft} onMoveRight={onMoveRight} />
       <div style={{
         flex: 1,
         display: 'flex',

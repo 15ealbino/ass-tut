@@ -7,9 +7,11 @@ interface Props {
   badge?: string
   onClose?: () => void
   onDragStart?: (e: React.DragEvent<HTMLElement>) => void
+  onMoveLeft?: () => void
+  onMoveRight?: () => void
 }
 
-export default function CodePane({ title, lines, highlightMap, activeLines, onLineClick, badge, onClose, onDragStart }: Props) {
+export default function CodePane({ title, lines, highlightMap, activeLines, onLineClick, badge, onClose, onDragStart, onMoveLeft, onMoveRight }: Props) {
   return (
     <div style={{
       display: 'flex',
@@ -69,21 +71,10 @@ export default function CodePane({ title, lines, highlightMap, activeLines, onLi
             {badge}
           </span>
         )}
-        {onClose && (
-          <button
-            onClick={onClose}
-            title="Close pane"
-            style={{
-              marginLeft: 'auto',
-              padding: '1px 6px',
-              fontSize: 11,
-              color: 'var(--text-muted)',
-              border: '1px solid var(--border-dim)',
-              borderRadius: 2,
-              lineHeight: 1,
-            }}
-          >×</button>
-        )}
+        <span style={{ flex: 1 }} />
+        {onMoveLeft && <button onClick={onMoveLeft} title="Move pane left" style={CTRL_BTN}>◀</button>}
+        {onMoveRight && <button onClick={onMoveRight} title="Move pane right" style={CTRL_BTN}>▶</button>}
+        {onClose && <button onClick={onClose} title="Close pane" style={CTRL_BTN}>×</button>}
       </div>
 
       {/* Line list */}
@@ -152,4 +143,14 @@ export default function CodePane({ title, lines, highlightMap, activeLines, onLi
       </div>
     </div>
   )
+}
+
+const CTRL_BTN: React.CSSProperties = {
+  padding: '1px 5px',
+  fontSize: 10,
+  color: 'var(--text-muted)',
+  border: '1px solid var(--border-dim)',
+  borderRadius: 2,
+  lineHeight: 1,
+  flexShrink: 0,
 }

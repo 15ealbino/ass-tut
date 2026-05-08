@@ -22,6 +22,8 @@ interface Props {
   vuln?: VulnAdvisory | null
   onClose?: () => void
   onDragStart?: (e: React.DragEvent<HTMLElement>) => void
+  onMoveLeft?: () => void
+  onMoveRight?: () => void
 }
 
 const MNEMONIC_MAP: Record<string, string> = {
@@ -97,7 +99,7 @@ function explainAsm(line: string): string {
   return MNEMONIC_MAP[mnemonic] ?? ''
 }
 
-export default function AsmPane({ title, lines, highlightMap, activeLines, infoMap, badge, vuln, onClose, onDragStart }: Props) {
+export default function AsmPane({ title, lines, highlightMap, activeLines, infoMap, badge, vuln, onClose, onDragStart, onMoveLeft, onMoveRight }: Props) {
   const [advisoryOpen, setAdvisoryOpen] = useState(true)
   const sevColor = vuln ? (SEVERITY_COLOR[vuln.severity] ?? 'var(--red)') : 'var(--red)'
 
@@ -163,29 +165,19 @@ export default function AsmPane({ title, lines, highlightMap, activeLines, infoM
             {badge}
           </span>
         )}
+        <span style={{ flex: 1 }} />
         <span style={{
-          marginLeft: 'auto',
           fontSize: 10,
           color: 'var(--text-muted)',
           letterSpacing: '0.06em',
           fontFamily: 'Fira Code, monospace',
+          marginRight: 4,
         }}>
           CLICK LEGEND TO TRACE
         </span>
-        {onClose && (
-          <button
-            onClick={onClose}
-            title="Close pane"
-            style={{
-              padding: '1px 6px',
-              fontSize: 11,
-              color: 'var(--text-muted)',
-              border: '1px solid var(--border-dim)',
-              borderRadius: 2,
-              lineHeight: 1,
-            }}
-          >×</button>
-        )}
+        {onMoveLeft && <button onClick={onMoveLeft} title="Move pane left" style={CTRL_BTN}>◀</button>}
+        {onMoveRight && <button onClick={onMoveRight} title="Move pane right" style={CTRL_BTN}>▶</button>}
+        {onClose && <button onClick={onClose} title="Close pane" style={CTRL_BTN}>×</button>}
       </div>
 
       {/* Security advisory banner — only shown when a vuln is active */}
@@ -373,4 +365,14 @@ export default function AsmPane({ title, lines, highlightMap, activeLines, infoM
       </div>
     </div>
   )
+}
+
+const CTRL_BTN: React.CSSProperties = {
+  padding: '1px 5px',
+  fontSize: 10,
+  color: 'var(--text-muted)',
+  border: '1px solid var(--border-dim)',
+  borderRadius: 2,
+  lineHeight: 1,
+  flexShrink: 0,
 }
