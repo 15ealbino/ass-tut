@@ -203,11 +203,15 @@ class Transpiler(ast.NodeVisitor):
         e.indent()
         saved = self._declared.copy()
         saved_types = self._instance_types.copy()
+        saved_in_func = self._in_func
+        saved_in_method = self._in_method
         self._declared = set(a.arg for a in node.args.args)
         self._in_func = True
+        self._in_method = None  # top-level functions are not inside a class method
         for child in node.body:
             self.visit(child)
-        self._in_func = False
+        self._in_func = saved_in_func
+        self._in_method = saved_in_method
         self._declared = saved
         self._instance_types = saved_types
         e.emit('return 0;', node.end_lineno)
@@ -267,9 +271,13 @@ class Transpiler(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign):
         e = self.emitter
-        op = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}.get(
-            type(node.op), "+="
-        )
+        _AUG_OPS = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}
+        op = _AUG_OPS.get(type(node.op))
+        if op is None:
+            raise TranspileError(
+                f"Line {node.lineno}: unsupported augmented assignment operator "
+                f"{type(node.op).__name__}"
+            )
         val = self._expr(node.value)
 
         # self.attr += val  (inside a method)
@@ -433,7 +441,9 @@ class Transpiler(ast.NodeVisitor):
     def _expr(self, node: ast.expr) -> str:
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
-                escaped = node.value.replace('"', '\\"')
+                # Escape backslashes first, then double-quotes, to avoid
+                # producing invalid C strings (e.g. "a\" would be unterminated).
+                escaped = node.value.replace('\\', '\\\\').replace('"', '\\"')
                 return f'"{escaped}"'
             if isinstance(node.value, bool):
                 return "1" if node.value else "0"

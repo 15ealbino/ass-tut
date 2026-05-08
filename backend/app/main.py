@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,24 +18,35 @@ from app.schemas import CompileRequest, CompileResponse, Token, UserLogin, UserR
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Assembly Tutorial API")
-
 
 async def seed_dev_account() -> None:
-    """Create a default dev account if it does not already exist."""
+    """Create a default dev account if it does not already exist.
+
+    Password is read from settings.DEV_SEED_PASSWORD (env: DEV_SEED_PASSWORD).
+    This account must NEVER be seeded in a production environment.
+    """
+    logger.warning(
+        "DEBUG mode is ON — seeding dev account dev@example.com. "
+        "Ensure DEBUG=False and this account does not exist in production."
+    )
     async with SessionLocal() as db:
         existing = await get_user_by_email(db, "dev@example.com")
         if existing is None:
-            await create_user(db, "dev@example.com", "devpassword")
+            await create_user(db, "dev@example.com", settings.DEV_SEED_PASSWORD)
             logger.info("Debug mode: created dev account dev@example.com")
         else:
             logger.info("Debug mode: dev account dev@example.com already exists, skipping")
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
+    """Application lifespan: run startup logic, then yield, then shutdown."""
     if settings.DEBUG:
         await seed_dev_account()
+    yield
+
+
+app = FastAPI(title="Assembly Tutorial API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

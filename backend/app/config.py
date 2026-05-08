@@ -7,6 +7,10 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 60 * 24
     DEBUG: bool = False
+    # Password for the auto-seeded dev account (DEBUG=True only).
+    # Override via DEV_SEED_PASSWORD env var. Default is intentionally weak —
+    # this account must never exist in production.
+    DEV_SEED_PASSWORD: str = "devpassword"
 
     @field_validator('SECRET_KEY')
     @classmethod

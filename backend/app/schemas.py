@@ -19,7 +19,9 @@ class LineMapping(BaseModel):
     color: str
 
 class CompileRequest(BaseModel):
-    code: str
+    # Enforce the character cap at the schema layer so oversized bodies are
+    # rejected before they are fully deserialized by the application logic.
+    code: str = Field(max_length=10_000)
 
 class CompileResponse(BaseModel):
     python_lines: List[str]

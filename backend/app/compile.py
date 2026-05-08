@@ -18,6 +18,26 @@ logger = logging.getLogger(__name__)
 MAX_LINES = 200
 MAX_CHARS = 10_000
 TIMEOUT = 10  # seconds
+# Cap simultaneous gcc subprocesses to prevent resource exhaustion from unauthenticated
+# callers flooding the /compile endpoint.
+MAX_CONCURRENT_GCC = 8
+
+# Keyed by event-loop identity so each loop (including per-test loops in the test
+# suite) gets its own semaphore without cross-loop sharing.
+_GCC_SEMAPHORES: dict = {}
+
+
+def _get_gcc_semaphore() -> asyncio.Semaphore:
+    """Return a gcc semaphore bound to the current running event loop.
+
+    Keying by loop identity ensures test isolation: pytest-asyncio creates a
+    new loop per test function, so each test gets a fresh semaphore rather than
+    reusing one from a previous (already-closed) loop.
+    """
+    loop = asyncio.get_running_loop()
+    if loop not in _GCC_SEMAPHORES:
+        _GCC_SEMAPHORES[loop] = asyncio.Semaphore(MAX_CONCURRENT_GCC)
+    return _GCC_SEMAPHORES[loop]
 
 
 class CompileError(Exception):
@@ -106,11 +126,13 @@ async def compile_python(python_source: str) -> dict:
         raise CompileError(str(e))
 
     loop = asyncio.get_running_loop()
+    sem = _get_gcc_semaphore()
     try:
-        asm_text = await asyncio.wait_for(
-            loop.run_in_executor(None, partial(_run_gcc, c_source)),
-            timeout=TIMEOUT + 1,
-        )
+        async with sem:
+            asm_text = await asyncio.wait_for(
+                loop.run_in_executor(None, partial(_run_gcc, c_source)),
+                timeout=TIMEOUT + 1,
+            )
     except asyncio.TimeoutError:
         logger.error("GCC timed out after %ds", TIMEOUT)
         raise CompileError("Compilation timed out")
