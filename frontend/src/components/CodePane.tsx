@@ -5,9 +5,11 @@ interface Props {
   activeLines: Set<number>               // 1-indexed lines currently "active"
   onLineClick?: (lineNo: number) => void
   badge?: string
+  onClose?: () => void
+  onDragStart?: (e: React.DragEvent<HTMLElement>) => void
 }
 
-export default function CodePane({ title, lines, highlightMap, activeLines, onLineClick, badge }: Props) {
+export default function CodePane({ title, lines, highlightMap, activeLines, onLineClick, badge, onClose, onDragStart }: Props) {
   return (
     <div style={{
       display: 'flex',
@@ -27,7 +29,21 @@ export default function CodePane({ title, lines, highlightMap, activeLines, onLi
         display: 'flex',
         alignItems: 'center',
         gap: 8,
+        flexShrink: 0,
       }}>
+        <span
+          draggable={!!onDragStart}
+          onDragStart={onDragStart}
+          title="Drag to reorder"
+          style={{
+            cursor: onDragStart ? 'grab' : 'default',
+            color: 'var(--border-bright)',
+            fontSize: 13,
+            userSelect: 'none',
+            flexShrink: 0,
+            letterSpacing: '-1px',
+          }}
+        >⠿</span>
         <span style={{
           fontWeight: 700,
           fontSize: 11,
@@ -52,6 +68,21 @@ export default function CodePane({ title, lines, highlightMap, activeLines, onLi
           }}>
             {badge}
           </span>
+        )}
+        {onClose && (
+          <button
+            onClick={onClose}
+            title="Close pane"
+            style={{
+              marginLeft: 'auto',
+              padding: '1px 6px',
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              border: '1px solid var(--border-dim)',
+              borderRadius: 2,
+              lineHeight: 1,
+            }}
+          >×</button>
         )}
       </div>
 

@@ -20,6 +20,8 @@ interface Props {
   infoMap: Record<number, AsmLineInfo>
   badge?: string
   vuln?: VulnAdvisory | null
+  onClose?: () => void
+  onDragStart?: (e: React.DragEvent<HTMLElement>) => void
 }
 
 const MNEMONIC_MAP: Record<string, string> = {
@@ -95,7 +97,7 @@ function explainAsm(line: string): string {
   return MNEMONIC_MAP[mnemonic] ?? ''
 }
 
-export default function AsmPane({ title, lines, highlightMap, activeLines, infoMap, badge, vuln }: Props) {
+export default function AsmPane({ title, lines, highlightMap, activeLines, infoMap, badge, vuln, onClose, onDragStart }: Props) {
   const [advisoryOpen, setAdvisoryOpen] = useState(true)
   const sevColor = vuln ? (SEVERITY_COLOR[vuln.severity] ?? 'var(--red)') : 'var(--red)'
 
@@ -123,6 +125,19 @@ export default function AsmPane({ title, lines, highlightMap, activeLines, infoM
         gap: 8,
         flexShrink: 0,
       }}>
+        <span
+          draggable={!!onDragStart}
+          onDragStart={onDragStart}
+          title="Drag to reorder"
+          style={{
+            cursor: onDragStart ? 'grab' : 'default',
+            color: 'var(--border-bright)',
+            fontSize: 13,
+            userSelect: 'none',
+            flexShrink: 0,
+            letterSpacing: '-1px',
+          }}
+        >⠿</span>
         <span style={{
           fontWeight: 700,
           fontSize: 11,
@@ -157,6 +172,20 @@ export default function AsmPane({ title, lines, highlightMap, activeLines, infoM
         }}>
           CLICK LEGEND TO TRACE
         </span>
+        {onClose && (
+          <button
+            onClick={onClose}
+            title="Close pane"
+            style={{
+              padding: '1px 6px',
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              border: '1px solid var(--border-dim)',
+              borderRadius: 2,
+              lineHeight: 1,
+            }}
+          >×</button>
+        )}
       </div>
 
       {/* Security advisory banner — only shown when a vuln is active */}

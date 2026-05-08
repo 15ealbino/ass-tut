@@ -1,7 +1,7 @@
 import CodeMirror from '@uiw/react-codemirror'
 import { python } from '@codemirror/lang-python'
 import { oneDark } from '@codemirror/theme-one-dark'
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { compile, CompileResponse, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
 import AsmPane, { AsmLineInfo } from '../components/AsmPane'
@@ -325,6 +325,10 @@ export default function EditorPage() {
   const [activePyLine, setActivePyLine] = useState<number | null>(null)
   const [activeVuln, setActiveVuln] = useState<Vuln | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [paneOrder, setPaneOrder] = useState<Array<'python' | 'c' | 'asm'>>(['python', 'c', 'asm'])
+  const [closedPanes, setClosedPanes] = useState(new Set<string>())
+  const [dragOver, setDragOver] = useState<string | null>(null)
+  const dragSrc = useRef<string | null>(null)
 
   async function handleCompile() {
     setLoading(true)
@@ -352,6 +356,33 @@ export default function EditorPage() {
     setResult(null)
     setError('')
     setActivePyLine(null)
+  }
+
+  function closePane(pane: string) { setClosedPanes(prev => new Set([...prev, pane])) }
+  function openPane(pane: string) { setClosedPanes(prev => { const n = new Set(prev); n.delete(pane); return n }) }
+
+  function handlePaneDragStart(pane: string, e: React.DragEvent) {
+    dragSrc.current = pane
+    e.dataTransfer.effectAllowed = 'move'
+  }
+  function handlePaneDragOver(pane: string, e: React.DragEvent) {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    if (dragSrc.current !== pane) setDragOver(pane)
+  }
+  function handlePaneDrop(pane: string, e: React.DragEvent) {
+    e.preventDefault()
+    if (dragSrc.current && dragSrc.current !== pane) {
+      setPaneOrder(prev => {
+        const o = [...prev] as Array<'python' | 'c' | 'asm'>
+        const si = o.indexOf(dragSrc.current as 'python' | 'c' | 'asm')
+        const ti = o.indexOf(pane as 'python' | 'c' | 'asm')
+        ;[o[si], o[ti]] = [o[ti], o[si]]
+        return o
+      })
+    }
+    dragSrc.current = null
+    setDragOver(null)
   }
 
   // Build color highlight maps
@@ -585,72 +616,141 @@ export default function EditorPage() {
         </div>
 
         {/* ── Three-pane workspace ── */}
-        <div style={{ display: 'flex', flex: 1, overflow: 'hidden', gap: 6, padding: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', padding: 6, gap: 0 }}>
 
-          {/* Python editor */}
-          <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            flex: 1,
-            minWidth: 0,
-            background: 'var(--bg-panel)',
-            borderRadius: 2,
-            overflow: 'hidden',
-            border: activeVuln
-              ? `1px solid ${SEVERITY_COLOR[activeVuln.severity]}55`
-              : '1px solid var(--border-dim)',
-            boxShadow: activeVuln
-              ? `0 0 12px ${SEVERITY_COLOR[activeVuln.severity]}22`
-              : 'none',
-          }}>
-            <PaneHeader
-              title="PYTHON"
-              badge={activeVuln ? activeVuln.name : 'INPUT'}
-              badgeColor={activeVuln ? SEVERITY_COLOR[activeVuln.severity] : 'var(--green)'}
-            />
-            <div style={{ flex: 1, overflow: 'auto' }}>
-              <CodeMirror
-                value={code}
-                onChange={handleCodeChange}
-                extensions={[python()]}
-                theme={oneDark}
-                style={{ height: '100%', fontSize: 13 }}
-                basicSetup={{ lineNumbers: true, foldGutter: false }}
-              />
+          {/* Restore bar — shown when panes are closed */}
+          {closedPanes.size > 0 && (
+            <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexShrink: 0, flexWrap: 'wrap' }}>
+              {paneOrder.filter(p => closedPanes.has(p)).map(p => {
+                const label: Record<string, string> = { python: 'PYTHON', c: 'C', asm: 'x86 ASM' }
+                return (
+                  <button
+                    key={p}
+                    onClick={() => openPane(p)}
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--cyan)',
+                      border: '1px solid var(--cyan)44',
+                      background: '#00ccff0d',
+                      borderRadius: 2,
+                      padding: '3px 10px',
+                      letterSpacing: '0.1em',
+                      fontFamily: 'Fira Code, monospace',
+                      boxShadow: '0 0 4px #00ccff22',
+                    }}
+                  >
+                    [+] {label[p] ?? p.toUpperCase()}
+                  </button>
+                )
+              })}
             </div>
+          )}
+
+          {/* Panes row */}
+          <div style={{ display: 'flex', flex: 1, overflow: 'hidden', gap: 6 }}>
+            {paneOrder
+              .filter(p => !closedPanes.has(p))
+              .map(pane => (
+                <div
+                  key={pane}
+                  onDragOver={e => handlePaneDragOver(pane, e)}
+                  onDrop={e => handlePaneDrop(pane, e)}
+                  onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(null) }}
+                  onDragEnd={() => { dragSrc.current = null; setDragOver(null) }}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    borderRadius: 2,
+                    outline: dragOver === pane ? '2px dashed #00ccff88' : '2px dashed transparent',
+                    transition: 'outline-color 0.12s',
+                  }}
+                >
+                  {/* Python editor */}
+                  {pane === 'python' && (
+                    <div style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      flex: 1,
+                      background: 'var(--bg-panel)',
+                      borderRadius: 2,
+                      overflow: 'hidden',
+                      border: activeVuln
+                        ? `1px solid ${SEVERITY_COLOR[activeVuln.severity]}55`
+                        : '1px solid var(--border-dim)',
+                      boxShadow: activeVuln
+                        ? `0 0 12px ${SEVERITY_COLOR[activeVuln.severity]}22`
+                        : 'none',
+                    }}>
+                      <PaneHeader
+                        title="PYTHON"
+                        badge={activeVuln ? activeVuln.name : 'INPUT'}
+                        badgeColor={activeVuln ? SEVERITY_COLOR[activeVuln.severity] : 'var(--green)'}
+                        onClose={() => closePane('python')}
+                        onDragStart={e => handlePaneDragStart('python', e)}
+                      />
+                      <div style={{ flex: 1, overflow: 'auto' }}>
+                        <CodeMirror
+                          value={code}
+                          onChange={handleCodeChange}
+                          extensions={[python()]}
+                          theme={oneDark}
+                          style={{ height: '100%', fontSize: 13 }}
+                          basicSetup={{ lineNumbers: true, foldGutter: false }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* C output */}
+                  {pane === 'c' && (result ? (
+                    <CodePane
+                      title="C"
+                      badge="TRANSPILED"
+                      lines={result.c_lines}
+                      highlightMap={cHighlight}
+                      activeLines={activeCLines}
+                      onClose={() => closePane('c')}
+                      onDragStart={e => handlePaneDragStart('c', e)}
+                    />
+                  ) : (
+                    <PlaceholderPane
+                      title="C"
+                      badge="TRANSPILED"
+                      onClose={() => closePane('c')}
+                      onDragStart={e => handlePaneDragStart('c', e)}
+                    />
+                  ))}
+
+                  {/* Assembly output */}
+                  {pane === 'asm' && (result ? (
+                    <AsmPane
+                      title="x86 ASM"
+                      badge="GCC -O0"
+                      lines={result.asm_lines}
+                      highlightMap={asmHighlight}
+                      activeLines={activeAsmLines}
+                      infoMap={asmToInfo}
+                      vuln={activeVuln ? {
+                        name: activeVuln.name,
+                        severity: activeVuln.severity,
+                        explanation: activeVuln.explanation,
+                      } : null}
+                      onClose={() => closePane('asm')}
+                      onDragStart={e => handlePaneDragStart('asm', e)}
+                    />
+                  ) : (
+                    <PlaceholderPane
+                      title="x86 ASM"
+                      badge="GCC -O0"
+                      onClose={() => closePane('asm')}
+                      onDragStart={e => handlePaneDragStart('asm', e)}
+                    />
+                  ))}
+                </div>
+              ))}
           </div>
-
-          {/* C output */}
-          {result ? (
-            <CodePane
-              title="C"
-              badge="TRANSPILED"
-              lines={result.c_lines}
-              highlightMap={cHighlight}
-              activeLines={activeCLines}
-            />
-          ) : (
-            <PlaceholderPane title="C" badge="TRANSPILED" />
-          )}
-
-          {/* Assembly output */}
-          {result ? (
-            <AsmPane
-              title="x86 ASM"
-              badge="GCC -O0"
-              lines={result.asm_lines}
-              highlightMap={asmHighlight}
-              activeLines={activeAsmLines}
-              infoMap={asmToInfo}
-              vuln={activeVuln ? {
-                name: activeVuln.name,
-                severity: activeVuln.severity,
-                explanation: activeVuln.explanation,
-              } : null}
-            />
-          ) : (
-            <PlaceholderPane title="x86 ASM" badge="GCC -O0" />
-          )}
         </div>
       </div>
 
@@ -715,7 +815,12 @@ export default function EditorPage() {
 
 // ─── Shared sub-components ─────────────────────────────────────────────────
 
-function PaneHeader({ title, badge, badgeColor }: { title: string; badge?: string; badgeColor?: string }) {
+function PaneHeader({
+  title, badge, badgeColor, onClose, onDragStart,
+}: {
+  title: string; badge?: string; badgeColor?: string;
+  onClose?: () => void; onDragStart?: (e: React.DragEvent) => void;
+}) {
   return (
     <div style={{
       padding: '7px 14px',
@@ -724,7 +829,21 @@ function PaneHeader({ title, badge, badgeColor }: { title: string; badge?: strin
       display: 'flex',
       alignItems: 'center',
       gap: 8,
+      flexShrink: 0,
     }}>
+      <span
+        draggable={!!onDragStart}
+        onDragStart={onDragStart}
+        title="Drag to reorder"
+        style={{
+          cursor: onDragStart ? 'grab' : 'default',
+          color: 'var(--border-bright)',
+          fontSize: 13,
+          userSelect: 'none',
+          flexShrink: 0,
+          letterSpacing: '-1px',
+        }}
+      >⠿</span>
       <span style={{
         fontWeight: 700,
         fontSize: 11,
@@ -750,11 +869,31 @@ function PaneHeader({ title, badge, badgeColor }: { title: string; badge?: strin
           {badge}
         </span>
       )}
+      {onClose && (
+        <button
+          onClick={onClose}
+          title="Close pane"
+          style={{
+            marginLeft: 'auto',
+            padding: '1px 6px',
+            fontSize: 11,
+            color: 'var(--text-muted)',
+            border: '1px solid var(--border-dim)',
+            borderRadius: 2,
+            lineHeight: 1,
+          }}
+        >×</button>
+      )}
     </div>
   )
 }
 
-function PlaceholderPane({ title, badge }: { title: string; badge?: string }) {
+function PlaceholderPane({
+  title, badge, onClose, onDragStart,
+}: {
+  title: string; badge?: string;
+  onClose?: () => void; onDragStart?: (e: React.DragEvent) => void;
+}) {
   return (
     <div style={{
       flex: 1,
@@ -765,7 +904,7 @@ function PlaceholderPane({ title, badge }: { title: string; badge?: string }) {
       display: 'flex',
       flexDirection: 'column',
     }}>
-      <PaneHeader title={title} badge={badge} />
+      <PaneHeader title={title} badge={badge} onClose={onClose} onDragStart={onDragStart} />
       <div style={{
         flex: 1,
         display: 'flex',
