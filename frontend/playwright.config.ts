@@ -8,7 +8,7 @@ export default defineConfig({
   workers: 1,
   reporter: 'list',
   use: {
-    baseURL: 'http://localhost:5174',
+    baseURL: process.env.BASE_URL ?? 'http://localhost:80',
     trace: 'on-first-retry',
     headless: true,
   },
@@ -18,6 +18,7 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
     },
   ],
-  // Do NOT start the servers automatically — the user runs them separately
-  // (docker-compose up or uvicorn + vite) before running tests.
+  // Do NOT start the servers automatically — the user runs them separately.
+  // Local docker-compose: docker-compose up --build -d  (serves on :80)
+  // Oracle VM:            BASE_URL=http://138.2.212.103 npx playwright test
 })

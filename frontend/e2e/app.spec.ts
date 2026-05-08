@@ -3,7 +3,7 @@
  *
  * Pre-conditions:
  *   - Backend running on :8000 (uvicorn or docker-compose)
- *   - Frontend dev server on :5173 (npm run dev) or :5174 (docker)
+ *   - Frontend on :80 (docker-compose) or set BASE_URL env var for remote
  *   - No authentication required — /compile is a public endpoint
  *
  * Run: npx playwright test

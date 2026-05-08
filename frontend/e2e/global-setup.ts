@@ -10,7 +10,7 @@ import { Client } from 'pg'
 import bcrypt from 'bcryptjs'
 import { randomUUID } from 'crypto'
 
-const DB_URL = 'postgresql://postgres:postgres@localhost:5432/asstut'
+const DB_URL = process.env.DB_URL ?? 'postgresql://postgres:postgres@localhost:5432/asstut'
 export const TEST_EMAIL = 'e2e-test@example.com'
 export const TEST_PASSWORD = 'testpassword123'
 
