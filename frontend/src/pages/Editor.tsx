@@ -1,7 +1,7 @@
 import CodeMirror from '@uiw/react-codemirror'
 import { python } from '@codemirror/lang-python'
 import { oneDark } from '@codemirror/theme-one-dark'
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef } from 'react'
 import { compile, CompileResponse, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
 import AsmPane, { AsmLineInfo } from '../components/AsmPane'
@@ -293,75 +293,61 @@ print(payload)
 `,
   },
   {
-    id: 'integer-overflow',
-    name: 'INTEGER OVERFLOW',
+    id: 'toctou-race',
+    name: 'TOCTOU RACE CONDITION',
     severity: 'CRITICAL',
-    category: 'Arithmetic',
-    description: 'Signed 32-bit counter wraps negative, bypassing a size-guard and enabling heap underflow.',
+    category: 'Race Condition',
+    description: 'Resource state changes between security check and use, bypassing access control.',
     explanation:
-      'Integer overflow is deceptively simple: adding 1 to a signed 32-bit maximum (0x7fffffff) ' +
-      'wraps around to −2147483648. If the wrapped value is then used as an allocation size or ' +
-      'array index, the allocator may receive a tiny (or zero) size while the caller writes a much ' +
-      'larger number of bytes — a heap underflow. ' +
-      'CVE-2021-3156 (sudo) and CVE-2022-0847 (Dirty Pipe) both involve arithmetic that silently ' +
-      'wraps before a bounds check, making the check meaningless. ' +
-      'In the assembly, the `addl` instruction sets the OF (overflow) flag when wrapping, but ' +
-      'no `jo` branch follows — the wrapped value flows directly into the `cmpl` guard, which ' +
-      'passes because −1 < 0 is trivially true in signed comparison.',
+      'Time-of-Check Time-of-Use (TOCTOU / CWE-367) is a race condition where the program checks a ' +
+      'condition (e.g. file permissions, ownership, credential validity) and then acts on the result, ' +
+      'but an attacker modifies the resource in the window between the check and the use. ' +
+      'The classic UNIX exploit: a setuid program calls access() to verify a user may read a file, ' +
+      'then calls open() — the attacker uses a symlink swap between the two calls to redirect ' +
+      'the open to /etc/shadow. Exploited in CVE-2024-7348 (PostgreSQL pg_dump — attacker replaces ' +
+      'a relation with a view during the race window to execute arbitrary SQL as a superuser), ' +
+      'CVE-2024-50379 (Apache Tomcat — TOCTOU during JSP compilation enables RCE on case-insensitive ' +
+      'file systems), and a Docker TOCTOU (CVE-2019-19921) that granted root access to the host filesystem. ' +
+      'At Pwn2Own 2023 a TOCTOU bug was used to compromise a Tesla Model 3. ' +
+      'In the assembly, the `cmpl` from the check and the `movl` from the use reference the same ' +
+      'stack offset, but no lock or atomic operation guards the gap — a concurrent write between ' +
+      'the two instructions changes the value the use reads.',
     code:
-`# CVE pattern: signed 32-bit counter wraps past INT_MAX, bypasses guard
-def alloc_buffer():
-    INT_MAX = 2147483647
-    count = INT_MAX
-    extra = 1
-    total = count + extra
-    guard = 0
-    if total > 0:
-        guard = total
-    else:
-        guard = 1
-    result = guard * 4
-    return result
+`# CVE pattern: check-then-use gap lets attacker swap resource
+class Resource:
+    def __init__(self, owner, perms):
+        self.owner = owner
+        self.perms = perms
+        self.data = 0
+        self.modified = 0
 
-size = alloc_buffer()
-print(size)
-`,
-  },
-  {
-    id: 'format-string',
-    name: 'FORMAT STRING',
-    severity: 'CRITICAL',
-    category: 'Injection',
-    description: 'User-controlled format string reads arbitrary stack slots via %x/%n specifiers.',
-    explanation:
-      'Format string vulnerabilities arise when user input is passed directly as the format ' +
-      'argument to printf-family functions. The attacker supplies specifiers like %x to read ' +
-      'successive stack words, leaking stack canaries, return addresses, and heap pointers — ' +
-      'enough to defeat ASLR. Adding %n writes the character count to an attacker-chosen address, ' +
-      'turning a read-primitive into an arbitrary write. ' +
-      'Classic targets: wu-ftpd (CVE-2000-0573), glibc syslog, and many embedded firmware stacks. ' +
-      'In the assembly, the format buffer is loaded via `leaq` and passed as the first argument ' +
-      '(%rdi) without any interposing sanitization — the `call` to the output function receives ' +
-      'raw user bytes as its format string, and %rsi/%rdx/%rcx are whatever happened to live in ' +
-      'those registers, not validated arguments.',
-    code:
-`# CVE pattern: user string used as format — leaks stack values
-class Logger:
-    def __init__(self, base):
-        self.base = base
-        self.leak1 = 0
-        self.leak2 = 0
-        self.written = 0
+    def set_data(self, val):
+        self.data = val
+        self.modified = 1
 
-    def log(self, user_fmt):
-        self.leak1 = self.base + user_fmt
-        self.leak2 = self.leak1 * 2
-        self.written += 1
-        return self.leak2
+class AccessChecker:
+    def __init__(self, required_perms):
+        self.required_perms = required_perms
+        self.check_passed = 0
+        self.used = 0
 
-logger = Logger(134513152)
-result = logger.log(1094861636)
-print(result)
+    def check(self, res):
+        if res.perms >= self.required_perms:
+            self.check_passed = 1
+        return self.check_passed
+
+    def use(self, res):
+        result = res.data * self.check_passed
+        self.used = 1
+        return result
+
+res = Resource(1000, 755)
+checker = AccessChecker(644)
+checker.check(res)
+res.data = 3735928559
+res.owner = 0
+privileged_read = checker.use(res)
+print(privileged_read)
 `,
   },
 ]
@@ -374,8 +360,7 @@ const SEVERITY_COLOR: Record<string, string> = {
   MEDIUM: 'var(--cyan)',
 }
 
-const STARTERS = [
-  `# Write Python below and click [> COMPILE]
+const STARTER = `# Write Python below and click [> COMPILE]
 x = 10
 y = 20
 
@@ -386,109 +371,22 @@ if x > 30:
     print(x)
 else:
     print(y)
-`,
-  `# Fibonacci via iteration
-def fib(n):
-    a = 0
-    b = 1
-    i = 0
-    while i < n:
-        temp = a + b
-        a = b
-        b = temp
-        i += 1
-    return a
-
-result = fib(10)
-print(result)
-`,
-  `# Bubble sort pass
-def sort_pass(n):
-    swaps = 0
-    i = 0
-    while i < n - 1:
-        if i % 2 == 0:
-            swaps += 1
-        i += 1
-    return swaps
-
-total = sort_pass(8)
-print(total)
-`,
-  `# Power function (exponentiation by squaring)
-def power(base, exp):
-    result = 1
-    i = 0
-    while i < exp:
-        result *= base
-        i += 1
-    return result
-
-val = power(3, 5)
-print(val)
-`,
-  `# Collatz conjecture steps
-def collatz(n):
-    steps = 0
-    while n > 1:
-        if n % 2 == 0:
-            n = n // 2
-        else:
-            n = n * 3 + 1
-        steps += 1
-    return steps
-
-result = collatz(27)
-print(result)
-`,
-  `# Greatest common divisor (Euclidean)
-def gcd(a, b):
-    while b > 0:
-        temp = b
-        b = a - (a // b) * b
-        a = temp
-    return a
-
-result = gcd(48, 18)
-print(result)
-`,
-]
-
-function randomStarter(): string {
-  return STARTERS[Math.floor(Math.random() * STARTERS.length)]
-}
+`
 
 // ─── EditorPage ────────────────────────────────────────────────────────────
 
 export default function EditorPage() {
-  const [code, setCode] = useState(() => randomStarter())
+  const [code, setCode] = useState(STARTER)
   const [result, setResult] = useState<CompileResponse | null>(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [activePyLine, setActivePyLine] = useState<number | null>(null)
   const [activeVuln, setActiveVuln] = useState<Vuln | null>(null)
-  const vulnCycleIdx = useRef(0)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [paneOrder, setPaneOrder] = useState<Array<'python' | 'c' | 'asm'>>(['python', 'c', 'asm'])
   const [closedPanes, setClosedPanes] = useState(new Set<string>())
   const [dragOver, setDragOver] = useState<string | null>(null)
   const dragSrc = useRef<string | null>(null)
-
-  // Auto-cycle through vulnerabilities every 2 hours
-  useEffect(() => {
-    const TWO_HOURS = 2 * 60 * 60 * 1000
-    const id = setInterval(() => {
-      const next = (vulnCycleIdx.current + 1) % VULNS.length
-      vulnCycleIdx.current = next
-      const v = VULNS[next]
-      setCode(v.code)
-      setActiveVuln(v)
-      setResult(null)
-      setError('')
-      setActivePyLine(null)
-    }, TWO_HOURS)
-    return () => clearInterval(id)
-  }, [])
 
   async function handleCompile() {
     setLoading(true)
@@ -513,7 +411,6 @@ export default function EditorPage() {
   function selectVuln(v: Vuln) {
     setCode(v.code)
     setActiveVuln(v)
-    vulnCycleIdx.current = VULNS.indexOf(v)
     setResult(null)
     setError('')
     setActivePyLine(null)
