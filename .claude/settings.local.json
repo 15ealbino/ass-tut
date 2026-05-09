@@ -7,7 +7,12 @@
       "Bash(mv C:/Users/15eal/ass-tut/.claude/commands/code-testing.md C:/Users/15eal/ass-tut/.claude/commands/skills/)",
       "Skill(update-config)",
       "Bash(git init *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(npx tsc *)",
+      "Bash(git push *)",
+      "Bash(npm run *)",
+      "Bash(git *)"
     ]
   }
 }
