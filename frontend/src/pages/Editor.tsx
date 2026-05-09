@@ -1,6 +1,7 @@
 import CodeMirror from '@uiw/react-codemirror'
 import { python } from '@codemirror/lang-python'
 import { oneDark } from '@codemirror/theme-one-dark'
+import type { EditorView } from '@codemirror/view'
 import { useState, useRef } from 'react'
 import { compile, CompileResponse, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
@@ -504,6 +505,7 @@ export default function EditorPage() {
   const [closedPanes, setClosedPanes] = useState(new Set<string>())
   const [dragOver, setDragOver] = useState<string | null>(null)
   const dragSrc = useRef<string | null>(null)
+  const editorViewRef = useRef<EditorView | null>(null)
 
   async function handleCompile() {
     setLoading(true)
@@ -531,6 +533,17 @@ export default function EditorPage() {
     setResult(null)
     setError('')
     setActivePyLine(null)
+  }
+
+  function handlePythonLineClick(e: React.MouseEvent<HTMLDivElement>) {
+    if (!result) return
+    const view = editorViewRef.current
+    if (!view) return
+    const pos = view.posAtCoords({ x: e.clientX, y: e.clientY })
+    if (pos === null) return
+    const lineNo = view.state.doc.lineAt(pos).number
+    if (!result.line_map[lineNo]) return
+    setActivePyLine(prev => prev === lineNo ? null : lineNo)
   }
 
   function closePane(pane: string) { setClosedPanes(prev => new Set([...prev, pane])) }
@@ -887,7 +900,10 @@ export default function EditorPage() {
                         onMoveLeft={canLeft ? () => movePane('python', -1) : undefined}
                         onMoveRight={canRight ? () => movePane('python', 1) : undefined}
                       />
-                      <div style={{ flex: 1, overflow: 'auto' }}>
+                      <div
+                        style={{ flex: 1, overflow: 'auto', cursor: result ? 'pointer' : 'text' }}
+                        onClick={handlePythonLineClick}
+                      >
                         <CodeMirror
                           value={code}
                           onChange={handleCodeChange}
@@ -895,6 +911,7 @@ export default function EditorPage() {
                           theme={oneDark}
                           style={{ height: '100%', fontSize: 13 }}
                           basicSetup={{ lineNumbers: true, foldGutter: false }}
+                          onCreateEditor={(view) => { editorViewRef.current = view }}
                         />
                       </div>
                     </div>
