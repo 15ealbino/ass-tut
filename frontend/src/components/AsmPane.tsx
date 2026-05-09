@@ -10,6 +10,8 @@ export interface VulnAdvisory {
   name: string
   severity: string
   explanation: string
+  badPatterns?: string[]
+  badDescription?: string
 }
 
 interface Props {
@@ -99,9 +101,30 @@ function explainAsm(line: string): string {
   return MNEMONIC_MAP[mnemonic] ?? ''
 }
 
+function isBadLine(line: string, patterns: string[]): boolean {
+  const t = line.trim()
+  if (!t || t.startsWith('.') || t.endsWith(':')) return false
+  const mnemonic = t.split(/\s/)[0].toLowerCase()
+  return patterns.some(p => mnemonic === p.toLowerCase())
+}
+
+function buildBadLineSet(lines: string[], patterns: string[]): Set<number> {
+  const s = new Set<number>()
+  lines.forEach((line, i) => { if (isBadLine(line, patterns)) s.add(i + 1) })
+  return s
+}
+
 export default function AsmPane({ title, lines, highlightMap, activeLines, infoMap, badge, vuln, onClose, onDragStart, onMoveLeft, onMoveRight }: Props) {
   const [advisoryOpen, setAdvisoryOpen] = useState(true)
   const sevColor = vuln ? (SEVERITY_COLOR[vuln.severity] ?? 'var(--red)') : 'var(--red)'
+
+  const badLineNos = vuln?.badPatterns?.length
+    ? buildBadLineSet(lines, vuln.badPatterns)
+    : new Set<number>()
+
+  // Track which bad lines end a consecutive group (next line is not bad)
+  const groupEndLineNos = new Set<number>()
+  badLineNos.forEach(n => { if (!badLineNos.has(n + 1)) groupEndLineNos.add(n) })
 
   return (
     <div style={{
@@ -261,104 +284,180 @@ export default function AsmPane({ title, lines, highlightMap, activeLines, infoM
           const isActive = activeLines.has(lineNo)
           const info = infoMap[lineNo]
           const explanation = explainAsm(line)
+          const isBad = badLineNos.has(lineNo)
+          const isGroupEnd = groupEndLineNos.has(lineNo)
 
           return (
-            <div
-              key={lineNo}
-              style={{
-                display: 'flex',
-                alignItems: 'stretch',
-                background: isActive && color ? `${color}18` : 'transparent',
-                boxShadow: isActive && color ? `inset 0 0 16px ${color}0d` : 'none',
-                transition: 'background 0.1s',
-              }}
-            >
-              {/* Color stripe */}
-              <div style={{
-                width: 3,
-                flexShrink: 0,
-                background: color ?? 'transparent',
-                opacity: isActive ? 1 : color ? 0.7 : 0,
-                boxShadow: isActive && color ? `0 0 8px ${color}` : 'none',
-                transition: 'opacity 0.1s',
-              }} />
+            <div key={lineNo}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'stretch',
+                  background: isBad
+                    ? `${sevColor}18`
+                    : isActive && color
+                      ? `${color}18`
+                      : 'transparent',
+                  outline: isBad ? `1px solid ${sevColor}88` : 'none',
+                  outlineOffset: '-1px',
+                  boxShadow: isBad
+                    ? `inset 0 0 12px ${sevColor}0d`
+                    : isActive && color
+                      ? `inset 0 0 16px ${color}0d`
+                      : 'none',
+                  transition: 'background 0.1s',
+                }}
+              >
+                {/* Color stripe — red when bad, else mapping color */}
+                <div style={{
+                  width: isBad ? 5 : 3,
+                  flexShrink: 0,
+                  background: isBad ? sevColor : (color ?? 'transparent'),
+                  opacity: isBad ? 1 : isActive ? 1 : color ? 0.7 : 0,
+                  boxShadow: isBad
+                    ? `0 0 8px ${sevColor}`
+                    : isActive && color
+                      ? `0 0 8px ${color}`
+                      : 'none',
+                  transition: 'opacity 0.1s, width 0.1s',
+                }} />
 
-              {/* Line number */}
-              <div style={{
-                width: 36,
-                textAlign: 'right',
-                paddingRight: 10,
-                color: 'var(--text-muted)',
-                fontSize: 11,
-                fontFamily: 'Fira Code, monospace',
-                userSelect: 'none',
-                lineHeight: '22px',
-                flexShrink: 0,
-              }}>
-                {lineNo}
+                {/* Line number */}
+                <div style={{
+                  width: 36,
+                  textAlign: 'right',
+                  paddingRight: 10,
+                  color: isBad ? sevColor : 'var(--text-muted)',
+                  fontSize: 11,
+                  fontFamily: 'Fira Code, monospace',
+                  userSelect: 'none',
+                  lineHeight: '22px',
+                  flexShrink: 0,
+                  fontWeight: isBad ? 700 : 400,
+                }}>
+                  {lineNo}
+                </div>
+
+                {/* Assembly instruction */}
+                <pre style={{
+                  flex: 1,
+                  fontSize: 12,
+                  fontFamily: '"Fira Code", "Cascadia Code", monospace',
+                  lineHeight: '22px',
+                  color: isBad ? '#ffaaaa' : isActive ? '#ccffcc' : 'var(--text-primary)',
+                  margin: 0,
+                  paddingRight: 8,
+                  whiteSpace: 'pre',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  textShadow: isBad
+                    ? `0 0 8px ${sevColor}88`
+                    : isActive && color
+                      ? `0 0 8px ${color}55`
+                      : 'none',
+                }}>
+                  {line}
+                </pre>
+
+                {/* Annotation column */}
+                <div style={{
+                  width: 220,
+                  flexShrink: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  paddingLeft: 8,
+                  paddingRight: 10,
+                  borderLeft: `1px solid ${isBad ? sevColor + '55' : 'var(--border-dim)'}`,
+                  overflow: 'hidden',
+                }}>
+                  {isBad && (
+                    <span style={{
+                      fontSize: 9,
+                      fontWeight: 700,
+                      color: sevColor,
+                      background: `${sevColor}22`,
+                      border: `1px solid ${sevColor}`,
+                      borderRadius: 2,
+                      padding: '1px 5px',
+                      flexShrink: 0,
+                      fontFamily: 'Fira Code, monospace',
+                      letterSpacing: '0.04em',
+                      boxShadow: `0 0 4px ${sevColor}55`,
+                    }}>
+                      ⚠ UNSAFE
+                    </span>
+                  )}
+                  {!isBad && info && (
+                    <span style={{
+                      fontSize: 9,
+                      fontWeight: 700,
+                      color: info.color,
+                      background: `${info.color}22`,
+                      border: `1px solid ${info.color}44`,
+                      borderRadius: 2,
+                      padding: '1px 5px',
+                      flexShrink: 0,
+                      fontFamily: 'Fira Code, monospace',
+                      letterSpacing: '0.04em',
+                      boxShadow: isActive ? `0 0 4px ${info.color}55` : 'none',
+                    }}>
+                      PY:{info.pyLine}
+                    </span>
+                  )}
+                  {!isBad && explanation && (
+                    <span style={{
+                      fontSize: 10,
+                      color: isActive ? 'var(--cyan)' : 'var(--text-dim)',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      fontFamily: 'Fira Code, monospace',
+                      letterSpacing: '0.02em',
+                      textShadow: isActive ? 'var(--glow-cyan)' : 'none',
+                    }}>
+                      // {explanation}
+                    </span>
+                  )}
+                </div>
               </div>
 
-              {/* Assembly instruction */}
-              <pre style={{
-                flex: 1,
-                fontSize: 12,
-                fontFamily: '"Fira Code", "Cascadia Code", monospace',
-                lineHeight: '22px',
-                color: isActive ? '#ccffcc' : 'var(--text-primary)',
-                margin: 0,
-                paddingRight: 8,
-                whiteSpace: 'pre',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                textShadow: isActive && color ? `0 0 8px ${color}55` : 'none',
-              }}>
-                {line}
-              </pre>
-
-              {/* Annotation column */}
-              <div style={{
-                width: 220,
-                flexShrink: 0,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 5,
-                paddingLeft: 8,
-                paddingRight: 10,
-                borderLeft: '1px solid var(--border-dim)',
-                overflow: 'hidden',
-              }}>
-                {info && (
-                  <span style={{
-                    fontSize: 9,
-                    fontWeight: 700,
-                    color: info.color,
-                    background: `${info.color}22`,
-                    border: `1px solid ${info.color}44`,
-                    borderRadius: 2,
-                    padding: '1px 5px',
-                    flexShrink: 0,
-                    fontFamily: 'Fira Code, monospace',
-                    letterSpacing: '0.04em',
-                    boxShadow: isActive ? `0 0 4px ${info.color}55` : 'none',
-                  }}>
-                    PY:{info.pyLine}
-                  </span>
-                )}
-                {explanation && (
+              {/* Description callout shown after the last line in each bad group */}
+              {isGroupEnd && vuln?.badDescription && (
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 8,
+                  margin: '2px 0 4px 5px',
+                  padding: '5px 10px',
+                  background: '#1a0008',
+                  border: `1px solid ${sevColor}55`,
+                  borderLeft: `3px solid ${sevColor}`,
+                  borderRadius: '0 2px 2px 0',
+                  boxShadow: `inset 0 0 16px ${sevColor}08, 0 1px 6px ${sevColor}22`,
+                }}>
                   <span style={{
                     fontSize: 10,
-                    color: isActive ? 'var(--cyan)' : 'var(--text-dim)',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
+                    color: sevColor,
+                    fontWeight: 700,
+                    fontFamily: 'Fira Code, monospace',
+                    letterSpacing: '0.06em',
+                    flexShrink: 0,
+                    lineHeight: 1.5,
+                  }}>
+                    [!]
+                  </span>
+                  <span style={{
+                    fontSize: 10,
+                    color: 'var(--text-dim)',
                     fontFamily: 'Fira Code, monospace',
                     letterSpacing: '0.02em',
-                    textShadow: isActive ? 'var(--glow-cyan)' : 'none',
+                    lineHeight: 1.5,
                   }}>
-                    // {explanation}
+                    {vuln.badDescription}
                   </span>
-                )}
-              </div>
+                </div>
+              )}
             </div>
           )
         })}

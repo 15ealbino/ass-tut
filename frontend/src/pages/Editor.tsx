@@ -16,6 +16,7 @@ interface Vuln {
   description: string
   explanation: string
   code: string
+  badAsm: { patterns: string[]; description: string }
 }
 
 const VULNS: Vuln[] = [
@@ -49,6 +50,10 @@ def copy_input():
 result = copy_input()
 print(result)
 `,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl compares against attacker-controlled bound; movl writes past the allocated stack frame, overwriting saved %rbp then the return address',
+    },
   },
   {
     id: 'heap-uaf',
@@ -83,6 +88,10 @@ c.data = 0
 stale = c.read()
 print(stale)
 `,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl reads from a zeroed (freed) stack slot — at runtime an attacker heap-sprays the freed region so these reads return attacker-controlled bytes',
+    },
   },
   {
     id: 'vtable-hijack',
@@ -116,6 +125,10 @@ vt.handler = 1094795585
 result = vt.dispatch()
 print(result)
 `,
+    badAsm: {
+      patterns: ['imull', 'movl'],
+      description: 'movl loads the attacker-overwritten handler value; imull multiplies using it as an operand — in a real vtable hijack this becomes an indirect call to attacker-chosen code',
+    },
   },
   {
     id: 'double-free',
@@ -150,6 +163,10 @@ block.free()
 result = block.free_count
 print(result)
 `,
+    badAsm: {
+      patterns: ['addl', 'movl'],
+      description: 'addl increments free_count from the same base address twice; in a real heap this corrupts the allocator\'s tcache bin, turning the next malloc into an arbitrary-write primitive',
+    },
   },
   {
     id: 'off-by-one',
@@ -182,6 +199,10 @@ def copy_buf():
 result = copy_buf()
 print(result)
 `,
+    badAsm: {
+      patterns: ['cmpl', 'jle'],
+      description: 'cmpl + jle implements the <= bound — with buf_size=8 the loop runs a 9th iteration, writing one slot past the buffer end and overwriting the low byte of saved %rbp',
+    },
   },
   {
     id: 'cmd-injection',
@@ -218,6 +239,10 @@ runner.set_input(1094861636)
 result = runner.run()
 print(result)
 `,
+    badAsm: {
+      patterns: ['addl', 'call'],
+      description: 'addl combines base_cmd with unsanitized user_input; call passes the result to the output function — in a real system this buffer feeds system() or execve() with shell metacharacters intact',
+    },
   },
   {
     id: 'type-confusion',
@@ -254,6 +279,10 @@ b = TypeB(a.data, a.size)
 confused = b.handler + b.flags
 print(confused)
 `,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl reads b.handler and b.flags from stack offsets that alias TypeA\'s layout — the "handler" field contains a.data (attacker-controlled), not a function pointer from a safe vtable',
+    },
   },
   {
     id: 'rop-gadget',
@@ -291,6 +320,10 @@ def build_rop_frame():
 payload = build_rop_frame()
 print(payload)
 `,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl plants gadget addresses (0xdeadbeef, 0x400600) into stack slots; the epilogue\'s pop instructions restore these into callee-saved registers which become the first ROP gadget addresses on return',
+    },
   },
   {
     id: 'toctou-race',
@@ -349,6 +382,90 @@ res.owner = 0
 privileged_read = checker.use(res)
 print(privileged_read)
 `,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks resource.perms but no atomic guard prevents swapping res.data in the race window; movl then reads the now-attacker-controlled value in the use phase — classic check-then-use exploit',
+    },
+  },
+  {
+    id: 'integer-overflow',
+    name: 'INTEGER OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Arithmetic',
+    description: 'Signed 32-bit counter wraps negative, bypassing a size-guard and enabling heap underflow.',
+    explanation:
+      'Integer overflow is deceptively simple: adding 1 to a signed 32-bit maximum (0x7fffffff) ' +
+      'wraps around to −2147483648. If the wrapped value is then used as an allocation size or ' +
+      'array index, the allocator may receive a tiny (or zero) size while the caller writes a much ' +
+      'larger number of bytes — a heap underflow. ' +
+      'CVE-2021-3156 (sudo) and CVE-2022-0847 (Dirty Pipe) both involve arithmetic that silently ' +
+      'wraps before a bounds check, making the check meaningless. ' +
+      'In the assembly, the `addl` instruction sets the OF (overflow) flag when wrapping, but ' +
+      'no `jo` branch follows — the wrapped value flows directly into the `cmpl` guard, which ' +
+      'passes because −1 < 0 is trivially true in signed comparison.',
+    code:
+`# CVE pattern: signed 32-bit counter wraps past INT_MAX, bypasses guard
+def alloc_buffer():
+    INT_MAX = 2147483647
+    count = INT_MAX
+    extra = 1
+    total = count + extra
+    guard = 0
+    if total > 0:
+        guard = total
+    else:
+        guard = 1
+    result = guard * 4
+    return result
+
+size = alloc_buffer()
+print(size)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl'],
+      description: 'addl sets the Overflow Flag when INT_MAX+1 wraps to -2147483648; cmpl then compares the wrapped negative value — the guard passes because no `jo` branch follows, letting a tiny allocation proceed with a massive write',
+    },
+  },
+  {
+    id: 'format-string',
+    name: 'FORMAT STRING',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'User-controlled format string reads arbitrary stack slots via %x/%n specifiers.',
+    explanation:
+      'Format string vulnerabilities arise when user input is passed directly as the format ' +
+      'argument to printf-family functions. The attacker supplies specifiers like %x to read ' +
+      'successive stack words, leaking stack canaries, return addresses, and heap pointers — ' +
+      'enough to defeat ASLR. Adding %n writes the character count to an attacker-chosen address, ' +
+      'turning a read-primitive into an arbitrary write. ' +
+      'Classic targets: wu-ftpd (CVE-2000-0573), glibc syslog, and many embedded firmware stacks. ' +
+      'In the assembly, the format buffer is loaded via `leaq` and passed as the first argument ' +
+      '(%rdi) without any interposing sanitization — the `call` to the output function receives ' +
+      'raw user bytes as its format string, and %rsi/%rdx/%rcx are whatever happened to live in ' +
+      'those registers, not validated arguments.',
+    code:
+`# CVE pattern: user string used as format — leaks stack values
+class Logger:
+    def __init__(self, base):
+        self.base = base
+        self.leak1 = 0
+        self.leak2 = 0
+        self.written = 0
+
+    def log(self, user_fmt):
+        self.leak1 = self.base + user_fmt
+        self.leak2 = self.leak1 * 2
+        self.written += 1
+        return self.leak2
+
+logger = Logger(134513152)
+result = logger.log(1094861636)
+print(result)
+`,
+    badAsm: {
+      patterns: ['leaq', 'call', 'addl', 'imull'],
+      description: 'leaq loads user_fmt directly into %rdi as the format argument; call passes it to the output function with no sanitization — %rsi/%rdx hold whatever was in those registers, making %x specifiers leak stack data',
+    },
   },
 ]
 
@@ -820,6 +937,8 @@ export default function EditorPage() {
                         name: activeVuln.name,
                         severity: activeVuln.severity,
                         explanation: activeVuln.explanation,
+                        badPatterns: activeVuln.badAsm.patterns,
+                        badDescription: activeVuln.badAsm.description,
                       } : null}
                       onClose={() => closePane('asm')}
                       onDragStart={e => handlePaneDragStart('asm', e)}
