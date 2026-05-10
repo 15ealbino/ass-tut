@@ -468,6 +468,56 @@ print(result)
       description: 'leaq loads user_fmt directly into %rdi as the format argument; call passes it to the output function with no sanitization — %rsi/%rdx hold whatever was in those registers, making %x specifiers leak stack data',
     },
   },
+  {
+    id: 'uninit-memory',
+    name: 'UNINITIALIZED MEMORY READ',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Buffer allocated without zeroing leaks stale stack data from prior call frames.',
+    explanation:
+      'Uninitialized memory reads (CWE-908) occur when a buffer or struct is allocated without being ' +
+      'zeroed, leaving residual data from prior stack frames or heap allocations readable by an attacker. ' +
+      'A partial fill writes only some fields; the rest retain stale values such as stack canaries, ' +
+      'KASLR base pointers, or cryptographic keys from a previous call frame. ' +
+      'CVE-2024-50302 (Linux kernel HID core) is a critical real-world example: the HID report buffer ' +
+      'was allocated without memset, allowing a crafted USB HID device to leak raw kernel memory. ' +
+      'This vulnerability was actively exploited by Cellebrite in a zero-day exploit chain targeting ' +
+      'Android devices and was added to CISA\'s Known Exploited Vulnerabilities catalog in March 2025. ' +
+      'USENIX WOOT \'20 research demonstrated that even low-CVSS uninitialized stack variable bugs can ' +
+      'be weaponized via deterministic stack spraying to defeat KASLR and leak stack canaries. ' +
+      'In the assembly, `movl` stores sentinel values (0xCAFEBABE, 0xFFFF0000) into struct fields ' +
+      'during construction; fill_partial zeroes only data0, but `addl` in read_report sums all three ' +
+      'slots — the uncleared fields still hold stale data, defeating KASLR and leaking canaries.',
+    code:
+`# CVE pattern: buffer allocated without zeroing — stale data readable
+class ReportBuffer:
+    def __init__(self, size):
+        self.size = size
+        self.data0 = 3405691582
+        self.data1 = 4294901760
+        self.data2 = 4196096
+        self.initialized = 0
+
+    def fill_partial(self, count):
+        if count >= 1:
+            self.data0 = 0
+        self.initialized = count
+        return self.initialized
+
+    def read_report(self):
+        total = self.data0 + self.data1 + self.data2
+        return total
+
+buf = ReportBuffer(256)
+buf.fill_partial(1)
+leaked = buf.read_report()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads stale sentinel values (0xCAFEBABE, 0xFFFF0000) into unzeroed struct fields on the stack; addl in read_report sums all fields including the two never cleared — the leaked total contains kernel pointers and canary fragments',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
