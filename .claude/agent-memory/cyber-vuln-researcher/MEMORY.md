@@ -1,0 +1,1 @@
+- [TOCTOU Research](reference_toctou_research.md) — Key CVEs (CVE-2024-30088, CVE-2024-50379, CVE-2016-5195), assembly mechanism, demo approaches
