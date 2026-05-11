@@ -518,6 +518,60 @@ print(leaked)
       description: 'movl loads stale sentinel values (0xCAFEBABE, 0xFFFF0000) into unzeroed struct fields on the stack; addl in read_report sums all fields including the two never cleared — the leaked total contains kernel pointers and canary fragments',
     },
   },
+  {
+    id: 'signedness-confusion',
+    name: 'SIGNEDNESS CONFUSION',
+    severity: 'CRITICAL',
+    category: 'Arithmetic',
+    description: 'Negative signed integer passes a less-than bounds check, then wraps to a huge unsigned offset for OOB access.',
+    explanation:
+      'Signedness confusion (CWE-195 / CWE-196) occurs when a signed integer is compared using a signed ' +
+      'relational operator but later used in an unsigned context such as a buffer index or allocation size. ' +
+      'A negative value like -1 trivially passes `if (index < max_entries)` because -1 < 32 is true in signed ' +
+      'arithmetic, but when cast to size_t or used as an unsigned offset, -1 becomes 0xFFFFFFFF (4 GB) — a ' +
+      'massive out-of-bounds write. CVE-2024-56614 (Linux kernel AF_XDP xsk_map) allowed kernel OOB writes ' +
+      'because the check `if (k >= max_entries)` did not block negative signed values of k, letting a ' +
+      'user-controlled index reach kernel memory far outside the map array. CVE-2024-47606 (GStreamer) ' +
+      'turned a signed integer underflow in Theora extension parsing into remote code execution — the ' +
+      '`gint size` variable went negative, passed a positive-only guard, then was used as a length for ' +
+      'a memcpy that corrupted the heap. CVE-2007-1997 (ClamAV) exploited a signed comparison in CHM ' +
+      'archive parsing to trigger a stack-based buffer overflow. ' +
+      'In the assembly, `cmpl` performs a signed comparison (using `jge`/`jl` rather than unsigned ' +
+      '`jae`/`jb`), so the negative index passes the guard; the subsequent `imull` multiplies the ' +
+      'negative value to compute the offset, producing a large wrapped result that `addl` feeds ' +
+      'directly into the buffer write — an OOB primitive.',
+    code:
+`# CVE pattern: signed index passes < check, wraps for OOB write
+class ArrayMap:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slot0 = 0
+        self.slot1 = 0
+        self.write_count = 0
+
+    def delete_entry(self, index):
+        if index < self.capacity:
+            offset = index * 8
+            self.slot0 += offset
+            self.write_count += 1
+        return self.write_count
+
+    def read_total(self):
+        result = self.slot0 + self.slot1
+        return result
+
+amap = ArrayMap(32)
+amap.delete_entry(4)
+neg_index = 0 - 1
+amap.delete_entry(neg_index)
+result = amap.read_total()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'imull'],
+      description: 'cmpl uses signed comparison (jl/jge) so -1 passes the < capacity check; imull then multiplies the negative index by 8, producing a wrapped offset that addl applies as an out-of-bounds write far outside the buffer',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
