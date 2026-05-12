@@ -633,6 +633,67 @@ print(hijacked)
       description: 'movl loads NOP sled (0x90909090) and shellcode (0xDEADBEEF) into stack slots for each SprayBlock; addl accumulates total_bytes in the spray loop — deref_corrupted adds an offset to last_payload with no bounds check, landing execution in attacker-sprayed memory',
     },
   },
+  {
+    id: 'null-deref',
+    name: 'NULL POINTER DEREFERENCE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Dereferencing an unchecked NULL pointer crashes the process or lets an attacker map code at address zero for kernel-mode execution.',
+    explanation:
+      'NULL pointer dereference (CWE-476) occurs when a program follows a pointer it expects to be valid ' +
+      'but which is NULL, typically crashing with SIGSEGV. On older kernels without mmap_min_addr or SMAP, ' +
+      'an attacker can mmap page zero and place shellcode there — when the kernel dereferences a NULL function ' +
+      'pointer, execution jumps to the attacker\'s code running in ring 0. ' +
+      'CVE-2009-2692 (Linux kernel sendpage) exploited uninitialized proto_ops function pointers: the kernel ' +
+      'called a NULL sendpage handler after the attacker mapped executable code at address 0x0, achieving ' +
+      'local privilege escalation to root. CVE-2019-9213 bypassed mmap_min_addr protections by exploiting a ' +
+      'missing check in expand_downwards, re-enabling NULL-page mapping on non-SMAP platforms. ' +
+      'CVE-2025-49694 (Windows Server 2025) demonstrated a kernel NULL dereference granting local privilege ' +
+      'escalation without user interaction. CWE-476 ranks in the 2024 CWE Top 25 most dangerous weaknesses. ' +
+      'In the assembly, `movl $0` zeroes the handler field but no conditional branch guards the subsequent ' +
+      '`addl` that reads from the same offset — the CPU dereferences the NULL-derived address, landing in ' +
+      'attacker-controlled memory at the zero page.',
+    code:
+`# CVE pattern: NULL function ptr called — attacker maps code at 0x0
+class Object:
+    def __init__(self, handler, data):
+        self.handler = handler
+        self.data = data
+        self.refcount = 1
+
+    def invoke(self):
+        result = self.handler + self.data
+        self.refcount -= 1
+        return result
+
+class Allocator:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.count = 0
+        self.last_result = 0
+
+    def create(self, handler, data):
+        obj = Object(handler, data)
+        self.count += 1
+        return obj
+
+    def release(self, obj):
+        obj.handler = 0
+        obj.data = 0
+        self.count -= 1
+        return self.count
+
+alloc = Allocator(64)
+obj = alloc.create(4196352, 256)
+alloc.release(obj)
+dangling = obj.invoke()
+print(dangling)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl zeroes the handler field (simulating NULL assignment); the subsequent invoke\'s addl reads from the same stack offset without a NULL guard — on a real system the CPU dereferences address 0x0 where the attacker has mapped shellcode via mmap',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
