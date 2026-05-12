@@ -572,6 +572,67 @@ print(result)
       description: 'cmpl uses signed comparison (jl/jge) so -1 passes the < capacity check; imull then multiplies the negative index by 8, producing a wrapped offset that addl applies as an out-of-bounds write far outside the buffer',
     },
   },
+  {
+    id: 'heap-spray',
+    name: 'HEAP SPRAY',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker fills the heap with NOP-sled + shellcode blocks so any corrupted pointer dereference lands in controlled memory.',
+    explanation:
+      'Heap spraying (CWE-122 adjacent) is a reliability technique that fills the process heap with hundreds of ' +
+      'identical blocks — each containing a NOP sled (0x90 bytes) followed by shellcode — so that any corrupted ' +
+      'pointer dereference statistically lands in attacker-controlled memory. The technique transforms unreliable ' +
+      'use-after-free or buffer overflow bugs into near-deterministic code execution. ' +
+      'CVE-2022-0609 (Chrome Animation UAF, exploited in the wild by Lazarus Group) used heap spraying after ' +
+      'corrupting animation object pointers to achieve reliable RCE. CVE-2025-4096 (Chrome HTML parser heap ' +
+      'overflow) was noted as chainable with heap spraying for controlled code execution. The technique dates ' +
+      'to 2001 but became widespread in 2005 via Internet Explorer ActiveX exploits; modern variants target ' +
+      'V8 and SpiderMonkey JIT heaps. ' +
+      'In the assembly, the spray loop\'s `addl` accumulates total_bytes from each SprayBlock — the NOP sled ' +
+      'value (0x90909090) and shellcode marker (0xDEADBEEF) are loaded by `movl` into stack slots; ' +
+      '`deref_corrupted` adds an offset directly to last_payload with no bounds check, simulating an ' +
+      'arbitrary pointer dereference into sprayed memory.',
+    code:
+`# CVE pattern: heap filled with NOP sleds — corrupted ptr lands in payload
+class SprayBlock:
+    def __init__(self, sled, payload):
+        self.sled = sled
+        self.payload = payload
+        self.size = sled + payload
+
+class Heap:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.fill_count = 0
+        self.total_bytes = 0
+        self.last_payload = 0
+
+    def spray(self, sled, payload, count):
+        i = 0
+        while i < count:
+            block = SprayBlock(sled, payload)
+            self.total_bytes += block.size
+            self.last_payload = block.payload
+            self.fill_count += 1
+            i += 1
+        return self.fill_count
+
+    def deref_corrupted(self, offset):
+        result = self.last_payload + offset
+        return result
+
+heap = Heap(1048576)
+nop_sled = 2425393296
+shellcode = 3735928559
+heap.spray(nop_sled, shellcode, 8)
+hijacked = heap.deref_corrupted(256)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads NOP sled (0x90909090) and shellcode (0xDEADBEEF) into stack slots for each SprayBlock; addl accumulates total_bytes in the spray loop — deref_corrupted adds an offset to last_payload with no bounds check, landing execution in attacker-sprayed memory',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
