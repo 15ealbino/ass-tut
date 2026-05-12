@@ -256,7 +256,156 @@ Returns `{"status":"ok"}`. No auth required. Useful for liveness checks.
    ```
 4. Migrations run automatically on backend startup (`alembic upgrade head` is the container entrypoint).
 
-For production, put a TLS-terminating reverse proxy (nginx, Caddy, etc.) in front of port 5173.
+For production, put a TLS-terminating reverse proxy (nginx, Caddy, etc.) in front of port 80. The recommended path for a public deployment is the Oracle Cloud VM walkthrough below — it bundles Caddy and Let's Encrypt out of the box.
+
+---
+
+### Oracle Cloud VM with HTTPS (Caddy + Cloudflare)
+
+This is the recommended production path. The stack runs as containers on an Oracle Cloud Always-Free VM; a Caddy sidecar terminates TLS, fetches and renews Let's Encrypt certificates automatically, and proxies traffic to the frontend.
+
+**End state.** `https://assembly-tutorial-ea.assembly-tutorial.com` serves the app over HTTPS with a real (browser-trusted) certificate. The backend and frontend containers are not directly reachable from the public internet — only Caddy listens on `:80` and `:443`.
+
+#### Prerequisites
+
+- An Oracle Cloud VM instance (Always-Free `VM.Standard.E2.1.Micro` or larger), Oracle Linux 8/9 or Ubuntu 22.04+
+- SSH access to the VM as a user in the `docker` group
+- A domain registered and managed via Cloudflare (this guide uses `assembly-tutorial.com`)
+- The repo cloned onto the VM (`/home/<user>/ass-tut` or similar)
+
+#### Step 1 — Add the DNS A record in Cloudflare
+
+In the Cloudflare dashboard, select `assembly-tutorial.com` → **DNS → Records → Add record**:
+
+| Field | Value |
+|-------|-------|
+| Type | `A` |
+| Name | `assembly-tutorial-ea` |
+| IPv4 address | the VM's public IP (find in OCI console → Instance details) |
+| Proxy status | **DNS only** (gray cloud) — required so Let's Encrypt can complete the HTTP-01 challenge on first issuance |
+| TTL | `Auto` |
+
+Verify propagation from any machine:
+
+```bash
+dig +short assembly-tutorial-ea.assembly-tutorial.com
+```
+
+The output must be the VM's public IP. If it shows nothing or a Cloudflare IP (`104.x` / `172.x`), the record is not yet live or proxying is on.
+
+Once Caddy has issued the certificate (after Step 5), you may flip the proxy status to **Proxied** (orange cloud) — set Cloudflare SSL/TLS mode to **Full (strict)** before doing so to avoid redirect loops.
+
+#### Step 2 — Open ports 80 and 443 in the Oracle Cloud security list
+
+In the OCI console: **Networking → Virtual Cloud Networks → your VCN → Security Lists → Default Security List → Add Ingress Rules**:
+
+| Source CIDR | IP Protocol | Destination Port |
+|-------------|-------------|------------------|
+| `0.0.0.0/0` | TCP | `80` |
+| `0.0.0.0/0` | TCP | `443` |
+| `0.0.0.0/0` | UDP | `443` |
+
+UDP `443` is for HTTP/3, which Caddy enables by default. Omit it if you don't want HTTP/3.
+
+#### Step 3 — Open ports 80 and 443 in the VM firewall
+
+Oracle Linux and Ubuntu ship with `iptables` blocking inbound traffic by default. Open the ports and persist the rules:
+
+```bash
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p udp --dport 443 -j ACCEPT
+```
+
+Save the rules so they survive a reboot:
+
+```bash
+# Oracle Linux
+sudo service iptables save
+
+# Ubuntu / Debian
+sudo apt install -y iptables-persistent
+sudo netfilter-persistent save
+```
+
+#### Step 4 — Install Docker and Docker Compose v2
+
+```bash
+# Oracle Linux 8/9
+sudo dnf install -y docker
+sudo systemctl enable --now docker
+
+# Ubuntu 22.04+
+sudo apt update && sudo apt install -y docker.io docker-compose-v2
+sudo systemctl enable --now docker
+```
+
+Add yourself to the `docker` group so you can run compose without `sudo`, then log out and back in:
+
+```bash
+sudo usermod -aG docker $USER
+```
+
+#### Step 5 — Configure environment and start the stack
+
+From the cloned repo on the VM:
+
+```bash
+cd ~/ass-tut
+cp .env.example .env
+```
+
+Edit `.env` and set both variables:
+
+```bash
+SECRET_KEY=$(openssl rand -hex 32)
+DOMAIN=assembly-tutorial-ea.assembly-tutorial.com
+```
+
+Bring up the stack with the production overlay — this adds the Caddy reverse proxy and removes the direct public ports for the backend and frontend:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+Watch the certificate issuance live:
+
+```bash
+docker compose logs -f caddy
+```
+
+You should see `certificate obtained successfully` for `assembly-tutorial-ea.assembly-tutorial.com` within ~30 seconds. Press `Ctrl-C` to detach (the container keeps running).
+
+#### Step 6 — Verify
+
+```bash
+curl -I https://assembly-tutorial-ea.assembly-tutorial.com
+# → HTTP/2 200
+```
+
+Open the URL in a browser — you should see the editor, served over a valid certificate with no warning.
+
+#### Updating the deployment
+
+After pulling new commits on the VM:
+
+```bash
+cd ~/ass-tut
+git pull
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+Caddy keeps its certificates in the `caddy_data` named volume, so rebuilds and restarts do not re-trigger Let's Encrypt issuance.
+
+#### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `dig` returns a Cloudflare IP, not your VM IP | Proxy is on (orange cloud) | Set the record to **DNS only** for the first cert; re-enable proxy afterwards |
+| Caddy logs `acme: error: 400 ... no TXT record` or hangs on challenge | Port 80 blocked on Oracle security list or VM iptables | Re-check Step 2 and Step 3 |
+| Browser shows `too many redirects` after enabling Cloudflare proxy | Cloudflare SSL mode set to **Flexible** | Change to **Full (strict)** in Cloudflare SSL/TLS settings |
+| `docker compose` reports `address already in use` for port 80 | System nginx or apache is bound to `:80` | `sudo systemctl disable --now nginx apache2` |
+| HTTP 502 from Caddy | Frontend container not healthy | `docker compose logs frontend`; rebuild with `--build` |
 
 ---
 
