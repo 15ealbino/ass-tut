@@ -704,6 +704,15 @@ const SEVERITY_COLOR: Record<string, string> = {
   MEDIUM: 'var(--cyan)',
 }
 
+function sampleN<T>(arr: T[], n: number): T[] {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a.slice(0, Math.min(n, a.length))
+}
+
 const STARTER = `# Write Python below and click [> COMPILE]
 x = 10
 y = 20
@@ -727,6 +736,7 @@ export default function EditorPage() {
   const [activePyLine, setActivePyLine] = useState<number | null>(null)
   const [activeVuln, setActiveVuln] = useState<Vuln | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [displayedVulns] = useState(() => sampleN(VULNS, 10))
   const [paneOrder, setPaneOrder] = useState<Array<'python' | 'c' | 'asm'>>(['python', 'c', 'asm'])
   const [closedPanes, setClosedPanes] = useState(new Set<string>())
   const [dragOver, setDragOver] = useState<string | null>(null)
@@ -971,7 +981,7 @@ export default function EditorPage() {
           {/* Vuln card list */}
           {sidebarOpen && (
             <div style={{ overflowY: 'auto', flex: 1, padding: '6px 6px' }}>
-              {VULNS.map(v => {
+              {displayedVulns.map(v => {
                 const isActive = activeVuln?.id === v.id
                 const sevColor = SEVERITY_COLOR[v.severity]
                 return (
