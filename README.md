@@ -264,7 +264,7 @@ For production, put a TLS-terminating reverse proxy (nginx, Caddy, etc.) in fron
 
 This is the recommended production path. The stack runs as containers on an Oracle Cloud Always-Free VM; a Caddy sidecar terminates TLS, fetches and renews Let's Encrypt certificates automatically, and proxies traffic to the frontend.
 
-**End state.** `https://assembly-tutorial-ea.assembly-tutorial.com` serves the app over HTTPS with a real (browser-trusted) certificate. The backend and frontend containers are not directly reachable from the public internet — only Caddy listens on `:80` and `:443`.
+**End state.** `https://assembly-tutorial.com` serves the app over HTTPS with a real (browser-trusted) certificate. The backend and frontend containers are not directly reachable from the public internet — only Caddy listens on `:80` and `:443`.
 
 #### Prerequisites
 
@@ -280,7 +280,7 @@ In the Cloudflare dashboard, select `assembly-tutorial.com` → **DNS → Record
 | Field | Value |
 |-------|-------|
 | Type | `A` |
-| Name | `assembly-tutorial-ea` |
+| Name | `@` (the apex — Cloudflare resolves `@` to `assembly-tutorial.com`) |
 | IPv4 address | the VM's public IP (find in OCI console → Instance details) |
 | Proxy status | **DNS only** (gray cloud) — required so Let's Encrypt can complete the HTTP-01 challenge on first issuance |
 | TTL | `Auto` |
@@ -288,7 +288,7 @@ In the Cloudflare dashboard, select `assembly-tutorial.com` → **DNS → Record
 Verify propagation from any machine:
 
 ```bash
-dig +short assembly-tutorial-ea.assembly-tutorial.com
+dig +short assembly-tutorial.com
 ```
 
 The output must be the VM's public IP. If it shows nothing or a Cloudflare IP (`104.x` / `172.x`), the record is not yet live or proxying is on.
@@ -359,7 +359,7 @@ Edit `.env` and set both variables:
 
 ```bash
 SECRET_KEY=$(openssl rand -hex 32)
-DOMAIN=assembly-tutorial-ea.assembly-tutorial.com
+DOMAIN=assembly-tutorial.com
 ```
 
 Bring up the stack with the production overlay — this adds the Caddy reverse proxy and removes the direct public ports for the backend and frontend:
@@ -374,12 +374,12 @@ Watch the certificate issuance live:
 docker compose logs -f caddy
 ```
 
-You should see `certificate obtained successfully` for `assembly-tutorial-ea.assembly-tutorial.com` within ~30 seconds. Press `Ctrl-C` to detach (the container keeps running).
+You should see `certificate obtained successfully` for `assembly-tutorial.com` within ~30 seconds. Press `Ctrl-C` to detach (the container keeps running).
 
 #### Step 6 — Verify
 
 ```bash
-curl -I https://assembly-tutorial-ea.assembly-tutorial.com
+curl -I https://assembly-tutorial.com
 # → HTTP/2 200
 ```
 
