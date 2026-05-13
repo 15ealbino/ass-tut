@@ -694,6 +694,65 @@ print(dangling)
       description: 'movl zeroes the handler field (simulating NULL assignment); the subsequent invoke\'s addl reads from the same stack offset without a NULL guard — on a real system the CPU dereferences address 0x0 where the attacker has mapped shellcode via mmap',
     },
   },
+  {
+    id: 'write-what-where',
+    name: 'WRITE-WHAT-WHERE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker gains ability to write an arbitrary value to an arbitrary memory address, enabling full control hijack.',
+    explanation:
+      'A write-what-where condition (CWE-123) gives the attacker a primitive to write any value (the "what") to any ' +
+      'memory address (the "where"). This is the most powerful corruption primitive: with a single controlled write, ' +
+      'an attacker can overwrite function pointers, GOT entries, return addresses, or security-critical flags. ' +
+      'The primitive typically arises from corrupted heap metadata (unlinking a freed chunk patches arbitrary pointers), ' +
+      'out-of-bounds array indexing with an attacker-controlled index and value, or format string %n writes. ' +
+      'CVE-2024-21338 (Windows AppLocker kernel driver) was exploited by the Lazarus Group: the appid.sys IOCTL ' +
+      'allowed tricking the kernel into calling an arbitrary pointer, which Lazarus used to establish a kernel ' +
+      'read/write primitive and deploy the FudModule rootkit with SYSTEM privileges. CVE-2024-1086 (Linux netfilter ' +
+      'nf_tables) provided an arbitrary write via a use-after-free in verdict handling, enabling local privilege ' +
+      'escalation to root — actively exploited in ransomware campaigns by RansomHub and Akira in 2025. ' +
+      'In the assembly, `imull` computes the byte offset from the attacker-controlled index, and `movl` writes the ' +
+      'attacker-chosen value at that computed offset — no bounds check guards the store, giving a full write-what-where primitive.',
+    code:
+`# CVE pattern: controlled index + value = write-what-where primitive
+class HeapMeta:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.guard = 1337
+
+    def write_entry(self, index, value):
+        offset = index * 8
+        if index == 0:
+            self.slot0 = value
+        elif index == 1:
+            self.slot1 = value
+        elif index == 2:
+            self.slot2 = value
+        else:
+            self.guard = value
+        return offset
+
+    def read_guard(self):
+        result = self.guard + self.slot0
+        return result
+
+meta = HeapMeta(32)
+meta.write_entry(0, 100)
+meta.write_entry(1, 200)
+attacker_index = 99
+attacker_value = 3735928559
+meta.write_entry(attacker_index, attacker_value)
+leaked = meta.read_guard()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['imull', 'movl'],
+      description: 'imull computes the byte offset from the attacker-controlled index (99) without bounds checking; movl writes the attacker-chosen value (0xDEADBEEF) at that offset — overwriting the guard slot simulates corrupting heap metadata or a GOT entry for full control hijack',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
