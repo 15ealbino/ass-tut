@@ -753,6 +753,65 @@ print(leaked)
       description: 'imull computes the byte offset from the attacker-controlled index (99) without bounds checking; movl writes the attacker-chosen value (0xDEADBEEF) at that offset — overwriting the guard slot simulates corrupting heap metadata or a GOT entry for full control hijack',
     },
   },
+  {
+    id: 'ret2libc',
+    name: 'RET2LIBC',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Buffer overflow overwrites the return address with libc\'s system() to spawn a shell, bypassing non-executable stack (NX/DEP).',
+    explanation:
+      'Return-to-libc (ret2libc) is the foundational code-reuse attack: instead of injecting shellcode onto a ' +
+      'non-executable stack, the attacker overwrites the saved return address with the address of libc\'s system() ' +
+      'function and places a pointer to "/bin/sh" in the argument slot — when the function epilogue executes `ret`, ' +
+      'control transfers directly to system("/bin/sh"), spawning a root shell. First demonstrated by Alexander ' +
+      'Peslyak in 1997, ret2libc remains the basis for modern ROP chains and SROP attacks. ' +
+      'CVE-2023-6246 (glibc __vsyslog_internal heap overflow) enabled local privilege escalation to root on ' +
+      'Debian, Ubuntu, and Fedora by exploiting a buffer overflow in syslog() — the attacker leveraged libc\'s ' +
+      'own functions to escalate from unprivileged user to full root. CVE-2023-4911 (Looney Tunables, glibc ' +
+      'ld.so GLIBC_TUNABLES overflow) similarly allowed LPE via a crafted environment variable that overwrote ' +
+      'the dynamic linker\'s stack frame with controlled addresses. ' +
+      'In the assembly, `cmpl` checks the buffer offset but the attacker-supplied index exceeds it; `movl` writes ' +
+      'the libc system() address into the return-address stack slot, and `addl` combines it with the ' +
+      '/bin/sh pointer argument — the function epilogue\'s `ret` pops this address into %rip, jumping to system().',
+    code:
+`# CVE pattern: overflow redirects return to libc system() — bypasses NX
+class StackFrame:
+    def __init__(self, ret_addr):
+        self.buf_size = 64
+        self.canary = 0
+        self.saved_rbp = 4196352
+        self.ret_addr = ret_addr
+        self.arg_slot = 0
+
+    def write_buf(self, offset, value):
+        if offset < self.buf_size:
+            self.canary += value
+        elif offset == self.buf_size:
+            self.saved_rbp = value
+        elif offset == self.buf_size + 1:
+            self.ret_addr = value
+        else:
+            self.arg_slot = value
+        return offset
+
+    def execute_ret(self):
+        result = self.ret_addr + self.arg_slot
+        return result
+
+frame = StackFrame(4196608)
+libc_system = 4151632
+bin_sh_ptr = 4217856
+frame.write_buf(64, 1094795585)
+frame.write_buf(65, libc_system)
+frame.write_buf(66, bin_sh_ptr)
+hijacked = frame.execute_ret()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl checks the buffer offset but attacker-supplied values exceed it; movl writes the libc system() address into the return-address slot on the stack; addl combines it with the /bin/sh argument pointer — the ret epilogue pops this into %rip, jumping to system("/bin/sh")',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
