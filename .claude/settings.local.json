@@ -12,7 +12,24 @@
       "Bash(npx tsc *)",
       "Bash(git push *)",
       "Bash(npm run *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(DOMAIN=assembly-tutorial-ea.example.com docker compose config)",
+      "Bash(DOMAIN=assembly-tutorial-ea.assembly-tutorial.com docker compose -f docker-compose.yml -f docker-compose.prod.yml config)",
+      "Bash(docker compose *)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m pytest tests/ -x --tb=short)",
+      "Bash(pip3 list *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -m pip --version)",
+      "Bash(python3 -m ensurepip --version)",
+      "Bash(apt list *)",
+      "Bash(python3 *)",
+      "Bash(gcc -S /tmp/test.c -o /tmp/test.s)",
+      "Read(//tmp/**)",
+      "Bash(./node_modules/.bin/tsc --noEmit)",
+      "Bash(./node_modules/.bin/vite build *)",
+      "Bash(gcc -S /tmp/mixed.c -o /tmp/mixed.s)",
+      "Bash(gcc -S -O0 /tmp/mixed.c -o /tmp/mixed.s)"
     ]
   }
 }

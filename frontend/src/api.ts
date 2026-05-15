@@ -41,6 +41,11 @@ export interface CompileResponse {
   line_map: Record<number, LineMapping>
 }
 
-export function compile(code: string) {
-  return request<CompileResponse>('/compile', { method: 'POST', body: JSON.stringify({ code }) })
+export type CompileMethod = 'transpile' | 'pyghidra'
+
+export function compile(code: string, method: CompileMethod = 'transpile') {
+  return request<CompileResponse>('/compile', {
+    method: 'POST',
+    body: JSON.stringify({ code, method }),
+  })
 }

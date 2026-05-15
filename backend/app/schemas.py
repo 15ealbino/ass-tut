@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 class UserRegister(BaseModel):
     email: EmailStr
@@ -18,10 +18,16 @@ class LineMapping(BaseModel):
     asm_lines: List[int]
     color: str
 
+# Compile backend selectors:
+#   transpile — the AST→C→gcc pipeline (default; supports per-line mapping)
+#   pyghidra  — Nuitka → native binary → Ghidra disassembly + decompiled C
+CompileMethod = Literal["transpile", "pyghidra"]
+
 class CompileRequest(BaseModel):
     # Enforce the character cap at the schema layer so oversized bodies are
     # rejected before they are fully deserialized by the application logic.
     code: str = Field(max_length=10_000)
+    method: CompileMethod = "transpile"
 
 class CompileResponse(BaseModel):
     python_lines: List[str]

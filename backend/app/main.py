@@ -13,6 +13,11 @@ from app.auth import (
 )
 from app.compile import CompileError, compile_python
 from app.config import settings
+from app.pyghidra_compile import (
+    PyGhidraCompileError,
+    PyGhidraUnavailable,
+    compile_pyghidra,
+)
 from app.database import SessionLocal, get_db
 from app.schemas import CompileRequest, CompileResponse, Token, UserLogin, UserRegister
 
@@ -82,7 +87,18 @@ async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
 @app.post("/compile", response_model=CompileResponse)
 async def compile_code(body: CompileRequest):
     try:
-        result = await compile_python(body.code)
+        if body.method == "pyghidra":
+            result = await compile_pyghidra(body.code)
+        else:
+            result = await compile_python(body.code)
+    except PyGhidraUnavailable as e:
+        # Toolchain missing — return 503 so the frontend can show a "backend
+        # unavailable" message rather than treating it as a user error.
+        logger.warning("PyGhidra unavailable: %s", e)
+        raise HTTPException(status_code=503, detail=f"PyGhidra unavailable: {e}")
+    except PyGhidraCompileError as e:
+        logger.warning("PyGhidra compile error: %s", e)
+        raise HTTPException(status_code=422, detail=str(e))
     except CompileError as e:
         logger.warning("Compile error: %s", e)
         raise HTTPException(status_code=422, detail=str(e))

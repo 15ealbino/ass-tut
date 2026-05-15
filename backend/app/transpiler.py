@@ -3,7 +3,7 @@ Python AST → C transpiler with line-number mapping.
 Returns (c_source: str, mapping: dict[py_lineno -> list[c_lineno]])
 """
 import ast
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 COLORS = [
     "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
@@ -11,6 +11,47 @@ COLORS = [
     "#F0B27A", "#85C1E9", "#F1948A", "#73C6B6", "#D2B4DE",
     "#A9CCE3", "#A3E4D7", "#FAD7A0", "#A9DFBF", "#F9E79F",
 ]
+
+# ── Stdlib-import shim registry ────────────────────────────────────────────
+#
+# Each entry maps (module_name, attribute) → (c_template, arity, headers, return_type).
+# c_template uses {0}, {1}, ... as positional argument placeholders. The
+# template is the C expression substituted at the use-site.
+#
+# Adding a new shim: list the headers it needs and the C return type so
+# variable declarations and printf format strings get inferred correctly.
+
+SUPPORTED_MODULES: Set[str] = {"time", "math", "random", "sys", "json"}
+
+SHIMS: Dict[Tuple[str, str], Tuple[str, int, List[str], str]] = {
+    ("time", "time"):     ("((long)time(NULL))", 0, ["<time.h>"], "long"),
+    ("time", "sleep"):    ("sleep({0})", 1, ["<unistd.h>"], "int"),
+    ("math", "sqrt"):     ("sqrt((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "pow"):      ("pow((double)({0}), (double)({1}))", 2, ["<math.h>"], "double"),
+    ("math", "floor"):    ("floor((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "ceil"):     ("ceil((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "fabs"):     ("fabs((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "log"):      ("log((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "log2"):     ("log2((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "log10"):    ("log10((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "exp"):      ("exp((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "sin"):      ("sin((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "cos"):      ("cos((double)({0}))", 1, ["<math.h>"], "double"),
+    ("math", "tan"):      ("tan((double)({0}))", 1, ["<math.h>"], "double"),
+    ("random", "random"):  ("((double)rand() / (double)RAND_MAX)", 0, ["<stdlib.h>"], "double"),
+    ("random", "randint"): ("(({0}) + rand() % ((({1}) - ({0})) + 1))", 2, ["<stdlib.h>"], "int"),
+    ("random", "seed"):    ("srand((unsigned int)({0}))", 1, ["<stdlib.h>"], "void"),
+    ("sys", "exit"):       ("exit({0})", 1, ["<stdlib.h>"], "void"),
+    # json.dumps emits a call to a tiny helper function written into the C source.
+    ("json", "dumps"):     ("_shim_json_dumps_int((int)({0}))", 1, [], "const char*"),
+}
+
+SHIM_CONSTS: Dict[Tuple[str, str], Tuple[str, List[str], str]] = {
+    ("math", "pi"):  ("M_PI", ["<math.h>"], "double"),
+    ("math", "e"):   ("M_E", ["<math.h>"], "double"),
+    ("math", "inf"): ("INFINITY", ["<math.h>"], "double"),
+}
+
 
 class TranspileError(Exception):
     pass
@@ -40,23 +81,82 @@ class CEmitter:
         return "\n".join(self.lines)
 
 
-def _type_for(node: ast.expr) -> str:
-    if isinstance(node, ast.Constant):
-        if isinstance(node.value, float):
-            return "double"
-        if isinstance(node.value, str):
-            return "char*"
-    return "int"
-
-
 class Transpiler(ast.NodeVisitor):
     def __init__(self):
         self.emitter = CEmitter()
         self._declared: set = set()
+        self._var_types: Dict[str, str] = {}      # var_name -> emitted C type (used by print)
         self._in_func = False
         self._classes: Dict[str, Dict] = {}       # class_name -> {fields, methods}
         self._instance_types: Dict[str, str] = {} # var_name -> class_name
         self._in_method: str | None = None        # class name when inside a method
+        # ── Import shim tracking ─────────────────────────────────────────
+        # alias -> module name (eg `import time as t` → {"t": "time"})
+        self._imports: Dict[str, str] = {}
+        # alias -> (module, attr)  (eg `from math import sqrt as s` → {"s": ("math", "sqrt")})
+        self._from_imports: Dict[str, Tuple[str, str]] = {}
+        self._needed_headers: Set[str] = set()
+        self._needs_json_helper = False
+
+    def _type_for(self, node: ast.expr) -> str:
+        """Best-effort static type of an expression — used for variable declarations
+        and printf format-string selection."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return "int"
+            if isinstance(node.value, float):
+                return "double"
+            if isinstance(node.value, str):
+                return "char*"
+            return "int"
+        if isinstance(node, ast.Call):
+            shim = self._shim_for_call(node)
+            if shim is not None:
+                return shim[3]
+        if isinstance(node, ast.Attribute):
+            const = self._shim_const_for(node)
+            if const is not None:
+                return const[2]
+        if isinstance(node, ast.Name):
+            if node.id in self._from_imports:
+                const = SHIM_CONSTS.get(self._from_imports[node.id])
+                if const is not None:
+                    return const[2]
+            return self._var_types.get(node.id, "int")
+        return "int"
+
+    def _shim_for_call(self, node: ast.Call) -> Tuple[str, int, List[str], str] | None:
+        """Return the SHIMS entry for a call node, or None."""
+        key = self._shim_key_for_call(node)
+        return SHIMS.get(key) if key is not None else None
+
+    def _shim_key_for_call(self, node: ast.Call) -> Tuple[str, str] | None:
+        """Return the (module, attr) key a call resolves to under the import map."""
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self._imports):
+            return (self._imports[node.func.value.id], node.func.attr)
+        if isinstance(node.func, ast.Name) and node.func.id in self._from_imports:
+            return self._from_imports[node.func.id]
+        return None
+
+    def _shim_const_for(self, node: ast.Attribute) -> Tuple[str, List[str], str] | None:
+        """Return the SHIM_CONSTS entry for an attribute node like `math.pi`, or None."""
+        if (isinstance(node.value, ast.Name)
+                and node.value.id in self._imports):
+            module = self._imports[node.value.id]
+            return SHIM_CONSTS.get((module, node.attr))
+        return None
+
+    def _render_shim_call(self, key: Tuple[str, str], call: ast.Call) -> str:
+        """Substitute the call's arguments into the shim template."""
+        template, arity, _, _ = SHIMS[key]
+        if len(call.args) != arity:
+            raise TranspileError(
+                f"Line {call.lineno}: {key[0]}.{key[1]}() expects {arity} arg(s), got {len(call.args)}"
+            )
+        rendered_args = [self._expr(a) for a in call.args]
+        return template.format(*rendered_args)
 
     # ── main entry ─────────────────────────────────────────────────────────
 
@@ -66,10 +166,31 @@ class Transpiler(ast.NodeVisitor):
         except SyntaxError as e:
             raise TranspileError(f"Python syntax error: {e}")
 
+        # ── First pass: register imports & precompute needed headers ──────
+        # Imports must be processed before we emit headers, since we want the
+        # shim system to know what's in scope before we visit() the body.
+        self._scan_imports_and_shims(tree)
+
         e = self.emitter
         e.emit('#include <stdio.h>')
         e.emit('#include <string.h>')
+        for header in sorted(self._needed_headers - {"<stdio.h>", "<string.h>"}):
+            e.emit(f'#include {header}')
         e.emit('')
+
+        # Emit the tiny json.dumps helper if any json.dumps(...) call appears.
+        # The static buffer is single-shot per call — chained dumps() inside one
+        # expression would clobber each other, but that's an acceptable trade-off
+        # for an educational stdio-only shim.
+        if self._needs_json_helper:
+            e.emit('static char _shim_json_buf[64];')
+            e.emit('static const char* _shim_json_dumps_int(int v) {')
+            e.indent()
+            e.emit('snprintf(_shim_json_buf, sizeof(_shim_json_buf), "%d", v);')
+            e.emit('return _shim_json_buf;')
+            e.dedent()
+            e.emit('}')
+            e.emit('')
 
         # ── Emit struct typedefs and method forward-decls for all classes ──
         class_nodes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
@@ -112,6 +233,57 @@ class Transpiler(ast.NodeVisitor):
                     self._emit_method(cls.name, method)
 
         return e.source(), e.py_to_c
+
+    # ── Import scanning ─────────────────────────────────────────────────────
+
+    def _scan_imports_and_shims(self, tree: ast.Module):
+        """Top-level imports register module aliases; a tree-walk then collects
+        every header any used shim would require so they can be emitted upfront.
+        """
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    mod = alias.name
+                    if mod not in SUPPORTED_MODULES:
+                        raise TranspileError(
+                            f"Line {node.lineno}: unsupported import '{mod}'. "
+                            f"Supported modules: {', '.join(sorted(SUPPORTED_MODULES))}"
+                        )
+                    self._imports[alias.asname or mod] = mod
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module
+                if mod not in SUPPORTED_MODULES:
+                    raise TranspileError(
+                        f"Line {node.lineno}: unsupported import from '{mod}'. "
+                        f"Supported modules: {', '.join(sorted(SUPPORTED_MODULES))}"
+                    )
+                for alias in node.names:
+                    if alias.name == "*":
+                        raise TranspileError(
+                            f"Line {node.lineno}: wildcard 'from {mod} import *' is not supported"
+                        )
+                    self._from_imports[alias.asname or alias.name] = (mod, alias.name)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                shim = self._shim_for_call(node)
+                if shim is not None:
+                    self._needed_headers.update(shim[2])
+                    # Detect json.dumps so the helper is emitted upfront.
+                    if (isinstance(node.func, ast.Attribute)
+                            and isinstance(node.func.value, ast.Name)
+                            and node.func.value.id in self._imports
+                            and self._imports[node.func.value.id] == "json"
+                            and node.func.attr == "dumps"):
+                        self._needs_json_helper = True
+                    elif (isinstance(node.func, ast.Name)
+                            and node.func.id in self._from_imports
+                            and self._from_imports[node.func.id] == ("json", "dumps")):
+                        self._needs_json_helper = True
+            elif isinstance(node, ast.Attribute):
+                const = self._shim_const_for(node)
+                if const is not None:
+                    self._needed_headers.update(const[1])
 
     # ── Class helpers ───────────────────────────────────────────────────────
 
@@ -175,8 +347,10 @@ class Transpiler(ast.NodeVisitor):
 
         saved_declared = self._declared.copy()
         saved_types = self._instance_types.copy()
+        saved_var_types = self._var_types.copy()
         saved_in_func = self._in_func
         self._declared = {a.arg for a in method.args.args if a.arg != 'self'}
+        self._var_types = {a.arg: "int" for a in method.args.args if a.arg != 'self'}
         self._in_method = class_name
         self._in_func = True
 
@@ -187,6 +361,7 @@ class Transpiler(ast.NodeVisitor):
         self._in_method = None
         self._declared = saved_declared
         self._instance_types = saved_types
+        self._var_types = saved_var_types
 
         if method.name != '__init__':
             e.emit('return 0;', method.end_lineno)
@@ -203,9 +378,11 @@ class Transpiler(ast.NodeVisitor):
         e.indent()
         saved = self._declared.copy()
         saved_types = self._instance_types.copy()
+        saved_var_types = self._var_types.copy()
         saved_in_func = self._in_func
         saved_in_method = self._in_method
         self._declared = set(a.arg for a in node.args.args)
+        self._var_types = {a.arg: "int" for a in node.args.args}
         self._in_func = True
         self._in_method = None  # top-level functions are not inside a class method
         for child in node.body:
@@ -214,6 +391,7 @@ class Transpiler(ast.NodeVisitor):
         self._in_method = saved_in_method
         self._declared = saved
         self._instance_types = saved_types
+        self._var_types = saved_var_types
         e.emit('return 0;', node.end_lineno)
         e.dedent()
         e.emit('}')
@@ -263,9 +441,10 @@ class Transpiler(ast.NodeVisitor):
 
             val = self._expr(node.value)
             if name not in self._declared:
-                ctype = _type_for(node.value)
+                ctype = self._type_for(node.value)
                 e.emit(f"{ctype} {name} = {val};", node.lineno)
                 self._declared.add(name)
+                self._var_types[name] = ctype
             else:
                 e.emit(f"{name} = {val};", node.lineno)
 
@@ -301,6 +480,15 @@ class Transpiler(ast.NodeVisitor):
     def _emit_call(self, node: ast.Call, py_line: int):
         e = self.emitter
 
+        # Stdlib shim: module.func(args) or `from module import func; func(args)`
+        shim = self._shim_for_call(node)
+        if shim is not None:
+            key = self._shim_key_for_call(node)
+            assert key is not None
+            rendered = self._render_shim_call(key, node)
+            e.emit(f"{rendered};", py_line)
+            return
+
         # Method call: obj.method(args)
         if isinstance(node.func, ast.Attribute):
             obj = node.func.value
@@ -327,12 +515,21 @@ class Transpiler(ast.NodeVisitor):
             for a in args:
                 if isinstance(a, ast.Constant) and isinstance(a.value, str):
                     fmt_parts.append(a.value.replace('"', '\\"').replace('%', '%%'))
-                elif isinstance(a, ast.Constant) and isinstance(a.value, float):
-                    fmt_parts.append("%f")
-                    c_args.append(self._expr(a))
-                else:
-                    fmt_parts.append("%d")
-                    c_args.append(self._expr(a))
+                    continue
+                # Pick the format specifier from the expression's inferred C type.
+                # This lets `print(math.sqrt(2))` produce %f and
+                # `print(json.dumps(x))` produce %s, rather than always defaulting
+                # to %d which would have garbled the output.
+                ctype = self._type_for(a)
+                spec = {
+                    "double": "%f",
+                    "float":  "%f",
+                    "long":   "%ld",
+                    "char*":  "%s",
+                    "const char*": "%s",
+                }.get(ctype, "%d")
+                fmt_parts.append(spec)
+                c_args.append(self._expr(a))
             fmt = " ".join(fmt_parts) + "\\n"
             if c_args:
                 e.emit(f'printf("{fmt}", {", ".join(c_args)});', py_line)
@@ -422,6 +619,14 @@ class Transpiler(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef):
         pass  # handled separately
 
+    def visit_Import(self, node: ast.Import):
+        # Already registered during the scan phase; the C source only needs
+        # the corresponding #include lines emitted at the top of the file.
+        pass
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        pass
+
     def visit_Pass(self, node: ast.Pass):
         self.emitter.emit("/* pass */", node.lineno)
 
@@ -449,6 +654,13 @@ class Transpiler(ast.NodeVisitor):
                 return "1" if node.value else "0"
             return str(node.value)
         if isinstance(node, ast.Name):
+            # A from-imported constant (`from math import pi; x = pi`)
+            # resolves to the C constant expression, not the bare Python name.
+            if node.id in self._from_imports:
+                mod_attr = self._from_imports[node.id]
+                const = SHIM_CONSTS.get(mod_attr)
+                if const is not None:
+                    return const[0]
             return node.id
         if isinstance(node, ast.BinOp):
             left = self._expr(node.left)
@@ -481,6 +693,12 @@ class Transpiler(ast.NodeVisitor):
             op = "&&" if isinstance(node.op, ast.And) else "||"
             return f" {op} ".join(self._expr(v) for v in node.values)
         if isinstance(node, ast.Call):
+            # Stdlib-shim call (`math.sqrt(x)`, `time.time()`, `sqrt(2)` after a
+            # from-import). Resolved first because constructor / instance-method
+            # checks below would mis-classify these otherwise.
+            key = self._shim_key_for_call(node)
+            if key is not None and key in SHIMS:
+                return self._render_shim_call(key, node)
             # Constructor call inside an expression: ClassName(args)
             if isinstance(node.func, ast.Name) and node.func.id in self._classes:
                 raise TranspileError(
@@ -500,6 +718,10 @@ class Transpiler(ast.NodeVisitor):
             args = ", ".join(self._expr(a) for a in node.args)
             return f"{func_name}({args})"
         if isinstance(node, ast.Attribute):
+            # Stdlib constant (`math.pi`).
+            const = self._shim_const_for(node)
+            if const is not None:
+                return const[0]
             # self.attr inside a method → pointer dereference
             if (isinstance(node.value, ast.Name)
                     and node.value.id == 'self'

@@ -153,6 +153,81 @@ async def test_compile_vuln_uninit_var_code(client):
     assert r.status_code == 200
 
 
+# ─── method = pyghidra ─────────────────────────────────────────────────────
+
+
+async def test_compile_pyghidra_unavailable_returns_503(client):
+    # Without Nuitka / pyghidra / Ghidra installed, the alt backend should
+    # report 503 with a precise reason — not crash, not 500, not 422.
+    from app.pyghidra_compile import PyGhidraUnavailable
+
+    with patch(
+        "app.main.compile_pyghidra",
+        new=AsyncMock(side_effect=PyGhidraUnavailable("Nuitka not installed")),
+    ):
+        r = await client.post(
+            "/compile", json={"code": "x = 1", "method": "pyghidra"}
+        )
+    assert r.status_code == 503
+    assert "Nuitka not installed" in r.json()["detail"]
+
+
+async def test_compile_pyghidra_runtime_error_returns_422(client):
+    # If the toolchain is present but the user's code fails to compile through
+    # Nuitka/Ghidra, surface that as a 422 (user error) rather than 503.
+    from app.pyghidra_compile import PyGhidraCompileError
+
+    with patch(
+        "app.main.compile_pyghidra",
+        new=AsyncMock(side_effect=PyGhidraCompileError("Nuitka exit 1: SyntaxError")),
+    ):
+        r = await client.post(
+            "/compile", json={"code": "x = ", "method": "pyghidra"}
+        )
+    assert r.status_code == 422
+    assert "SyntaxError" in r.json()["detail"]
+
+
+async def test_compile_pyghidra_success_returns_shape(client):
+    # When the pipeline succeeds, the response shape must match CompileResponse
+    # so the frontend's existing pane rendering works unchanged.
+    fake = {
+        "python_lines": ["x = 1"],
+        "c_code": "undefined4 main(void) { ... }",
+        "c_lines": ["undefined4 main(void) { ... }"],
+        "asm_code": "00401000: ENDBR64",
+        "asm_lines": ["00401000: ENDBR64"],
+        "line_map": {},
+    }
+    with patch("app.main.compile_pyghidra", new=AsyncMock(return_value=fake)):
+        r = await client.post(
+            "/compile", json={"code": "x = 1", "method": "pyghidra"}
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["line_map"] == {}
+    assert body["c_code"].startswith("undefined4")
+
+
+async def test_compile_default_method_is_transpile(client):
+    # Omitting `method` must keep the original AST→C→gcc path — no opt-in
+    # change for existing callers.
+    with patch("app.main.compile_python", new=AsyncMock(return_value=_fake_result())) as mock_t:
+        with patch("app.main.compile_pyghidra", new=AsyncMock()) as mock_p:
+            r = await client.post("/compile", json={"code": "x = 1"})
+    assert r.status_code == 200
+    mock_t.assert_awaited_once()
+    mock_p.assert_not_called()
+
+
+async def test_compile_rejects_unknown_method(client):
+    # Pydantic Literal enforces the enum at the schema layer.
+    r = await client.post(
+        "/compile", json={"code": "x = 1", "method": "rustc"}
+    )
+    assert r.status_code == 422  # FastAPI validation error
+
+
 # ─── helper ───────────────────────────────────────────────────────────────────
 
 def _fake_result() -> dict:

@@ -3,7 +3,7 @@ import { python } from '@codemirror/lang-python'
 import { oneDark } from '@codemirror/theme-one-dark'
 import type { EditorView } from '@codemirror/view'
 import { useState, useRef } from 'react'
-import { compile, CompileResponse, LineMapping } from '../api'
+import { compile, CompileMethod, CompileResponse, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
 import AsmPane, { AsmLineInfo } from '../components/AsmPane'
 
@@ -907,6 +907,7 @@ export default function EditorPage() {
   const [result, setResult] = useState<CompileResponse | null>(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [method, setMethod] = useState<CompileMethod>('transpile')
   const [activePyLine, setActivePyLine] = useState<number | null>(null)
   const [activeVuln, setActiveVuln] = useState<Vuln | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
@@ -922,7 +923,7 @@ export default function EditorPage() {
     setError('')
     setActivePyLine(null)
     try {
-      const res = await compile(code)
+      const res = await compile(code, method)
       setResult(res)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Compilation failed')
@@ -1065,6 +1066,43 @@ export default function EditorPage() {
         {result && !loading && (
           <span style={{ fontSize: 11, color: 'var(--green)', letterSpacing: '0.08em' }}>◉ COMPILED OK</span>
         )}
+
+        {/* Backend selector — drives the `method` field on /compile.
+            transpile = AST→C→gcc (fast, supports per-line trace);
+            pyghidra  = Nuitka→native→Ghidra (heavy, no line trace).         */}
+        <label
+          title="Compile backend"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: 10,
+            color: 'var(--text-dim)',
+            fontFamily: 'Fira Code, monospace',
+            letterSpacing: '0.08em',
+          }}
+        >
+          <span>METHOD::</span>
+          <select
+            value={method}
+            onChange={e => setMethod(e.target.value as CompileMethod)}
+            disabled={loading}
+            style={{
+              background: 'var(--bg-base)',
+              color: method === 'pyghidra' ? 'var(--cyan)' : 'var(--green)',
+              border: `1px solid ${method === 'pyghidra' ? 'var(--cyan)' : 'var(--green)'}44`,
+              padding: '3px 6px',
+              fontSize: 11,
+              fontFamily: 'Fira Code, monospace',
+              letterSpacing: '0.06em',
+              borderRadius: 2,
+              cursor: loading ? 'not-allowed' : 'pointer',
+            }}
+          >
+            <option value="transpile">TRANSPILE → GCC</option>
+            <option value="pyghidra">NUITKA → PYGHIDRA</option>
+          </select>
+        </label>
 
         <button
           onClick={handleCompile}
@@ -1327,11 +1365,11 @@ export default function EditorPage() {
                     </div>
                   )}
 
-                  {/* C output */}
+                  {/* C output — badge reflects the backend that produced it */}
                   {pane === 'c' && (result ? (
                     <CodePane
                       title="C"
-                      badge="TRANSPILED"
+                      badge={method === 'pyghidra' ? 'GHIDRA DECOMP' : 'TRANSPILED'}
                       lines={result.c_lines}
                       highlightMap={cHighlight}
                       activeLines={activeCLines}
@@ -1343,7 +1381,7 @@ export default function EditorPage() {
                   ) : (
                     <PlaceholderPane
                       title="C"
-                      badge="TRANSPILED"
+                      badge={method === 'pyghidra' ? 'GHIDRA DECOMP' : 'TRANSPILED'}
                       onClose={() => closePane('c')}
                       onDragStart={e => handlePaneDragStart('c', e)}
                       onMoveLeft={canLeft ? () => movePane('c', -1) : undefined}
@@ -1355,7 +1393,7 @@ export default function EditorPage() {
                   {pane === 'asm' && (result ? (
                     <AsmPane
                       title="x86 ASM"
-                      badge="GCC -O0"
+                      badge={method === 'pyghidra' ? 'NUITKA + GHIDRA' : 'GCC -O0'}
                       lines={result.asm_lines}
                       highlightMap={asmHighlight}
                       activeLines={activeAsmLines}
@@ -1375,7 +1413,7 @@ export default function EditorPage() {
                   ) : (
                     <PlaceholderPane
                       title="x86 ASM"
-                      badge="GCC -O0"
+                      badge={method === 'pyghidra' ? 'NUITKA + GHIDRA' : 'GCC -O0'}
                       onClose={() => closePane('asm')}
                       onDragStart={e => handlePaneDragStart('asm', e)}
                       onMoveLeft={canLeft ? () => movePane('asm', -1) : undefined}
