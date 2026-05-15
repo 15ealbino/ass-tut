@@ -682,6 +682,15 @@ class Transpiler(ast.NodeVisitor):
     def visit_Expr(self, node: ast.Expr):
         if isinstance(node.value, ast.Call):
             self._emit_call(node.value, node.lineno)
+            return
+        # `yield`, `yield from`, and `await` show up as Expr-wrapped statements;
+        # silently dropping them (the old default below for non-Call values)
+        # would let the rest of a generator/coroutine body transpile as if it
+        # were ordinary code, which is wrong.
+        if isinstance(node.value, (ast.Yield, ast.YieldFrom, ast.Await)):
+            raise TranspileError(
+                f"Line {node.lineno}: {type(node.value).__name__} is not supported"
+            )
 
     def _emit_call(self, node: ast.Call, py_line: int):
         e = self.emitter
@@ -844,10 +853,23 @@ class Transpiler(ast.NodeVisitor):
         self.emitter.emit(f"return {val};", node.lineno)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        pass  # handled separately
+        # Top-level FunctionDefs are filtered out of the body walk in
+        # transpile() and emitted via _emit_func; reaching this visitor means
+        # we're inside another function or method, i.e. a nested def. Silently
+        # passing here would drop the nested def and any unsupported
+        # constructs nested within it (notably `nonlocal`).
+        if self._in_func or self._in_method:
+            raise TranspileError(
+                f"Line {node.lineno}: nested function definitions are not supported"
+            )
 
     def visit_ClassDef(self, node: ast.ClassDef):
-        pass  # handled separately
+        # Same logic as visit_FunctionDef — top-level class defs are filtered
+        # out and emitted via _emit_class_struct/_emit_method.
+        if self._in_func or self._in_method:
+            raise TranspileError(
+                f"Line {node.lineno}: nested class definitions are not supported"
+            )
 
     def visit_Import(self, node: ast.Import):
         # Already registered during the scan phase; the C source only needs
