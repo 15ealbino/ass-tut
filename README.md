@@ -5,23 +5,46 @@ A full-stack web app that lets you write Python code and see it mapped line-by-l
 ## Architecture
 
 ```
-User browser
-    │
-    ▼
-Frontend (Vite + React, :5173)
-    │  POST /compile  { code, method }
-    ▼
-Backend (FastAPI + uvicorn, :8000)
-    ├── transpiler.py         Python AST → C  (tracks py_line → c_lines)
-    │                         int lists, top-level str→int dicts (hoisted helper),
-    │                         classes/methods, stdlib shims (time / math / random / sys / json)
-    ├── compile.py            method=transpile: C → gcc -S -O0 → parse .loc → line_map
-    ├── pyghidra_compile.py   method=pyghidra:  Nuitka → ELF → Ghidra (asm + decomp C)
-    ├── auth.py               bcrypt + JWT
-    └── main.py               routes: /auth/register  /auth/login  /compile  /health
-    │
-    ▼
-PostgreSQL 16 (users table)
+                  ┌────────────────────────────────────────────────────────┐
+                  │  Frontend  (Vite + React, :5173)                       │
+                  │                                                        │
+                  │   three-pane editor:  PYTHON │ C │ x86 ASM             │
+                  │   click a Python line → its C + asm lines glow in the  │
+                  │   colour assigned by line_map; the legend bar at the   │
+                  │   bottom mirrors the same colours per source line.     │
+                  └─────────────────────────┬──────────────────────────────┘
+                                            │
+            POST /compile { code, method }  │   { c_code, asm_code,
+                                            │     c_lines, asm_lines,
+                                            ▼     python_lines, line_map }
+                  ┌────────────────────────────────────────────────────────┐
+                  │  Backend  (FastAPI + uvicorn, :8000)                   │
+                  │                                                        │
+                  │  /compile  ─┬──►  method = "transpile"   (default)     │
+                  │             │     transpiler.py                        │
+                  │             │       AST → C, tracks py_line → c_lines  │
+                  │             │       int lists, str→int dicts,          │
+                  │             │       classes + methods,                 │
+                  │             │       stdlib shims:                      │
+                  │             │         time / math / random / sys /     │
+                  │             │         json.dumps                       │
+                  │             │     compile.py                           │
+                  │             │       gcc -S -O0 → parse .loc directives │
+                  │             │       → c_line → asm_lines mapping       │
+                  │             │                                          │
+                  │             └──►  method = "pyghidra"   (optional)     │
+                  │                   pyghidra_compile.py                  │
+                  │                     Nuitka → native ELF                │
+                  │                     Ghidra (pyghidra)                  │
+                  │                     → disassembly + decompiled C       │
+                  │                     (no line_map; returns {} )         │
+                  │                                                        │
+                  │  /auth/register, /auth/login   auth.py  bcrypt + JWT   │
+                  │  /health                                               │
+                  └─────────────────────────┬──────────────────────────────┘
+                                            │
+                                            ▼
+                              PostgreSQL 16  (users table)
 ```
 
 `method=transpile` is the default and the only path that requires no extra installs. `method=pyghidra` is an optional heavyweight backend covered in [Optional: PyGhidra alternative compile backend](#optional-pyghidra-alternative-compile-backend) below — if its toolchain is absent the endpoint returns HTTP 503 with a precise reason and the default path is unaffected.
