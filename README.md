@@ -13,7 +13,8 @@ Frontend (Vite + React, :5173)
     ▼
 Backend (FastAPI + uvicorn, :8000)
     ├── transpiler.py         Python AST → C  (tracks py_line → c_lines)
-    │                         Stdlib shims for time / math / random / sys / json
+    │                         int lists, top-level str→int dicts (hoisted helper),
+    │                         classes/methods, stdlib shims (time / math / random / sys / json)
     ├── compile.py            method=transpile: C → gcc -S -O0 → parse .loc → line_map
     ├── pyghidra_compile.py   method=pyghidra:  Nuitka → ELF → Ghidra (asm + decomp C)
     ├── auth.py               bcrypt + JWT
@@ -254,7 +255,44 @@ Compile Python to C and Assembly. No auth required.
 | `422` | Unsupported Python construct, oversize input, or a Nuitka/Ghidra failure (when `method=pyghidra`) |
 | `503` | `method=pyghidra` was requested but the toolchain (Nuitka, pyghidra, or `GHIDRA_INSTALL_DIR`) is not configured — see the PyGhidra setup section below |
 
-Supported Python for `transpile`: assignment, augmented assignment, `for x in range(...)`, `while`, `if`/`elif`/`else`, `print()`, `def`, `return`, `break`, `continue`, basic arithmetic, comparisons, boolean `and`/`or`, and the standard-library shims `time`, `math`, `random`, `sys`, `json.dumps`.
+**Supported Python for `transpile`**
+
+| Category | Specifics |
+|----------|-----------|
+| Statements | assignment, augmented assignment (`+=`, `-=`, `*=`, `/=`), `if`/`elif`/`else`, `while`, `for x in range(...)`, `for x in <list>`, `def`, `return`, `break`, `continue`, `pass`, `class` |
+| Expressions | int / float / string / bool constants, names, `+ - * / % //`, comparisons, boolean `and`/`or`, `not`, unary `-`, function calls |
+| Containers | int **lists** (`xs = [1, 2, 3]`), **dicts** with string keys and int values at module top level (`d = {"a": 1}`), `xs[i]` read / write, `d["k"]` read, `len(xs)`, `for v in xs:` — see [Containers](#containers) below for the limits |
+| Classes | simple instance fields (int / float / string), `__init__`, methods, `obj.method(args)` |
+| Stdlib shims | `time` (`time()`, `sleep()`), `math` (`sqrt`, `pow`, `floor`, `ceil`, `fabs`, `log`, `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pi`, `e`, `inf`), `random` (`random()`, `randint()`, `seed()`), `sys.exit()`, `json.dumps(int)` |
+
+#### Containers
+
+Lists lower to fixed-size C arrays; dicts lower to a `keys[]` / `vals[]` pair plus a linear-scan `_get(const char*)` helper hoisted to file scope. The full list of moves and the rejection paths:
+
+| Works | Doesn't (raises HTTP 422) |
+|-------|---------------------------|
+| `xs = [1, 2, 3]` | `xs = []` (empty literal) |
+| `xs = [a, b, c]` (int variables) | `xs = [[1, 2], [3]]` (nested) |
+| `xs[0]`, `xs[i]` | `xs[-1]`, `xs[1:2]` |
+| `xs[0] = 99` | reassigning the same list name |
+| `len(xs)` | `[x*x for x in range(5)]` (list-comp) |
+| `for v in xs: ...` | `for v in [1,2,3]: ...` (literal, must be a named variable) |
+| `d = {"a": 1, "b": 2}` (module top level only) | `d = {1: 2}` (non-string key) |
+| `d["k"]` | `d["k"] = 2` (writes), `len(d)` |
+| Multiple distinct dicts | dict literal inside a function or method |
+
+Example:
+
+```python
+prices = {"apple": 100, "banana": 50, "cherry": 25}
+order = [1, 3, 2]
+total = 0
+for n in order:
+    total += n * prices["apple"]
+print(total)
+```
+
+The emitted C contains `static const char* _shim_dict_prices_keys[3]`, a matching `_shim_dict_prices_vals[3]`, a `_shim_dict_prices_get(const char* key)` helper, and an `int order[3] = {1, 3, 2};` inside `main()`. Clicking any Python line in the UI highlights the C and asm lines produced by that line.
 
 ### `GET /health`
 Returns `{"status":"ok"}`. No auth required. Useful for liveness checks.
