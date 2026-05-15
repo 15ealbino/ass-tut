@@ -97,6 +97,13 @@ class Transpiler(ast.NodeVisitor):
         self._from_imports: Dict[str, Tuple[str, str]] = {}
         self._needed_headers: Set[str] = set()
         self._needs_json_helper = False
+        # ── Container tracking ────────────────────────────────────────────
+        # name -> element count for list variables (used by len() / for-loops)
+        self._list_lengths: Dict[str, int] = {}
+        # name -> {keys, vals, helper, keys_arr, vals_arr} for top-level dicts.
+        # Dicts live at C file scope so the helper is visible from any function;
+        # the dict literal must therefore appear at module top level.
+        self._dict_meta: Dict[str, Dict] = {}
 
     def _type_for(self, node: ast.expr) -> str:
         """Best-effort static type of an expression — used for variable declarations
@@ -113,6 +120,16 @@ class Transpiler(ast.NodeVisitor):
             shim = self._shim_for_call(node)
             if shim is not None:
                 return shim[3]
+            # len() of a list / dict returns int
+            if isinstance(node.func, ast.Name) and node.func.id == "len":
+                return "int"
+        if isinstance(node, ast.Subscript):
+            # All supported containers (int lists, int-valued dicts) yield int
+            if isinstance(node.value, ast.Name) and (
+                    node.value.id in self._list_lengths
+                    or node.value.id in self._dict_meta):
+                return "int"
+            return "int"
         if isinstance(node, ast.Attribute):
             const = self._shim_const_for(node)
             if const is not None:
@@ -170,6 +187,10 @@ class Transpiler(ast.NodeVisitor):
         # Imports must be processed before we emit headers, since we want the
         # shim system to know what's in scope before we visit() the body.
         self._scan_imports_and_shims(tree)
+        # Top-level dict literals are hoisted to C file scope; this pass
+        # registers them so the helpers exist before main() and any function
+        # body that reads from them.
+        self._scan_top_level_dicts(tree)
 
         e = self.emitter
         e.emit('#include <stdio.h>')
@@ -191,6 +212,12 @@ class Transpiler(ast.NodeVisitor):
             e.dedent()
             e.emit('}')
             e.emit('')
+
+        # ── Emit file-scope dict storage + lookup helpers ────────────────
+        # One static const char*[] of keys, one static int[] of values, and a
+        # linear-scan `_shim_dict_<name>_get(const char*)` per dict variable.
+        if self._dict_meta:
+            self._emit_dict_helpers()
 
         # ── Emit struct typedefs and method forward-decls for all classes ──
         class_nodes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
@@ -285,6 +312,114 @@ class Transpiler(ast.NodeVisitor):
                 if const is not None:
                     self._needed_headers.update(const[1])
 
+    # ── Container scanning + helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _c_str_lit(s: str) -> str:
+        escaped = s.replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{escaped}"'
+
+    def _scan_top_level_dicts(self, tree: ast.Module):
+        """Collect every `name = {...}` top-level assignment so the resulting
+        keys/vals arrays and `_get` helper can be emitted at C file scope
+        before main(). Inside functions, dicts are rejected at visit time —
+        a function-local dict would need a function-local helper, which
+        complicates scope rules without much payoff."""
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if not isinstance(node.value, ast.Dict):
+                continue
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                raise TranspileError(
+                    f"Line {node.lineno}: dict assignment must target a single name"
+                )
+            name = node.targets[0].id
+            d = node.value
+            if any(k is None for k in d.keys):
+                raise TranspileError(
+                    f"Line {node.lineno}: dict-unpacking (**kwargs) is not supported"
+                )
+            keys: List[str] = []
+            vals: List[int] = []
+            for k_node, v_node in zip(d.keys, d.values):
+                if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, str)):
+                    raise TranspileError(
+                        f"Line {node.lineno}: dict keys must be string literals"
+                    )
+                if (isinstance(v_node, ast.Constant)
+                        and isinstance(v_node.value, int)
+                        and not isinstance(v_node.value, bool)):
+                    vals.append(v_node.value)
+                elif (isinstance(v_node, ast.UnaryOp)
+                        and isinstance(v_node.op, ast.USub)
+                        and isinstance(v_node.operand, ast.Constant)
+                        and isinstance(v_node.operand.value, int)):
+                    vals.append(-v_node.operand.value)
+                else:
+                    raise TranspileError(
+                        f"Line {node.lineno}: dict values must be int literals"
+                    )
+                keys.append(k_node.value)
+            if name in self._dict_meta:
+                raise TranspileError(
+                    f"Line {node.lineno}: dict '{name}' is redefined; one dict per name"
+                )
+            self._dict_meta[name] = {
+                "keys": keys,
+                "vals": vals,
+                "helper":   f"_shim_dict_{name}_get",
+                "keys_arr": f"_shim_dict_{name}_keys",
+                "vals_arr": f"_shim_dict_{name}_vals",
+            }
+
+    def _emit_dict_helpers(self):
+        e = self.emitter
+        for name, meta in self._dict_meta.items():
+            n = len(meta["keys"])
+            keys_lit = ", ".join(self._c_str_lit(k) for k in meta["keys"])
+            vals_lit = ", ".join(str(v) for v in meta["vals"])
+            e.emit(f'static const char* {meta["keys_arr"]}[{n}] = {{{keys_lit}}};')
+            e.emit(f'static int {meta["vals_arr"]}[{n}] = {{{vals_lit}}};')
+            e.emit(f'static int {meta["helper"]}(const char* key) {{')
+            e.indent()
+            e.emit(f'for (int i = 0; i < {n}; i++) {{')
+            e.indent()
+            e.emit(
+                f'if (strcmp({meta["keys_arr"]}[i], key) == 0) '
+                f'return {meta["vals_arr"]}[i];'
+            )
+            e.dedent()
+            e.emit('}')
+            e.emit('return 0;')
+            e.dedent()
+            e.emit('}')
+            e.emit('')
+
+    def _emit_list_assignment(self, name: str, list_node: ast.List, py_line: int):
+        if name in self._declared:
+            raise TranspileError(
+                f"Line {py_line}: list variable '{name}' cannot be reassigned"
+            )
+        elts = list_node.elts
+        n = len(elts)
+        if n == 0:
+            raise TranspileError(
+                f"Line {py_line}: empty list literals are not supported (zero-length C arrays are invalid)"
+            )
+        rendered: List[str] = []
+        for el in elts:
+            if isinstance(el, (ast.List, ast.Dict, ast.Set, ast.Tuple)):
+                raise TranspileError(
+                    f"Line {py_line}: nested containers in list literals are not supported"
+                )
+            rendered.append(self._expr(el))
+        init = ", ".join(rendered)
+        self.emitter.emit(f"int {name}[{n}] = {{{init}}};", py_line)
+        self._declared.add(name)
+        self._var_types[name] = "int[]"
+        self._list_lengths[name] = n
+
     # ── Class helpers ───────────────────────────────────────────────────────
 
     def _register_class(self, cls: ast.ClassDef):
@@ -348,9 +483,13 @@ class Transpiler(ast.NodeVisitor):
         saved_declared = self._declared.copy()
         saved_types = self._instance_types.copy()
         saved_var_types = self._var_types.copy()
+        saved_list_lengths = self._list_lengths.copy()
         saved_in_func = self._in_func
         self._declared = {a.arg for a in method.args.args if a.arg != 'self'}
         self._var_types = {a.arg: "int" for a in method.args.args if a.arg != 'self'}
+        # Top-level list variables live on main()'s stack and are not visible
+        # from another function's frame; reset the table for this scope.
+        self._list_lengths = {}
         self._in_method = class_name
         self._in_func = True
 
@@ -362,6 +501,7 @@ class Transpiler(ast.NodeVisitor):
         self._declared = saved_declared
         self._instance_types = saved_types
         self._var_types = saved_var_types
+        self._list_lengths = saved_list_lengths
 
         if method.name != '__init__':
             e.emit('return 0;', method.end_lineno)
@@ -379,10 +519,12 @@ class Transpiler(ast.NodeVisitor):
         saved = self._declared.copy()
         saved_types = self._instance_types.copy()
         saved_var_types = self._var_types.copy()
+        saved_list_lengths = self._list_lengths.copy()
         saved_in_func = self._in_func
         saved_in_method = self._in_method
         self._declared = set(a.arg for a in node.args.args)
         self._var_types = {a.arg: "int" for a in node.args.args}
+        self._list_lengths = {}
         self._in_func = True
         self._in_method = None  # top-level functions are not inside a class method
         for child in node.body:
@@ -392,6 +534,7 @@ class Transpiler(ast.NodeVisitor):
         self._declared = saved
         self._instance_types = saved_types
         self._var_types = saved_var_types
+        self._list_lengths = saved_list_lengths
         e.emit('return 0;', node.end_lineno)
         e.dedent()
         e.emit('}')
@@ -419,11 +562,55 @@ class Transpiler(ast.NodeVisitor):
                 e.emit(f"{target.value.id}.{target.attr} = {val};", node.lineno)
                 continue
 
+            # Subscript assignment: xs[i] = v  (list write; dict write is banned)
+            if isinstance(target, ast.Subscript):
+                if not isinstance(target.value, ast.Name):
+                    raise TranspileError(
+                        f"Line {node.lineno}: subscript assignment must target a named variable"
+                    )
+                vname = target.value.id
+                if vname in self._dict_meta:
+                    raise TranspileError(
+                        f"Line {node.lineno}: dict assignment (`{vname}[key] = ...`) is not supported"
+                    )
+                if vname not in self._list_lengths:
+                    raise TranspileError(
+                        f"Line {node.lineno}: '{vname}' is not a known list; subscript assignment requires a list literal first"
+                    )
+                self._reject_negative_or_slice(target.slice, node.lineno)
+                idx_expr = self._expr(target.slice)
+                val = self._expr(node.value)
+                e.emit(f"{vname}[{idx_expr}] = {val};", node.lineno)
+                continue
+
             if not isinstance(target, ast.Name):
                 raise TranspileError(
                     f"Line {node.lineno}: only simple variable assignment supported"
                 )
             name = target.id
+
+            # List literal: xs = [1, 2, 3]
+            if isinstance(node.value, ast.List):
+                self._emit_list_assignment(name, node.value, node.lineno)
+                continue
+
+            # Dict literal: d = {"a": 1, "b": 2}
+            if isinstance(node.value, ast.Dict):
+                if self._in_func or self._in_method:
+                    raise TranspileError(
+                        f"Line {node.lineno}: dict literals must be defined at module top level"
+                    )
+                if name not in self._dict_meta:
+                    # The pre-scan handles every well-formed top-level dict
+                    # assignment; reaching here means the scan rejected it
+                    # and we should not silently emit a placeholder.
+                    raise TranspileError(
+                        f"Line {node.lineno}: dict '{name}' was not registered during pre-scan"
+                    )
+                e.emit(f"/* dict {name}: keys/vals + lookup helper at file scope */", node.lineno)
+                self._declared.add(name)
+                self._var_types[name] = "dict"
+                continue
 
             # Constructor call: n = ClassName(args)
             if (isinstance(node.value, ast.Call)
@@ -447,6 +634,25 @@ class Transpiler(ast.NodeVisitor):
                 self._var_types[name] = ctype
             else:
                 e.emit(f"{name} = {val};", node.lineno)
+
+    def _reject_negative_or_slice(self, slice_node: ast.expr, py_line: int):
+        if isinstance(slice_node, ast.Slice):
+            raise TranspileError(
+                f"Line {py_line}: list slicing is not supported"
+            )
+        if (isinstance(slice_node, ast.Constant)
+                and isinstance(slice_node.value, int)
+                and slice_node.value < 0):
+            raise TranspileError(
+                f"Line {py_line}: negative indices are not supported"
+            )
+        if (isinstance(slice_node, ast.UnaryOp)
+                and isinstance(slice_node.op, ast.USub)
+                and isinstance(slice_node.operand, ast.Constant)
+                and isinstance(slice_node.operand.value, int)):
+            raise TranspileError(
+                f"Line {py_line}: negative indices are not supported"
+            )
 
     def visit_AugAssign(self, node: ast.AugAssign):
         e = self.emitter
@@ -542,8 +748,32 @@ class Transpiler(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For):
         e = self.emitter
+        # Iterating a known list variable: walk the array with an index var.
+        # Hoist the loop var's declaration into the enclosing scope so its
+        # last-value survives the loop (matches Python semantics, and avoids
+        # leaving `_declared` pointing at a C identifier that's already out of
+        # scope by the next statement).
+        if isinstance(node.iter, ast.Name) and node.iter.id in self._list_lengths:
+            list_name = node.iter.id
+            length = self._list_lengths[list_name]
+            var = node.target.id if isinstance(node.target, ast.Name) else "x"
+            idx = f"_i_{var}"
+            if var not in self._declared:
+                e.emit(f"int {var};", node.lineno)
+                self._declared.add(var)
+                self._var_types[var] = "int"
+            e.emit(f"for (int {idx} = 0; {idx} < {length}; {idx}++) {{", node.lineno)
+            e.indent()
+            e.emit(f"{var} = {list_name}[{idx}];", node.lineno)
+            for child in node.body:
+                self.visit(child)
+            e.dedent()
+            e.emit("}", node.end_lineno)
+            return
         if not isinstance(node.iter, ast.Call) or not isinstance(node.iter.func, ast.Name):
-            raise TranspileError(f"Line {node.lineno}: only 'for x in range(...)' loops supported")
+            raise TranspileError(
+                f"Line {node.lineno}: only 'for x in range(...)' or 'for x in <list-variable>' loops supported"
+            )
         if node.iter.func.id != "range":
             raise TranspileError(f"Line {node.lineno}: only range() iterator supported")
         var = node.target.id if isinstance(node.target, ast.Name) else "i"
@@ -699,6 +929,24 @@ class Transpiler(ast.NodeVisitor):
             key = self._shim_key_for_call(node)
             if key is not None and key in SHIMS:
                 return self._render_shim_call(key, node)
+            # len() of a known list: emit sizeof-based expression so the
+            # length stays a compile-time constant on the C side too.
+            if isinstance(node.func, ast.Name) and node.func.id == "len":
+                if len(node.args) != 1:
+                    raise TranspileError(
+                        f"Line {getattr(node, 'lineno', '?')}: len() takes exactly one argument"
+                    )
+                arg = node.args[0]
+                if isinstance(arg, ast.Name) and arg.id in self._dict_meta:
+                    raise TranspileError(
+                        f"Line {getattr(node, 'lineno', '?')}: len() on a dict is not supported; "
+                        f"use a constant in your source instead"
+                    )
+                if not (isinstance(arg, ast.Name) and arg.id in self._list_lengths):
+                    raise TranspileError(
+                        f"Line {getattr(node, 'lineno', '?')}: len() argument must be a known list variable"
+                    )
+                return f"((int)(sizeof({arg.id})/sizeof({arg.id}[0])))"
             # Constructor call inside an expression: ClassName(args)
             if isinstance(node.func, ast.Name) and node.func.id in self._classes:
                 raise TranspileError(
@@ -717,6 +965,26 @@ class Transpiler(ast.NodeVisitor):
             func_name = self._expr(node.func)
             args = ", ".join(self._expr(a) for a in node.args)
             return f"{func_name}({args})"
+        if isinstance(node, ast.Subscript):
+            if not isinstance(node.value, ast.Name):
+                raise TranspileError(
+                    f"Line {getattr(node, 'lineno', '?')}: subscript target must be a named variable"
+                )
+            vname = node.value.id
+            if vname in self._dict_meta:
+                if isinstance(node.slice, ast.Slice):
+                    raise TranspileError(
+                        f"Line {getattr(node, 'lineno', '?')}: dict slicing is not supported"
+                    )
+                key_expr = self._expr(node.slice)
+                return f'{self._dict_meta[vname]["helper"]}({key_expr})'
+            if vname in self._list_lengths:
+                self._reject_negative_or_slice(node.slice, getattr(node, 'lineno', 0) or 0)
+                idx_expr = self._expr(node.slice)
+                return f"{vname}[{idx_expr}]"
+            raise TranspileError(
+                f"Line {getattr(node, 'lineno', '?')}: subscript on '{vname}' but it is not a known list or dict"
+            )
         if isinstance(node, ast.Attribute):
             # Stdlib constant (`math.pi`).
             const = self._shim_const_for(node)
@@ -729,6 +997,10 @@ class Transpiler(ast.NodeVisitor):
                 return f"self->{node.attr}"
             obj = self._expr(node.value)
             return f"{obj}.{node.attr}"
+        if isinstance(node, (ast.List, ast.Dict, ast.Set, ast.Tuple)):
+            raise TranspileError(
+                f"Line {getattr(node, 'lineno', '?')}: container literals are only supported on the right-hand side of a top-level assignment"
+            )
         raise TranspileError(f"Unsupported expression: {type(node).__name__}")
 
 
