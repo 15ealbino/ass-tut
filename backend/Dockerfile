@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+# Pinned to bookworm: Debian 13 (trixie) dropped openjdk-17-* in favour of 21,
+# and Ghidra 11.2's documented baseline is JDK 17 — pinning here keeps the
+# package name stable and matches the README's setup steps.
+FROM python:3.12-slim-bookworm
 
 # System deps:
 #   gcc / gcc-multilib  → method=transpile (compile.py invokes `gcc -S -m32`)
