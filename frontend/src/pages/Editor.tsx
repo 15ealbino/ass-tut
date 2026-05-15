@@ -812,6 +812,62 @@ print(hijacked)
       description: 'cmpl checks the buffer offset but attacker-supplied values exceed it; movl writes the libc system() address into the return-address slot on the stack; addl combines it with the /bin/sh argument pointer — the ret epilogue pops this into %rip, jumping to system("/bin/sh")',
     },
   },
+  {
+    id: 'oob-read',
+    name: 'OUT-OF-BOUNDS READ',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Read operation extends past buffer boundary, leaking adjacent memory contents such as keys, canaries, and ASLR pointers.',
+    explanation:
+      'Out-of-bounds read (CWE-125) occurs when a program reads data past the end of an allocated buffer, ' +
+      'exposing adjacent memory that may contain cryptographic keys, stack canaries, ASLR base addresses, ' +
+      'or session tokens. The classic example is Heartbleed (CVE-2014-0160): OpenSSL\'s TLS heartbeat handler ' +
+      'used an attacker-supplied length in memcpy without bounds checking, letting a remote attacker read 64KB ' +
+      'of server memory per request — leaking private keys from millions of servers worldwide. ' +
+      'CVE-2025-24991 (Windows NTFS) is a recent critical OOB read actively exploited in the wild: the NTFS ' +
+      'driver fails to validate offsets when parsing on-disk structures, allowing an attacker to read kernel ' +
+      'memory and recover credentials or encryption keys — it was added to CISA\'s Known Exploited Vulnerabilities ' +
+      'catalog. CWE-125 ranks in the 2025 CWE Top 25 most dangerous software weaknesses. ' +
+      'In the assembly, `cmpl` compares the loop index against the attacker-supplied claimed_len rather than ' +
+      'the buffer capacity — `addl` then sums values from stack slots well past the buffer boundary, reading ' +
+      'stale data (secret keys, canaries, saved return addresses) into the response and defeating ASLR.',
+    code:
+`# CVE pattern: attacker-supplied length exceeds buffer — leaks adjacent memory
+class TLSBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.data0 = 42
+        self.data1 = 0
+        self.secret_key = 3405691582
+        self.canary = 3735928559
+        self.ret_addr = 4196352
+
+    def heartbeat_echo(self, claimed_len):
+        total = 0
+        i = 0
+        while i < claimed_len:
+            if i == 0:
+                total += self.data0
+            elif i == 1:
+                total += self.data1
+            elif i == 2:
+                total += self.secret_key
+            elif i == 3:
+                total += self.canary
+            else:
+                total += self.ret_addr
+            i += 1
+        return total
+
+buf = TLSBuffer(2)
+leaked = buf.heartbeat_echo(6)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'addl'],
+      description: 'cmpl checks the loop index against the attacker-supplied claimed_len (6) instead of the buffer capacity (2); addl accumulates values from stack slots past the buffer boundary — secret_key, canary, and ret_addr leak into the response, defeating ASLR and exposing private keys',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
