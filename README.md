@@ -9,19 +9,23 @@ User browser
     │
     ▼
 Frontend (Vite + React, :5173)
-    │  POST /compile  (JWT in Authorization header)
+    │  POST /compile  { code, method }
     ▼
 Backend (FastAPI + uvicorn, :8000)
-    ├── transpiler.py  Python AST → C  (tracks py_line → c_lines)
-    ├── compile.py     C → gcc -S -O0 → parse .loc → combined line_map
-    ├── auth.py        bcrypt + JWT
-    └── main.py        routes: /auth/register  /auth/login  /compile  /health
+    ├── transpiler.py         Python AST → C  (tracks py_line → c_lines)
+    │                         Stdlib shims for time / math / random / sys / json
+    ├── compile.py            method=transpile: C → gcc -S -O0 → parse .loc → line_map
+    ├── pyghidra_compile.py   method=pyghidra:  Nuitka → ELF → Ghidra (asm + decomp C)
+    ├── auth.py               bcrypt + JWT
+    └── main.py               routes: /auth/register  /auth/login  /compile  /health
     │
     ▼
 PostgreSQL 16 (users table)
 ```
 
-The response carries a `line_map` keyed by Python line number; clicking any line in the editor highlights the corresponding C and assembly lines.
+`method=transpile` is the default and the only path that requires no extra installs. `method=pyghidra` is an optional heavyweight backend covered in [Optional: PyGhidra alternative compile backend](#optional-pyghidra-alternative-compile-backend) below — if its toolchain is absent the endpoint returns HTTP 503 with a precise reason and the default path is unaffected.
+
+Either path returns the same response shape. For `transpile`, the response carries a `line_map` keyed by Python line number so clicking any line in the editor highlights the corresponding C and assembly lines. For `pyghidra`, `line_map` is always `{}` (Nuitka's CPython glue makes line-accurate tracing infeasible).
 
 ---
 
@@ -218,11 +222,14 @@ Authenticate an existing account. Returns a JWT.
 ```
 
 ### `POST /compile`
-Transpile Python to C and Assembly. Requires `Authorization: Bearer <jwt>`.
+Compile Python to C and Assembly. No auth required.
 
 ```json
 // Request
-{ "code": "x = 1\nprint(x)" }
+{
+  "code": "x = 1\nprint(x)",
+  "method": "transpile"
+}
 
 // Response 200
 {
@@ -234,10 +241,164 @@ Transpile Python to C and Assembly. Requires `Authorization: Bearer <jwt>`.
 }
 ```
 
-Returns HTTP 422 if the Python uses unsupported constructs (e.g. classes, imports, list comprehensions).
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `code` | string (≤10 000 chars / ≤200 lines) | — | Python source |
+| `method` | `"transpile"` \| `"pyghidra"` | `"transpile"` | Compile backend. `transpile` is the AST→C→gcc path with per-line tracing. `pyghidra` runs Nuitka → ELF → Ghidra and returns disassembly plus decompiled C; `line_map` is empty for this method. |
+
+**Status codes**
+
+| Code | Cause |
+|------|-------|
+| `200` | Success |
+| `422` | Unsupported Python construct, oversize input, or a Nuitka/Ghidra failure (when `method=pyghidra`) |
+| `503` | `method=pyghidra` was requested but the toolchain (Nuitka, pyghidra, or `GHIDRA_INSTALL_DIR`) is not configured — see the PyGhidra setup section below |
+
+Supported Python for `transpile`: assignment, augmented assignment, `for x in range(...)`, `while`, `if`/`elif`/`else`, `print()`, `def`, `return`, `break`, `continue`, basic arithmetic, comparisons, boolean `and`/`or`, and the standard-library shims `time`, `math`, `random`, `sys`, `json.dumps`.
 
 ### `GET /health`
 Returns `{"status":"ok"}`. No auth required. Useful for liveness checks.
+
+---
+
+## Optional: PyGhidra alternative compile backend
+
+The `pyghidra` compile method runs the user's Python through **Nuitka** to produce a native ELF binary, then drives **Ghidra** (via the [`pyghidra`](https://pypi.org/project/pyghidra/) package) to extract the disassembly and decompiled C of `main`. It is purely additive — the default `transpile` backend keeps working with no extra installs, and selecting `method=pyghidra` on a server without the toolchain returns HTTP 503 with the missing dependency named.
+
+This path is heavyweight: each call spawns Nuitka (which itself invokes gcc) and then runs a full Ghidra auto-analysis pass. Expect ~20–60 s per request on a small program, ~1 GB of RAM headroom, and a JDK on the host.
+
+### Prerequisites
+
+| Tool | Version | Notes |
+|------|---------|-------|
+| JDK | 17+ | Ghidra 11.x requires JDK 17 minimum |
+| Ghidra | 11.x | Download from the [official release page](https://github.com/NationalSecurityAgency/ghidra/releases) |
+| Python packages | — | `nuitka` and `pyghidra` are already listed in `backend/requirements.txt` |
+
+### Step 1 — Install a JDK
+
+```bash
+# Ubuntu / Debian
+sudo apt update && sudo apt install -y openjdk-17-jdk
+
+# Oracle Linux / RHEL / Fedora
+sudo dnf install -y java-17-openjdk-devel
+```
+
+Verify:
+
+```bash
+java -version
+# → openjdk version "17.x.x" ...
+```
+
+### Step 2 — Install Ghidra
+
+Pick the latest release tagged `Ghidra_X.Y.Z_build` from the [GitHub releases](https://github.com/NationalSecurityAgency/ghidra/releases). The example below uses 11.2.1 — bump the version strings to whatever is current.
+
+```bash
+GHIDRA_VER=11.2.1_PUBLIC_20241105
+cd /opt
+sudo curl -L -o ghidra.zip \
+  "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_${GHIDRA_VER}.zip"
+sudo unzip -q ghidra.zip
+sudo rm ghidra.zip
+# Result: /opt/ghidra_11.2.1_PUBLIC/
+```
+
+### Step 3 — Export `GHIDRA_INSTALL_DIR` system-wide
+
+`pyghidra` discovers Ghidra exclusively through this environment variable; without it, every `method=pyghidra` request returns 503.
+
+```bash
+echo 'export GHIDRA_INSTALL_DIR=/opt/ghidra_11.2.1_PUBLIC' \
+  | sudo tee /etc/profile.d/ghidra.sh
+sudo chmod +x /etc/profile.d/ghidra.sh
+source /etc/profile.d/ghidra.sh
+```
+
+If the backend runs under systemd, also add it to the unit:
+
+```ini
+# /etc/systemd/system/ass-tut-backend.service
+[Service]
+Environment=GHIDRA_INSTALL_DIR=/opt/ghidra_11.2.1_PUBLIC
+```
+
+Then `sudo systemctl daemon-reload && sudo systemctl restart ass-tut-backend`.
+
+### Step 4 — Install the Python deps
+
+If you previously installed `backend/requirements.txt` before this feature was added, re-run it so Nuitka and pyghidra get picked up:
+
+```bash
+cd backend
+pip install -r requirements.txt
+```
+
+### Step 5 — Restart the backend and verify
+
+```bash
+uvicorn app.main:app --reload
+```
+
+In another terminal:
+
+```bash
+curl -s -X POST http://localhost:8000/compile \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"x = 1\nprint(x)","method":"pyghidra"}'
+```
+
+Expected outcomes:
+
+| Response | Meaning |
+|----------|---------|
+| `200` with a non-empty `asm_code` containing entries like `00401000:` | Toolchain is healthy |
+| `503` `{"detail":"PyGhidra unavailable: Nuitka not installed ..."}` | `pip install` did not run; redo Step 4 |
+| `503` `{"detail":"PyGhidra unavailable: pyghidra not installed ..."}` | Same — `pip install -r requirements.txt` |
+| `503` `{"detail":"PyGhidra unavailable: GHIDRA_INSTALL_DIR is not set ..."}` | The variable is not visible to the uvicorn process; redo Step 3, then restart the backend |
+| `422` with a Nuitka stderr tail | The user's Python is valid for `transpile` but Nuitka rejected it — surface the error to the caller |
+
+The default backend keeps working in parallel:
+
+```bash
+curl -s -X POST http://localhost:8000/compile \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"x = 1\nprint(x)"}'   # implicit method=transpile
+# → 200, same shape, with a populated line_map
+```
+
+### Docker
+
+The image at `backend/Dockerfile` is `python:3.12-slim` and does **not** ship a JDK or Ghidra. To enable the PyGhidra backend in the containerized stack, extend the Dockerfile:
+
+```dockerfile
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y \
+      gcc gcc-multilib \
+      openjdk-17-jdk-headless \
+      curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV GHIDRA_VER=11.2.1_PUBLIC_20241105
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra_11.2.1_PUBLIC
+
+RUN curl -L -o /tmp/ghidra.zip \
+      "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_${GHIDRA_VER}.zip" \
+    && unzip -q /tmp/ghidra.zip -d /opt \
+    && rm /tmp/ghidra.zip
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+This roughly doubles the image size (~2 GB once Ghidra is extracted). If you only need the transpile backend in production, leave the original Dockerfile in place.
 
 ---
 
