@@ -868,6 +868,62 @@ print(leaked)
       description: 'cmpl checks the loop index against the attacker-supplied claimed_len (6) instead of the buffer capacity (2); addl accumulates values from stack slots past the buffer boundary — secret_key, canary, and ret_addr leak into the response, defeating ASLR and exposing private keys',
     },
   },
+  {
+    id: 'use-after-return',
+    name: 'USE-AFTER-RETURN',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Stale pointer to a returned stack frame dereferences attacker-controlled data after the frame is reclaimed by a subsequent call.',
+    explanation:
+      'Use-after-return (CWE-562 / CWE-825) occurs when a function returns a pointer or reference to a ' +
+      'local stack variable. Once the function returns, its stack frame is deallocated — the next function ' +
+      'call reuses that same memory region, overwriting the original values with its own locals. Any ' +
+      'dangling pointer still referencing the old frame now reads attacker-controlled data from the new ' +
+      'call\'s stack layout. ' +
+      'CVE-2023-3269 (StackRot) exploited improper stack-expansion handling in the Linux kernel: the maple ' +
+      'tree replaced VMA nodes without holding the MM write lock, creating a use-after-free-by-RCU condition ' +
+      'in stack memory that allowed unprivileged local users to escalate to root on kernels 6.1 through 6.4. ' +
+      'CVE-2026-3591 (ISC BIND 9) returned the address of a stack variable during ACL evaluation, causing ' +
+      'the ACL to match incorrect IP addresses and bypass access controls. Google\'s AddressSanitizer added ' +
+      'a dedicated detect_stack_use_after_return mode because the bug class is so prevalent in C/C++ codebases. ' +
+      'In the assembly, `movl` stores the original canary (0x12345678) into a stack slot during get_local_ref; ' +
+      'after the frame is reclaimed, reuse_frame\'s `movl` overwrites that same offset with 0xDEADBEEF — ' +
+      'the subsequent `addl` in read() sums the clobbered values, leaking the attacker\'s payload.',
+    code:
+`# CVE pattern: returned stack-local ptr dereferenced after frame reclaimed
+class StackFrame:
+    def __init__(self, buf, canary, ret_addr):
+        self.buf = buf
+        self.canary = canary
+        self.ret_addr = ret_addr
+        self.valid = 1
+
+    def read(self):
+        result = self.buf + self.canary
+        return result
+
+def get_local_ref():
+    frame = StackFrame(256, 305419896, 4196352)
+    return frame
+
+def reuse_frame(payload):
+    frame = StackFrame(payload, payload, payload)
+    return frame
+
+stale = get_local_ref()
+stale.valid = 0
+reused = reuse_frame(3735928559)
+stale.buf = reused.buf
+stale.canary = reused.canary
+stale.ret_addr = reused.ret_addr
+leaked = stale.read()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the original canary (0x12345678) and buffer value into stack slots during get_local_ref; after frame reclamation, reuse_frame\'s movl overwrites those same offsets with 0xDEADBEEF — addl in read() sums the clobbered values, leaking attacker-controlled data from the reused stack frame',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
