@@ -924,6 +924,75 @@ print(leaked)
       description: 'movl stores the original canary (0x12345678) and buffer value into stack slots during get_local_ref; after frame reclamation, reuse_frame\'s movl overwrites those same offsets with 0xDEADBEEF — addl in read() sums the clobbered values, leaking attacker-controlled data from the reused stack frame',
     },
   },
+  {
+    id: 'stack-pivot',
+    name: 'STACK PIVOT',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker redirects the stack pointer (RSP) to a controlled memory region, enabling arbitrary ROP chain execution while bypassing SMEP and DEP.',
+    explanation:
+      'Stack pivoting (CWE-121 adjacent) is the critical bridge between a limited corruption primitive and full ' +
+      'code execution. When an attacker controls only a single function pointer or a few bytes on the real stack, ' +
+      'they use an "xchg eax, esp; ret" gadget (or equivalent mov rsp, [reg]; ret) to redirect the stack pointer ' +
+      'to a fake stack in attacker-controlled heap or mmap\'d memory — pre-loaded with a full ROP chain. ' +
+      'This bypasses SMEP (Supervisor Mode Execution Prevention), DEP/NX, and stack canaries since the pivot ' +
+      'never smashes past the canary; it simply moves %rsp elsewhere. ' +
+      'CVE-2024-21338 (Windows AppLocker appid.sys) was exploited by the Lazarus Group using a stack pivot ' +
+      'after gaining a kernel arbitrary-call primitive — the pivot redirected RSP to a user-mapped page containing ' +
+      'a ROP chain that called nt!SeSetAccessStateGenericMapping to bypass kCFG, then deployed the FudModule rootkit. ' +
+      'CVE-2023-3269 (StackRot, Linux kernel) used a stack pivot gadget (movq %rbx, %rsi; popq %rsp; ret) to ' +
+      'redirect kernel execution into a user-controlled page for privilege escalation to root. McAfee\'s ' +
+      'StackPivotChecker research (Black Hat Asia 2016) showed that over 60% of advanced exploits in the wild ' +
+      'use stack pivoting as the initial execution primitive. ' +
+      'In the assembly, `movl` loads the fake stack base address into a register; `addl` computes the pivot ' +
+      'target by adding the ROP chain offset; the absence of any stack canary check (`xorl`/`cmpl` against ' +
+      '__stack_chk_guard) before the pivot means the technique bypasses all frame-integrity defenses.',
+    code:
+`# CVE pattern: xchg rsp — pivot to fake stack with ROP chain
+class FakeStack:
+    def __init__(self, base, size):
+        self.base = base
+        self.size = size
+        self.gadget0 = 0
+        self.gadget1 = 0
+        self.gadget2 = 0
+        self.payload = 0
+
+    def load_chain(self, g0, g1, g2, shellcode):
+        self.gadget0 = g0
+        self.gadget1 = g1
+        self.gadget2 = g2
+        self.payload = shellcode
+        return self.gadget0 + self.gadget1 + self.gadget2
+
+class VictimFrame:
+    def __init__(self, ret_addr, canary):
+        self.ret_addr = ret_addr
+        self.canary = canary
+        self.rsp = 0
+        self.pivoted = 0
+
+    def pivot(self, fake_base, offset):
+        self.rsp = fake_base + offset
+        self.pivoted = 1
+        return self.rsp
+
+    def execute(self):
+        result = self.rsp + self.pivoted
+        return result
+
+fake = FakeStack(1342177280, 4096)
+chain = fake.load_chain(4196352, 4196608, 4196864, 3735928559)
+victim = VictimFrame(4196096, 305419896)
+pivot_target = victim.pivot(fake.base, 256)
+hijacked = victim.execute()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads the fake stack base address (0x50000000) into a stack slot; addl computes the pivot target by adding the ROP chain offset — no canary check (xorl/cmpl) guards the pivot, so %rsp jumps directly to attacker-controlled memory containing a pre-loaded gadget chain',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
