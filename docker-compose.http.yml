@@ -1,0 +1,26 @@
+services:
+  backend:
+    ports: !reset []
+    expose:
+      - "8000"
+
+  frontend:
+    ports: !reset []
+    expose:
+      - "80"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile.http:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+
+volumes:
+  caddy_data:
+  caddy_config:
