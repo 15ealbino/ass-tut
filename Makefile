@@ -9,13 +9,13 @@ ALL  := -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.http.
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-6s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-dev: ## Start dev stack detached (frontend :80, backend :8000, postgres :5432)
+dev: down ## Start dev stack detached (frontend :80, backend :8000, postgres :5432)
 	$(COMPOSE) up -d
 
-prod: ## Start production HTTPS stack with Caddy + Let's Encrypt (requires DOMAIN in .env)
+prod: down ## Start production HTTPS stack with Caddy + Let's Encrypt (requires DOMAIN in .env)
 	$(COMPOSE) $(PROD) up -d --build
 
-http: ## Start HTTP-only fallback stack on :80 (no TLS, no DNS required)
+http: down ## Start HTTP-only fallback stack on :80 (no TLS, no DNS required)
 	$(COMPOSE) $(HTTP) up -d --build
 
 down: ## Stop and remove containers for any running stack
