@@ -629,6 +629,66 @@ Caddy keeps its certificates in the `caddy_data` named volume, so rebuilds and r
 | `docker compose` reports `address already in use` for port 80 | System nginx or apache is bound to `:80` | `sudo systemctl disable --now nginx apache2` |
 | HTTP 502 from Caddy | Frontend container not healthy | `docker compose logs frontend`; rebuild with `--build` |
 
+#### HTTP-only fallback (Cloudflare DNS unavailable)
+
+If Cloudflare DNS is down or misconfigured, the apex `A` record won't resolve, Caddy can't complete the Let's Encrypt HTTP-01 challenge, and the HTTPS stack is unreachable. Use the `docker-compose.http.yml` overlay to serve the app over plain HTTP on `:80` directly from the VM's public IP, with no domain or certificate required.
+
+**When to use it:**
+
+- Cloudflare DNS, the registrar, or the `assembly-tutorial.com` zone is unavailable
+- You need to bring the site back up while DNS is being repaired
+- You want to smoke-test the stack on a fresh VM before pointing DNS at it
+
+**Files involved:**
+
+- `Caddyfile.http` — Caddy config that listens on `:80` with no domain and no TLS
+- `docker-compose.http.yml` — overlay that mounts `Caddyfile.http`, exposes only port `80`, and skips `443` (so no cert issuance is attempted)
+
+**Start it:**
+
+```bash
+cd ~/ass-tut
+docker compose -f docker-compose.yml -f docker-compose.prod.yml down
+docker compose -f docker-compose.yml -f docker-compose.http.yml up -d --build
+```
+
+`DOMAIN` does not need to be set for this overlay — `Caddyfile.http` has no `{$DOMAIN}` placeholder.
+
+**Verify:**
+
+```bash
+curl -I http://<vm-public-ip>/
+# → HTTP/1.1 200 OK
+```
+
+Open `http://<vm-public-ip>/` in a browser. There will be a "Not Secure" warning because traffic is unencrypted — this is expected.
+
+**Trade-offs vs the HTTPS prod setup:**
+
+| | HTTPS prod (`docker-compose.prod.yml`) | HTTP fallback (`docker-compose.http.yml`) |
+|---|---|---|
+| Reachable via | `https://assembly-tutorial.com` | `http://<vm-public-ip>/` |
+| Requires working DNS | Yes | No |
+| Requires Let's Encrypt | Yes | No |
+| Traffic encrypted | Yes | **No** — passwords and JWTs travel in cleartext |
+| Browser cert warning | None | "Not Secure" indicator |
+| Recommended duration | Permanent | Temporary, until DNS is restored |
+
+Because login credentials and JWTs traverse plain HTTP, treat this as a temporary recovery mode. Do not leave it running longer than needed.
+
+**Switch back to HTTPS once DNS is restored:**
+
+```bash
+dig +short assembly-tutorial.com   # confirm it returns the VM IP
+
+cd ~/ass-tut
+docker compose -f docker-compose.yml -f docker-compose.http.yml down
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+docker compose logs -f caddy       # watch for "certificate obtained successfully"
+```
+
+The `caddy_data` named volume persists across both overlays, so any previously issued certificate is reused without re-triggering Let's Encrypt issuance.
+
 ---
 
 ### Vercel
