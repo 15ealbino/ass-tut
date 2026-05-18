@@ -993,6 +993,74 @@ print(hijacked)
       description: 'movl loads the fake stack base address (0x50000000) into a stack slot; addl computes the pivot target by adding the ROP chain offset — no canary check (xorl/cmpl) guards the pivot, so %rsp jumps directly to attacker-controlled memory containing a pre-loaded gadget chain',
     },
   },
+  {
+    id: 'got-overwrite',
+    name: 'GOT OVERWRITE',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Arbitrary write overwrites a GOT entry so the next library call (e.g. printf) jumps to attacker-chosen code (e.g. system).',
+    explanation:
+      'The Global Offset Table (GOT) is an ELF data structure that holds resolved addresses for dynamically ' +
+      'linked library functions. During lazy binding, the first call to printf() triggers the dynamic linker to ' +
+      'write printf\'s real address into the GOT; subsequent calls jump directly to that stored address. ' +
+      'Because the GOT must be writable during lazy resolution (unless Full RELRO is enabled), any arbitrary-write ' +
+      'primitive — from a format string %n, heap metadata corruption, or out-of-bounds index — can overwrite a GOT ' +
+      'entry. The attacker replaces the address of a frequently called function (printf, puts, free) with libc\'s ' +
+      'system(), so the next call to printf("/bin/sh") executes system("/bin/sh") instead. ' +
+      'CVE-2024-20017 (MediaTek wappd, CVSS 9.8) used a 4-byte write primitive from a buffer overflow to iteratively ' +
+      'overwrite GOT entries with a shell payload, achieving zero-click RCE on routers and smartphones from Ubiquiti, ' +
+      'Xiaomi, and Netgear. CVE-2023-4911 (Looney Tunables, glibc ld.so) exploited a GLIBC_TUNABLES buffer overflow ' +
+      'in the dynamic linker itself — the component responsible for populating the GOT — enabling local privilege ' +
+      'escalation to root on Debian, Ubuntu, and Fedora. Full RELRO (marking the GOT read-only after binding) ' +
+      'mitigates this, but many embedded and legacy binaries ship with Partial RELRO, leaving the .got.plt writable. ' +
+      'In the assembly, movl writes the libc system() address into the GOT slot that previously held printf\'s ' +
+      'address; the subsequent call_printf\'s addl combines the hijacked address with the /bin/sh argument — ' +
+      'the PLT stub jumps to the overwritten GOT entry, landing in system() instead of printf().',
+    code:
+`# CVE pattern: arbitrary write replaces GOT[printf] with system()
+class GOTTable:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.printf_got = 0
+        self.puts_got = 0
+        self.exit_got = 0
+        self.resolved = 0
+
+    def lazy_bind(self, printf_addr, puts_addr, exit_addr):
+        self.printf_got = printf_addr
+        self.puts_got = puts_addr
+        self.exit_got = exit_addr
+        self.resolved = 3
+        return self.resolved
+
+    def call_printf(self, arg):
+        result = self.printf_got + arg
+        return result
+
+class Exploit:
+    def __init__(self, write_value):
+        self.value = write_value
+        self.triggered = 0
+
+    def overwrite_got(self, got):
+        got.printf_got = self.value
+        self.triggered = 1
+        return self.triggered
+
+got = GOTTable(3)
+got.lazy_bind(4214784, 4214848, 4214912)
+libc_system = 4151632
+bin_sh = 4217856
+exploit = Exploit(libc_system)
+exploit.overwrite_got(got)
+hijacked = got.call_printf(bin_sh)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl writes the attacker-supplied libc system() address into the stack slot representing the GOT entry for printf; addl in call_printf combines the hijacked address with the /bin/sh argument — the PLT stub jumps to the overwritten GOT entry, executing system("/bin/sh") instead of printf()',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
