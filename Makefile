@@ -4,10 +4,10 @@ HTTP := -f docker-compose.yml -f docker-compose.http.yml
 ALL  := -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.http.yml
 
 .DEFAULT_GOAL := help
-.PHONY: help dev prod http down logs ps
+.PHONY: help dev prod http down logs ps test-e2e
 
 help: ## Show available targets
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-6s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-9s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 dev: down ## Start dev stack detached (frontend :80, backend :8000, postgres :5432)
 	$(COMPOSE) up -d
@@ -26,3 +26,8 @@ logs: ## Tail logs from the running stack
 
 ps: ## Show container status
 	DOMAIN=_ $(COMPOSE) $(ALL) ps
+
+PYTHON ?= python3
+
+test-e2e: ## Run end-to-end Makefile/compose tests (slow, requires Docker)
+	$(PYTHON) tests/e2e/test_compose_modes.py
