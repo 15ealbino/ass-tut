@@ -1061,6 +1061,66 @@ print(hijacked)
       description: 'movl writes the attacker-supplied libc system() address into the stack slot representing the GOT entry for printf; addl in call_printf combines the hijacked address with the /bin/sh argument — the PLT stub jumps to the overwritten GOT entry, executing system("/bin/sh") instead of printf()',
     },
   },
+  {
+    id: 'heap-bof',
+    name: 'HEAP BUFFER OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Write past a heap-allocated buffer corrupts adjacent objects or allocator metadata, enabling arbitrary code execution.',
+    explanation:
+      'Heap buffer overflow (CWE-122) occurs when data written to a heap-allocated buffer exceeds its bounds, ' +
+      'corrupting adjacent heap objects or allocator metadata. Unlike stack overflows, heap overflows bypass stack ' +
+      'canaries entirely — the attacker instead overwrites adjacent objects\' function pointers, vtable references, ' +
+      'or allocator bookkeeping (size/fd/bk fields). With heap grooming — carefully ordering allocations so the ' +
+      'victim object sits directly after the overflow source — the attacker gains deterministic control of what gets ' +
+      'corrupted. CVE-2026-42945 (NGINX Rift, CVSS 9.2) is an 18-year-old heap overflow in ngx_http_rewrite_module ' +
+      'disclosed in May 2026 and immediately exploited in the wild: a crafted HTTP request overflows the worker-process ' +
+      'heap for unauthenticated RCE. CVE-2023-4863 (libwebp, CVSS 9.8) exploited a heap overflow in Huffman table ' +
+      'construction during WebP image decoding, achieving RCE in Chrome, Firefox, Signal, and 1Password. ' +
+      'In the assembly, `addl` accumulates data past the buffer capacity inside the write loop, but `cmpl` compares ' +
+      'against the attacker-supplied count rather than the buffer capacity — adjacent object fields (the victim\'s ' +
+      'handler pointer) are overwritten by the spill, redirecting the next virtual call to attacker-chosen code.',
+    code:
+`# CVE pattern: heap write exceeds capacity — corrupts adjacent object
+class HeapBuf:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.used = 0
+        self.data = 0
+        self.overflow = 0
+
+    def write(self, value, count):
+        i = 0
+        while i < count:
+            self.data += value
+            self.used += 1
+            if self.used > self.capacity:
+                self.overflow += 1
+            i += 1
+        return self.used
+
+class Adjacent:
+    def __init__(self, handler, size):
+        self.handler = handler
+        self.size = size
+        self.active = 1
+
+    def dispatch(self):
+        result = self.handler + self.size
+        return result
+
+buf = HeapBuf(8)
+victim = Adjacent(4196352, 64)
+buf.write(16, 12)
+victim.handler = 3735928559
+hijacked = victim.dispatch()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'addl'],
+      description: 'cmpl compares used against the attacker-supplied count instead of the buffer capacity; addl accumulates data past the boundary — the adjacent object\'s handler field is overwritten with 0xDEADBEEF, redirecting dispatch() to attacker-chosen code',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
