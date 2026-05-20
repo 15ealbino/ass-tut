@@ -1121,6 +1121,71 @@ print(hijacked)
       description: 'cmpl compares used against the attacker-supplied count instead of the buffer capacity; addl accumulates data past the boundary — the adjacent object\'s handler field is overwritten with 0xDEADBEEF, redirecting dispatch() to attacker-chosen code',
     },
   },
+  {
+    id: 'double-fetch',
+    name: 'DOUBLE FETCH',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Kernel reads user-space memory twice in one syscall — attacker thread swaps the value between the validation fetch and the use fetch.',
+    explanation:
+      'Double-fetch is a kernel-specific race condition where the kernel reads a value from user-space memory ' +
+      'to validate it (the check fetch), then reads the same address again to use it (the use fetch). Between ' +
+      'the two reads, a concurrent attacker thread overwrites the user-space value — the kernel operates on ' +
+      'modified, unchecked data. Unlike file-level TOCTOU, double-fetch exploits the CPU cache-coherence protocol ' +
+      'and shared-page mappings at individual instruction granularity within a single syscall handler. ' +
+      'CVE-2016-6130 (Linux s390 SCLP console driver) fetched a size field twice from user-space: the first ' +
+      'fetch validated the length, but the second fetch read a now-larger attacker-modified value, causing a ' +
+      'kernel heap overflow. CVE-2016-9038 (Sophos SboxDrv.sys sandbox driver) double-fetched a user-mode ' +
+      'address pointer: the first fetch verified it pointed to user-space, but the attacker swapped it to a ' +
+      'kernel-mode address before the second fetch, achieving arbitrary kernel memory write for privilege ' +
+      'escalation. A USENIX Security 2017 study found 90 double-fetch sites across the Linux kernel, ' +
+      'concentrated in ioctl handlers and copy_from_user paths. CVE-2022-1729 (Linux perf_event_open) ' +
+      'exploited a similar pattern in the performance subsystem for local privilege escalation. ' +
+      'In the assembly, two separate movl instructions load from the same user-space field offset — the first ' +
+      'feeds into cmpl for the bounds check, the second feeds into imull for the actual copy operation. No lock ' +
+      'or atomic load ties them together, so the attacker\'s concurrent store lands between the two fetches.',
+    code:
+`# CVE pattern: kernel fetches user-space size twice — attacker swaps between
+class UserPage:
+    def __init__(self, size, data):
+        self.size = size
+        self.data = data
+        self.swapped = 0
+
+    def attacker_swap(self, new_size, new_data):
+        self.size = new_size
+        self.data = new_data
+        self.swapped = 1
+        return self.swapped
+
+class SyscallHandler:
+    def __init__(self, max_size):
+        self.max_size = max_size
+        self.validated = 0
+        self.result = 0
+
+    def fetch_and_check(self, upage):
+        if upage.size <= self.max_size:
+            self.validated = 1
+        return self.validated
+
+    def fetch_and_use(self, upage):
+        copy_len = upage.size
+        self.result = copy_len * upage.data
+        return self.result
+
+upage = UserPage(16, 100)
+handler = SyscallHandler(64)
+handler.fetch_and_check(upage)
+upage.attacker_swap(4096, 3735928559)
+leaked = handler.fetch_and_use(upage)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'imull'],
+      description: 'cmpl compares the first-fetched upage.size against max_size in fetch_and_check; imull multiplies the second-fetched upage.size by data in fetch_and_use — two separate movl reads from the same field offset with no atomic tie let the attacker swap size from 16 to 4096 between fetches, bypassing the bounds guard',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
