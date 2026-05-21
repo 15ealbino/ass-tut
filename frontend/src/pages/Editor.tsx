@@ -1186,6 +1186,83 @@ print(leaked)
       description: 'cmpl compares the first-fetched upage.size against max_size in fetch_and_check; imull multiplies the second-fetched upage.size by data in fetch_and_use — two separate movl reads from the same field offset with no atomic tie let the attacker swap size from 16 to 4096 between fetches, bypassing the bounds guard',
     },
   },
+  {
+    id: 'srop',
+    name: 'SROP SIGRETURN ATTACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Forged sigreturn frame on the stack sets all CPU registers at once, achieving arbitrary syscall execution with just one gadget.',
+    explanation:
+      'Sigreturn-Oriented Programming (SROP / CWE-440 adjacent) exploits the UNIX signal-handling mechanism: ' +
+      'when a signal fires, the kernel saves all CPU registers onto the stack in a sigcontext frame (~300 bytes ' +
+      'on x86-64), then jumps to the signal handler. When the handler returns, the rt_sigreturn syscall pops ' +
+      'the saved frame and restores every register — rax, rdi, rsi, rdx, rsp, rip, and all others. ' +
+      'The attacker forges a fake sigcontext frame on the stack via a buffer overflow, setting rax=59 (execve), ' +
+      'rdi=address of "/bin/sh", and rip=a syscall gadget. Only one or two gadgets are needed (a "syscall; ret" ' +
+      'stub), compared to dozens in a traditional ROP chain — making SROP portable across binaries and ' +
+      'architectures. Presented at IEEE S&P 2014 (best student paper) by Erik Bosman of Vrije Universiteit ' +
+      'Amsterdam, SROP was demonstrated against a real glibc DNS resolver vulnerability and shown to work on ' +
+      'Linux, FreeBSD, and Mac OS X. CVE-2015-7547 (glibc getaddrinfo stack overflow, CVSS 8.1) provided the ' +
+      'exact conditions for SROP: a stack overflow in a statically linked resolver with few available gadgets, ' +
+      'where SROP\'s minimal gadget requirement was decisive. The technique bypasses NX/DEP, ASLR (no GOT/PLT ' +
+      'dependence), and stack canaries when combined with a canary leak. ' +
+      'In the assembly, movl loads attacker-chosen values (syscall number 59, /bin/sh address, syscall gadget ' +
+      'address) into stack slots representing the forged sigcontext; addl in execute_sigreturn sums rax + rdi + ' +
+      'rip — in a real SROP attack, rt_sigreturn pops these into CPU registers and the syscall instruction ' +
+      'fires execve("/bin/sh"), spawning a root shell.',
+    code:
+`# CVE pattern: forged sigreturn frame sets all regs — one gadget to shell
+class SigFrame:
+    def __init__(self):
+        self.rax = 0
+        self.rdi = 0
+        self.rsi = 0
+        self.rdx = 0
+        self.rsp = 0
+        self.rip = 0
+        self.frame_size = 0
+
+    def forge(self, syscall_nr, arg1, arg2, arg3, ret_addr):
+        self.rax = syscall_nr
+        self.rdi = arg1
+        self.rsi = arg2
+        self.rdx = arg3
+        self.rip = ret_addr
+        self.frame_size = self.rax + self.rdi + self.rsi + self.rdx + self.rip
+        return self.frame_size
+
+class VictimStack:
+    def __init__(self, ret_addr, canary):
+        self.ret_addr = ret_addr
+        self.canary = canary
+        self.sigreturn_gadget = 0
+        self.triggered = 0
+
+    def overflow(self, gadget_addr):
+        self.ret_addr = gadget_addr
+        self.sigreturn_gadget = gadget_addr
+        return self.ret_addr
+
+    def execute_sigreturn(self, frame):
+        result = frame.rax + frame.rdi + frame.rip
+        self.triggered = 1
+        return result
+
+frame = SigFrame()
+execve_nr = 59
+bin_sh = 4217856
+syscall_ret = 4196352
+frame.forge(execve_nr, bin_sh, 0, 0, syscall_ret)
+victim = VictimStack(4196608, 305419896)
+victim.overflow(syscall_ret)
+hijacked = victim.execute_sigreturn(frame)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads attacker-chosen values (syscall number 59/execve, /bin/sh address, syscall gadget address) into stack slots representing the forged sigcontext frame; addl in execute_sigreturn combines rax + rdi + rip — in a real SROP attack, rt_sigreturn pops these into CPU registers and the syscall instruction fires execve("/bin/sh")',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
