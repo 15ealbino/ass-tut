@@ -1263,6 +1263,71 @@ print(hijacked)
       description: 'movl loads attacker-chosen values (syscall number 59/execve, /bin/sh address, syscall gadget address) into stack slots representing the forged sigcontext frame; addl in execute_sigreturn combines rax + rdi + rip — in a real SROP attack, rt_sigreturn pops these into CPU registers and the syscall instruction fires execve("/bin/sh")',
     },
   },
+  {
+    id: 'page-cache-poison',
+    name: 'PAGE CACHE POISONING',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Controlled write into the kernel page cache silently corrupts in-memory file contents, enabling privilege escalation via setuid binary tampering.',
+    explanation:
+      'Page cache poisoning occurs when a kernel bug allows a userspace process to write controlled bytes into the ' +
+      'kernel\'s page cache — the in-memory copy of file contents that all processes read. Because the kernel never ' +
+      'marks the corrupted page dirty, the on-disk file remains untouched and checksum verification passes, yet every ' +
+      'process that reads the file sees the attacker\'s modified version. ' +
+      'CVE-2026-31431 ("Copy Fail", CVSS 7.8) is the defining example: a logic flaw in the Linux kernel\'s algif_aead ' +
+      'module (the AEAD socket interface of AF_ALG) uses destination memory as scratch space during decryption. By ' +
+      'chaining AF_ALG with splice(), an unprivileged user triggers a deterministic 4-byte write of controlled AAD ' +
+      'seqno_lo bytes into any readable file\'s page cache — targeting /usr/bin/su to patch in a root shell. ' +
+      'Introduced in 2017 via commit 72548b093ee3, the flaw affected every major Linux distribution for nine years. ' +
+      'A 732-byte Python script achieves root on Ubuntu 24.04, RHEL 10.1, Amazon Linux 2023, and SUSE 16 with no ' +
+      'additional kernel modules or race conditions required. CISA added it to the KEV catalog in May 2026. ' +
+      'In the assembly, movl writes the attacker\'s 4-byte payload into the cache_page slot; the subsequent addl in ' +
+      'read_cached sums the corrupted value with the original — no dirty-flag write (no additional movl to a "dirty" ' +
+      'field) appears, so the corruption is invisible to writeback and persists until page eviction.',
+    code:
+`# CVE pattern: AF_ALG splice corrupts page cache — 4 bytes to root
+class PageCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.page0 = 0
+        self.page1 = 0
+        self.dirty = 0
+        self.refcount = 1
+
+    def load_file(self, data0, data1):
+        self.page0 = data0
+        self.page1 = data1
+        self.refcount += 1
+        return self.refcount
+
+    def read_cached(self):
+        result = self.page0 + self.page1
+        return result
+
+class AeadScratch:
+    def __init__(self, aad_seqno):
+        self.seqno_lo = aad_seqno
+        self.written = 0
+
+    def corrupt_dst(self, cache):
+        cache.page1 = self.seqno_lo
+        self.written = 1
+        return self.written
+
+setuid_bin = 4196352
+original_code = 1094795585
+cache = PageCache(4096)
+cache.load_file(setuid_bin, original_code)
+scratch = AeadScratch(3735928559)
+scratch.corrupt_dst(cache)
+hijacked = cache.read_cached()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl writes the attacker\'s 4-byte seqno_lo payload (0xDEADBEEF) into the page1 cache slot representing the setuid binary\'s code page; addl in read_cached sums the corrupted value — no movl to a "dirty" field appears, so the kernel never writes back the corruption and on-disk checksums pass while all processes read the poisoned page',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
