@@ -18,8 +18,13 @@ prod: down ## Start production HTTPS stack with Caddy + Let's Encrypt (requires 
 http: down ## Start HTTP-only fallback stack on :80 (no TLS, no DNS required)
 	$(COMPOSE) $(HTTP) up -d --build
 
-down: ## Stop and remove containers for any running stack
+down: ## Stop and remove containers for any running stack (frees host :80 and :443)
 	DOMAIN=_ $(COMPOSE) $(ALL) down --remove-orphans
+	@cids=$$( { docker ps -q --filter publish=80; docker ps -q --filter publish=443; } 2>/dev/null | sort -u); \
+	if [ -n "$$cids" ]; then \
+		echo "Removing stray containers holding host :80/:443: $$cids"; \
+		docker rm -f $$cids >/dev/null; \
+	fi
 
 logs: ## Tail logs from the running stack
 	DOMAIN=_ $(COMPOSE) $(ALL) logs -f
