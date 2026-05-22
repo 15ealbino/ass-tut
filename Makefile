@@ -25,6 +25,7 @@ down: ## Stop and remove containers for any running stack (frees host :80 and :4
 		echo "Removing stray containers holding host :80/:443: $$cids"; \
 		docker rm -f $$cids >/dev/null; \
 	fi
+	@./scripts/free-ports.sh
 
 logs: ## Tail logs from the running stack
 	DOMAIN=_ $(COMPOSE) $(ALL) logs -f
