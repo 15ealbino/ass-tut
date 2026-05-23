@@ -1328,6 +1328,75 @@ print(hijacked)
       description: 'movl writes the attacker\'s 4-byte seqno_lo payload (0xDEADBEEF) into the page1 cache slot representing the setuid binary\'s code page; addl in read_cached sums the corrupted value — no movl to a "dirty" field appears, so the kernel never writes back the corruption and on-disk checksums pass while all processes read the poisoned page',
     },
   },
+  {
+    id: 'stack-clash',
+    name: 'STACK CLASH',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Large stack allocation jumps over the guard page, colliding the stack with an adjacent memory region and enabling arbitrary memory corruption.',
+    explanation:
+      'Stack Clash (CWE-121 adjacent) exploits insufficient stack guard pages: a single 4KB unmapped guard ' +
+      'page separates the downward-growing stack from adjacent memory regions (heap, mmap, BSS). An attacker ' +
+      'triggers a large alloca() or variable-length array that moves the stack pointer past the guard page ' +
+      'in a single jump — no page fault fires because the guard page is never touched. The stack pointer now ' +
+      'points into the adjacent heap or mmap region, and subsequent writes corrupt that region\'s metadata or data. ' +
+      'CVE-2017-1000364 (Linux kernel, affecting all major distributions and BSD/Solaris on i386 and amd64) ' +
+      'demonstrated that the 4KB guard page was trivially jumpable; Qualys developed seven proof-of-concept ' +
+      'exploits achieving root on Linux, OpenBSD, NetBSD, FreeBSD, and Solaris. CVE-2017-1000366 (glibc) ' +
+      'exploited the same class in ld.so\'s stack expansion during dynamic linking. CVE-2023-3269 (StackRot) ' +
+      'showed that MAP_GROWSDOWN VMA handling could bypass the enlarged 1MB guard added as a fix, enabling ' +
+      'kernel privilege escalation on Linux 6.1 through 6.4. GCC added -fstack-clash-protection to emit ' +
+      'stack probes for large allocations, but unprotected binaries remain vulnerable. ' +
+      'In the assembly, the loop\'s subtraction decrements sp by 65536 per iteration via `movl` without any ' +
+      'guard-page probe instruction — after 8 iterations `cmpl` shows sp has overshot the 4KB guard into the ' +
+      'heap region, and `movl` writes 0xDEADBEEF into the heap\'s data slot via the clashed stack frame.',
+    code:
+`# CVE pattern: large alloca jumps guard page — stack collides with heap
+class MemRegion:
+    def __init__(self, base, size):
+        self.base = base
+        self.size = size
+        self.data = 0
+        self.corrupted = 0
+
+    def write(self, value):
+        self.data = value
+        return self.data
+
+class Stack:
+    def __init__(self, top, guard_size):
+        self.top = top
+        self.sp = top
+        self.guard_size = guard_size
+        self.frames = 0
+
+    def alloca(self, size):
+        self.sp -= size
+        self.frames += 1
+        return self.sp
+
+    def check_clash(self, heap):
+        if self.sp <= heap.base + heap.size:
+            heap.corrupted = 1
+            heap.data = 3735928559
+        return heap.corrupted
+
+stack = Stack(1048576, 4096)
+heap = MemRegion(524288, 262144)
+heap.write(4196352)
+i = 0
+while i < 8:
+    stack.alloca(65536)
+    i += 1
+stack.check_clash(heap)
+result = heap.data
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl decrements the stack pointer by 65536 per loop iteration without a guard-page probe; after 8 iterations cmpl shows sp has overshot the 4KB guard into the heap region — movl then writes 0xDEADBEEF into the heap\'s data slot, corrupting adjacent memory via the clashed stack frame',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
