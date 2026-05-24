@@ -1397,6 +1397,67 @@ print(result)
       description: 'movl decrements the stack pointer by 65536 per loop iteration without a guard-page probe; after 8 iterations cmpl shows sp has overshot the 4KB guard into the heap region — movl then writes 0xDEADBEEF into the heap\'s data slot, corrupting adjacent memory via the clashed stack frame',
     },
   },
+  {
+    id: 'spectre-bbc',
+    name: 'SPECTRE BOUNDS BYPASS',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'CPU speculatively executes past a bounds check, leaking secret data from adjacent memory via cache timing side-channel.',
+    explanation:
+      'Spectre Variant 1 — Bounds Check Bypass (CVE-2017-5753 / CWE-200) exploits CPU speculative execution: ' +
+      'when a branch condition (e.g. "if index < array_size") takes time to resolve, the CPU speculates the ' +
+      'likely outcome and continues executing instructions. If it speculates "taken," it reads data past the ' +
+      'buffer boundary — secret keys, ASLR pointers, kernel memory — and uses that data to index a probe ' +
+      'array, loading a specific cache line. When the branch resolves and the speculation is rolled back, the ' +
+      'architectural state is clean but the cache state is not: the attacker times accesses to each probe-array ' +
+      'line to determine which was loaded, recovering the secret byte. Training the branch predictor with ' +
+      'repeated in-bounds accesses makes the speculative path near-certain on the attack invocation. ' +
+      'CVE-2024-45332 (Branch Privilege Injection, disclosed May 2025 by ETH Zürich) showed that Intel\'s own ' +
+      'IBPB/eIBRS mitigations could be bypassed, leaking kernel memory at 17 KB/s on all Intel CPUs since ' +
+      '9th-gen Coffee Lake. CVE-2025-24495 extended this to Lion Cove cores. Intel has not shipped a hardware ' +
+      'fix for Spectre v1; software mitigation requires inserting LFENCE between every bounds check and ' +
+      'dependent load, which most binaries still lack. ' +
+      'In the assembly, `cmpl` performs the bounds check but the CPU speculatively executes past the conditional ' +
+      'branch; `movl` loads the secret value from beyond the buffer boundary before the branch resolves; ' +
+      '`imull` multiplies it by 256 to compute the cache probe index — no `lfence` serializing instruction ' +
+      'appears between the check and the load, leaving the speculative window wide open.',
+    code:
+`# CVE pattern: speculative bounds bypass leaks secret via cache timing
+class VictimBuffer:
+    def __init__(self, bound):
+        self.bound = bound
+        self.data0 = 65
+        self.data1 = 66
+        self.secret_key = 3405691582
+        self.aslr_base = 4196352
+        self.probe_result = 0
+
+    def spec_read(self, index):
+        if index < self.bound:
+            value = self.data0 + index
+        else:
+            value = self.secret_key
+        self.probe_result = value * 256
+        return self.probe_result
+
+    def flush_reload(self):
+        result = self.probe_result + self.aslr_base
+        return result
+
+victim = VictimBuffer(2)
+i = 0
+while i < 5:
+    victim.spec_read(0)
+    i += 1
+leaked = victim.spec_read(99)
+timing = victim.flush_reload()
+print(timing)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'imull'],
+      description: 'cmpl performs the bounds check but the CPU speculatively executes past the conditional branch before it resolves; movl loads the secret_key (0xCAFEBABE) from beyond the buffer boundary; imull multiplies the leaked value by 256 to compute the cache probe line index — no lfence serializing instruction appears between the check and the load, leaving the speculative window open for a Flush+Reload timing attack',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
