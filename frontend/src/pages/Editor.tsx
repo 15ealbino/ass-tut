@@ -1458,6 +1458,80 @@ print(timing)
       description: 'cmpl performs the bounds check but the CPU speculatively executes past the conditional branch before it resolves; movl loads the secret_key (0xCAFEBABE) from beyond the buffer boundary; imull multiplies the leaked value by 256 to compute the cache probe line index — no lfence serializing instruction appears between the check and the load, leaving the speculative window open for a Flush+Reload timing attack',
     },
   },
+  {
+    id: 'jit-spray',
+    name: 'JIT SPRAY',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker-supplied constants in JIT-compiled code embed hidden shellcode on executable pages, bypassing DEP and ASLR.',
+    explanation:
+      'JIT spraying exploits just-in-time compilers that emit executable code from user-supplied data. ' +
+      'The attacker crafts JavaScript (or ActionScript) constants — XOR chains like ' +
+      '0x3C909090 ^ 0x3C909090 — where each operand encodes x86 NOP sled bytes (0x90) when read at a ' +
+      '1-byte offset from the intended instruction boundary. The JIT engine faithfully compiles these ' +
+      'constants onto an executable (RWX or RX) memory page; jumping into the middle of a constant ' +
+      'makes the CPU interpret the embedded bytes as a NOP sled sliding into shellcode. ' +
+      'Because JIT pages are exempt from DEP/NX (they must be executable by design) and spraying hundreds ' +
+      'of identical pages makes the target address predictable, both DEP and ASLR are defeated simultaneously. ' +
+      'First demonstrated by Dion Blazakis at Black Hat DC 2010 against Adobe Flash\'s ActionScript JIT, ' +
+      'the technique was later adapted to target V8, SpiderMonkey, and JavaScriptCore. ' +
+      'CVE-2024-29943 (SpiderMonkey JIT bounds check elimination, CVSS 9.8, Pwn2Own Vancouver 2024) allowed ' +
+      'Manfred Paul to fool range-based bounds checking in the IonMonkey JIT, achieving RCE in Firefox. ' +
+      'CVE-2025-4919 (Firefox IonMonkey, Pwn2Own Berlin 2025) exploited a similar JIT optimization flaw ' +
+      'for renderer-process compromise. Modern mitigations include constant blinding (XORing immediates ' +
+      'with a random key), W^X JIT pages, and removing bounds-check elimination entirely (V8, 2024). ' +
+      'In the assembly, movl loads attacker-chosen NOP sled values (0x90909090) and shellcode markers ' +
+      '(0xDEADBEEF) into stack slots representing JIT-emitted constants; addl in the spray loop ' +
+      'accumulates emit_count without any constant-blinding XOR — hijack adds a +1 offset to the ' +
+      'base address, simulating the misaligned jump that reinterprets constant bytes as executable instructions.',
+    code:
+`# CVE pattern: JIT-emitted constants hide shellcode — DEP bypass
+class JITPage:
+    def __init__(self, base_addr, size):
+        self.base_addr = base_addr
+        self.size = size
+        self.emit_count = 0
+        self.last_emit = 0
+
+    def emit_constant(self, value):
+        self.last_emit = value
+        self.emit_count += 1
+        return self.base_addr + self.emit_count * 8
+
+class SprayEngine:
+    def __init__(self, page_count):
+        self.page_count = page_count
+        self.total_emitted = 0
+        self.nop_sled_addr = 0
+
+    def spray(self, jit_page, nop_val, shellcode, count):
+        i = 0
+        while i < count:
+            jit_page.emit_constant(nop_val)
+            self.total_emitted += 1
+            i += 1
+        jit_page.emit_constant(shellcode)
+        self.total_emitted += 1
+        self.nop_sled_addr = jit_page.base_addr + 1
+        return self.nop_sled_addr
+
+    def hijack(self, offset):
+        result = self.nop_sled_addr + offset
+        return result
+
+jit = JITPage(1342177280, 4096)
+engine = SprayEngine(256)
+nop_sled = 2425393296
+shellcode = 3735928559
+entry = engine.spray(jit, nop_sled, shellcode, 6)
+hijacked = engine.hijack(4)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads attacker-chosen NOP sled values (0x90909090) and shellcode markers (0xDEADBEEF) into stack slots representing JIT-emitted constants on an executable page; addl in the spray loop increments emit_count with no constant-blinding XOR — hijack adds a +1 offset to the JIT page base, simulating the misaligned jump that reinterprets embedded constant bytes as a NOP sled sliding into shellcode',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
