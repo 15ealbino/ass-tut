@@ -1532,6 +1532,77 @@ print(hijacked)
       description: 'movl loads attacker-chosen NOP sled values (0x90909090) and shellcode markers (0xDEADBEEF) into stack slots representing JIT-emitted constants on an executable page; addl in the spray loop increments emit_count with no constant-blinding XOR — hijack adds a +1 offset to the JIT page base, simulating the misaligned jump that reinterprets embedded constant bytes as a NOP sled sliding into shellcode',
     },
   },
+  {
+    id: 'refcount-overflow',
+    name: 'REFCOUNT OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Object reference counter wraps past INT_MAX to zero, triggering premature free while live references remain — use-after-free to root.',
+    explanation:
+      'Reference count overflow (CWE-911) occurs when an object\'s reference counter — typically a 32-bit ' +
+      'atomic_t — is incremented past INT_MAX (0x7FFFFFFF), wrapping to zero or a small positive value. ' +
+      'The kernel interprets a zero refcount as "no references remain" and frees the object, but the attacker ' +
+      'still holds a dangling reference. Subsequent use of that reference is a classic use-after-free: the ' +
+      'attacker heap-sprays the freed slot with controlled data and redirects execution via a corrupted ' +
+      'function pointer or vtable. ' +
+      'CVE-2016-0728 (Linux keyring, CVSS 7.8) is the textbook example: join_session_keyring() leaked one ' +
+      'reference per call, so ~2^32 calls (~30 minutes on modern hardware) overflowed the atomic_t usage ' +
+      'field to zero, freeing the keyring while the process still held a pointer — Perception Point demonstrated ' +
+      'local privilege escalation to root on all kernels 3.8+. This CVE prompted Linux to introduce the ' +
+      'refcount_t API (v4.11) which saturates at REFCOUNT_SATURATED instead of wrapping. ' +
+      'CVE-2024-49940 (Linux L2TP) showed the class persists: a race in session creation let a concurrent ' +
+      'thread decrement a tunnel refcount that was never incremented, producing a refcount underflow to zero ' +
+      'and premature tunnel teardown. CVE-2021-22555 (Netfilter, exploited in the wild) and CVE-2021-20226 ' +
+      '(io_uring) both involved refcount mismanagement leading to use-after-free and root shells. ' +
+      'In the assembly, addl increments the refcount field in a tight loop; after enough iterations cmpl ' +
+      'shows the counter has wrapped past the maximum to a small value — the subsequent movl zeroes the ' +
+      'object (simulating free) yet addl in use_dangling still reads from the same stack offset, accessing ' +
+      'attacker-controlled data in the freed slot.',
+    code:
+`# CVE pattern: refcount wraps to zero — object freed while ref held
+class KernelObject:
+    def __init__(self, handler, data):
+        self.handler = handler
+        self.data = data
+        self.refcount = 1
+        self.freed = 0
+
+    def get_ref(self):
+        self.refcount += 1
+        return self.refcount
+
+    def put_ref(self):
+        self.refcount -= 1
+        if self.refcount == 0:
+            self.freed = 1
+            self.handler = 0
+            self.data = 0
+        return self.refcount
+
+    def use_dangling(self):
+        result = self.handler + self.data
+        return result
+
+obj = KernelObject(4196352, 256)
+i = 0
+while i < 6:
+    obj.get_ref()
+    i += 1
+overflow_val = obj.refcount
+j = 0
+while j < 8:
+    obj.put_ref()
+    j += 1
+obj.handler = 3735928559
+obj.data = 4196608
+leaked = obj.use_dangling()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl', 'movl'],
+      description: 'addl increments the refcount field in a tight loop; after wrapping, put_ref\'s cmpl sees refcount == 0 and movl zeroes the object (simulating free) — but use_dangling\'s addl still reads from the same stack offset where the attacker has sprayed 0xDEADBEEF, turning the premature free into code execution',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
