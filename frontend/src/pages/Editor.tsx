@@ -1603,6 +1603,79 @@ print(leaked)
       description: 'addl increments the refcount field in a tight loop; after wrapping, put_ref\'s cmpl sees refcount == 0 and movl zeroes the object (simulating free) — but use_dangling\'s addl still reads from the same stack offset where the attacker has sprayed 0xDEADBEEF, turning the premature free into code execution',
     },
   },
+  {
+    id: 'cow-race',
+    name: 'COPY-ON-WRITE RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Race between COW page-fault handler and madvise lets unprivileged user write to read-only memory mappings.',
+    explanation:
+      'Copy-on-write (COW) race conditions (CWE-362) exploit the kernel\'s memory-sharing optimization: when a ' +
+      'process forks, parent and child share the same physical pages marked read-only. A write triggers a page ' +
+      'fault, and the kernel creates a private copy before applying the write — but a concurrent madvise(MADV_DONTNEED) ' +
+      'call can discard the private copy in the window between its creation and the write, causing the write to land ' +
+      'on the original shared page. CVE-2016-5195 (Dirty COW, CVSS 7.8) is the most famous example: a race in ' +
+      'mm/gup.c\'s get_user_pages() allowed unprivileged users to overwrite any readable file — /etc/passwd, ' +
+      'setuid binaries, even kernel modules — on every Linux kernel from 2.6.22 (2007) through 4.8.3 (2016). ' +
+      'The exploit was actively used in the wild before disclosure and affected Android, embedded Linux, and ' +
+      'every major server distribution. CVE-2022-2590 extended the attack to transparent huge pages (THP), ' +
+      'bypassing the original fix by targeting PMD-level COW handling. ' +
+      'In the assembly, movl stores the original page data, then cow_break\'s movl copies it to a private slot; ' +
+      'madvise_discard\'s movl zeroes the private copy, and the subsequent cmpl in do_write sees write_target == 0 — ' +
+      'so the payload\'s movl writes directly to the original page\'s stack slot instead of the discarded private copy.',
+    code:
+`# CVE pattern: COW race — write hits original page instead of private copy
+class SharedPage:
+    def __init__(self, data, perms):
+        self.data = data
+        self.perms = perms
+        self.refcount = 2
+        self.cow_pending = 0
+
+    def request_write(self):
+        self.cow_pending = 1
+        self.refcount -= 1
+        return self.cow_pending
+
+class RaceThread:
+    def __init__(self, original):
+        self.original = original
+        self.private_copy = 0
+        self.write_target = 0
+        self.completed = 0
+
+    def cow_break(self, page):
+        self.private_copy = page.data
+        self.write_target = self.private_copy
+        return self.private_copy
+
+    def madvise_discard(self):
+        self.private_copy = 0
+        self.write_target = 0
+        return self.private_copy
+
+    def do_write(self, page, payload):
+        if self.write_target == 0:
+            page.data = payload
+        else:
+            self.write_target = payload
+        self.completed = 1
+        return page.data
+
+page = SharedPage(4196352, 444)
+racer = RaceThread(page.data)
+page.request_write()
+racer.cow_break(page)
+racer.madvise_discard()
+racer.do_write(page, 3735928559)
+leaked = page.data
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl copies the original page data into a private COW slot; madvise_discard\'s movl zeroes it; cmpl in do_write checks write_target == 0 and the branch falls through — the payload\'s movl writes directly to the original shared page\'s stack offset instead of the discarded private copy, achieving write access to read-only memory',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
