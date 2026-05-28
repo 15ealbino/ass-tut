@@ -1676,6 +1676,79 @@ print(leaked)
       description: 'movl copies the original page data into a private COW slot; madvise_discard\'s movl zeroes it; cmpl in do_write checks write_target == 0 and the branch falls through — the payload\'s movl writes directly to the original shared page\'s stack offset instead of the discarded private copy, achieving write access to read-only memory',
     },
   },
+  {
+    id: 'ebpf-verifier-bypass',
+    name: 'EBPF VERIFIER BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'eBPF verifier miscalculates register bounds, approving a program that performs out-of-bounds kernel read/write at runtime.',
+    explanation:
+      'eBPF verifier bypass (CWE-682 / CWE-787) exploits the semantic gap between the Linux kernel\'s eBPF ' +
+      'static verifier and actual runtime execution. The verifier performs abstract interpretation — tracking ' +
+      'each register\'s possible value range — to prove that a BPF program cannot access memory outside its ' +
+      'allocated maps. A bug in the verifier\'s ALU32 (32-bit arithmetic) bounds tracking lets an attacker craft ' +
+      'a register value that the verifier believes is bounded (e.g. 0..2) but at runtime takes a much larger value, ' +
+      'bypassing the map bounds check entirely. The attacker uses the mis-bounded register as an array index ' +
+      'to read or write kernel memory far outside the BPF map — leaking KASLR base pointers, overwriting ' +
+      'task_struct credentials (uid=0), or corrupting function pointers for code execution. ' +
+      'CVE-2021-3490 (Linux eBPF ALU32, CVSS 7.8) miscalculated 32-bit bounds during bitwise operations, giving ' +
+      'an unprivileged user arbitrary kernel read/write and root on all kernels 5.7 through 5.11. CVE-2020-27194 ' +
+      'allowed scalar bounds bypass via OR operations, also yielding arbitrary kernel read/write. CVE-2021-31440 ' +
+      'exploited incorrect 32-bit register bounds to escape Kubernetes containers via eBPF. CVE-2026-43009 ' +
+      '(CVSS 7.8, disclosed May 2026) extended the class to kernels 5.12 through 6.19.11, affecting WSL2 and ' +
+      'container workloads worldwide. A 2024 NCC Group audit of the eBPF verifier found a critical lack of ' +
+      'defensive bounds checking within the main verifier code itself. ' +
+      'In the assembly, `cmpl` in check_reg compares the verifier\'s tracked_max against the map capacity — ' +
+      'the verifier approves because tracked_max < capacity. But `imull` in read_slot multiplies the actual ' +
+      'runtime index (99) by 8, computing an offset far beyond the map boundary; `addl` adds this to cred_ptr, ' +
+      'reading kernel memory at an arbitrary offset. No bounds re-check appears before the `movl` that writes ' +
+      'uid=0, escalating the attacker to root.',
+    code:
+`# CVE pattern: eBPF verifier ALU32 bounds gap — kernel OOB to root
+class BPFMap:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slot0 = 100
+        self.slot1 = 200
+        self.slot2 = 300
+        self.cred_ptr = 4196352
+        self.uid = 1000
+
+    def read_slot(self, index):
+        offset = index * 8
+        result = self.cred_ptr + offset
+        return result
+
+    def overwrite_uid(self, new_uid):
+        self.uid = new_uid
+        return self.uid
+
+class Verifier:
+    def __init__(self, alu_width):
+        self.alu_width = alu_width
+        self.tracked_max = 0
+        self.approved = 0
+
+    def check_reg(self, reg_val, limit):
+        self.tracked_max = reg_val
+        if self.tracked_max < limit:
+            self.approved = 1
+        return self.approved
+
+bpf_map = BPFMap(3)
+verifier = Verifier(32)
+verifier.check_reg(2, bpf_map.capacity)
+oob_index = 99
+leaked = bpf_map.read_slot(oob_index)
+bpf_map.overwrite_uid(0)
+result = bpf_map.uid + leaked
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'imull', 'movl'],
+      description: 'cmpl in check_reg compares tracked_max against map capacity — the verifier approves because 2 < 3. But imull in read_slot multiplies the runtime index (99) by 8, computing an offset 792 bytes past the map boundary; addl adds this to cred_ptr for an OOB kernel read — then movl writes uid=0 with no re-check, escalating to root',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
