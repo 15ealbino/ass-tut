@@ -1749,6 +1749,96 @@ print(result)
       description: 'cmpl in check_reg compares tracked_max against map capacity — the verifier approves because 2 < 3. But imull in read_slot multiplies the runtime index (99) by 8, computing an offset 792 bytes past the map boundary; addl adds this to cred_ptr for an OOB kernel read — then movl writes uid=0 with no re-check, escalating to root',
     },
   },
+  {
+    id: 'cross-cache-slab',
+    name: 'CROSS-CACHE SLAB ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Freed slab page reclaimed by a different kernel cache places attacker-controlled objects where the victim object lived, enabling cross-type corruption to root.',
+    explanation:
+      'Cross-cache slab attacks exploit the Linux kernel\'s SLUB allocator page-recycling mechanism: when every ' +
+      'object in a slab page is freed, the page returns to the buddy page allocator; a different slab cache can ' +
+      'then reclaim that same page for its own allocations. An attacker who holds a dangling pointer to the freed ' +
+      'victim object (from a UAF or double-free) waits for the page to be reclaimed by a security-critical cache — ' +
+      'typically the cred_jar cache that holds task credentials (uid, gid, capabilities). Writing through the ' +
+      'dangling pointer now overwrites the cred struct\'s uid/gid fields to zero, escalating to root. ' +
+      'The technique was formalized as SLUBStick at USENIX Security 2024 and generalized by CROSS-X at ACM CCS ' +
+      '2025, which demonstrated stable cross-cache exploitation even against CONFIG_RANDOM_KMALLOC_CACHES. ' +
+      'CVE-2024-50264 (Linux AF_VSOCK, Pwnie Award 2025 Best Privilege Escalation) used cross-cache reclamation ' +
+      'with BPF JIT spraying to bypass randomized slab caches and achieve root on hardened kernels. ' +
+      'CVE-2026-31429 (Linux slab cross-cache free) causes kernel memory corruption via allocator confusion. ' +
+      'At least nine additional CVEs — including CVE-2022-29582 (io_uring), CVE-2022-27666 (ESP/IPsec), ' +
+      'CVE-2022-32250 (netfilter), and CVE-2023-21400 — have been exploited using cross-cache techniques to ' +
+      'overwrite cred structs or page table entries for privilege escalation. Defenses include ' +
+      'CONFIG_RANDOM_KMALLOC_CACHES (routing allocations through 16 sub-caches per size class) and ' +
+      'CONFIG_SLAB_VIRTUAL (pinning each cache to a dedicated virtual address range), but both can be bypassed ' +
+      'with sufficient heap grooming or page-allocator-level spraying. ' +
+      'In the assembly, movl stores the victim object\'s handler and size into stack slots, then release() zeroes ' +
+      'them; drain_cache\'s addl frees all slab objects in a loop returning the page to the buddy allocator; ' +
+      'reclaim_for\'s addl allocates cred objects into the reclaimed page — the final movl writes uid=0 and ' +
+      'gid=0 through the overlapping stack offsets, escalating to root without any bounds check.',
+    code:
+`# CVE pattern: slab page reclaimed across caches — dangling ptr overwrites cred
+class VictimObj:
+    def __init__(self, handler, size):
+        self.handler = handler
+        self.size = size
+        self.freed = 0
+
+    def release(self):
+        self.handler = 0
+        self.size = 0
+        self.freed = 1
+        return self.freed
+
+class CredObj:
+    def __init__(self, uid, gid):
+        self.uid = uid
+        self.gid = gid
+        self.cap = 0
+
+    def read_priv(self):
+        result = self.uid + self.gid + self.cap
+        return result
+
+class SlabAllocator:
+    def __init__(self, page_count):
+        self.page_count = page_count
+        self.free_pages = 0
+        self.reclaimed = 0
+
+    def drain_cache(self, count):
+        i = 0
+        while i < count:
+            self.free_pages += 1
+            i += 1
+        return self.free_pages
+
+    def reclaim_for(self, count):
+        i = 0
+        while i < count:
+            self.reclaimed += 1
+            self.free_pages -= 1
+            i += 1
+        return self.reclaimed
+
+victim = VictimObj(4196352, 192)
+victim.release()
+alloc = SlabAllocator(64)
+alloc.drain_cache(16)
+alloc.reclaim_for(16)
+cred = CredObj(1000, 1000)
+cred.uid = 0
+cred.gid = 0
+cred.cap = 4294967295
+leaked = cred.read_priv()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the victim handler and size into stack slots, then zeroes them on release; drain_cache\'s addl frees all slab objects in a loop returning the page to the buddy allocator; reclaim_for\'s addl allocates cred objects into the reclaimed page — the final movl writes uid=0 and gid=0 into the overlapping stack offsets, escalating to root via cross-cache type confusion',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
