@@ -1839,6 +1839,75 @@ print(leaked)
       description: 'movl stores the victim handler and size into stack slots, then zeroes them on release; drain_cache\'s addl frees all slab objects in a loop returning the page to the buddy allocator; reclaim_for\'s addl allocates cred objects into the reclaimed page — the final movl writes uid=0 and gid=0 into the overlapping stack offsets, escalating to root via cross-cache type confusion',
     },
   },
+  {
+    id: 'rowhammer',
+    name: 'ROWHAMMER BIT-FLIP',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Repeated DRAM row activation induces electrical bit flips in adjacent rows, corrupting page table entries to grant kernel memory access.',
+    explanation:
+      'Rowhammer (CWE-1256) is a hardware vulnerability in DRAM: rapidly activating (hammering) the same memory row ' +
+      'drains charge from cells in adjacent rows, causing bits to flip. The attacker uses the clflush instruction to ' +
+      'bypass CPU caches and directly hammer aggressor rows flanking a victim row that contains page table entries. ' +
+      'A single bit flip in a PTE changes the physical page it maps, redirecting virtual memory access to a page ' +
+      'containing the attacker\'s own page table — granting read-write access to all physical memory. ' +
+      'Google Project Zero demonstrated kernel privilege escalation on x86-64 Linux in 2015 (CVE-2015-0565 for NaCl). ' +
+      'CVE-2025-6202 (Phoenix, CVSS 7.1) bypasses DDR5 protections — on-die ECC, Target Row Refresh (TRR), and ' +
+      'Per-Row Activation Counting (PRAC) — achieving root in 109 seconds on production SK Hynix DDR5 systems. ' +
+      'ETH Zurich researchers flipped bits on all 15 DDR5 chips tested (manufactured 2021-2024), demonstrating that ' +
+      'no shipping DRAM generation is immune. TRRespass (2020) bypassed TRR on DDR4; Blacksmith (2021) used ' +
+      'non-uniform access patterns to defeat improved TRR. The technique has been demonstrated for VM escape, ' +
+      'SSH key extraction, and GPU memory corruption (NVIDIA A6000, disclosed January 2025). ' +
+      'In the assembly, the hammer loop\'s addl increments access_count 128 times per aggressor row without any ' +
+      'memory fence or cache line management — cmpl checks the combined count against the flip threshold, and ' +
+      'movl overwrites phys_page with the corrupted address, simulating the PTE bit flip that redirects ' +
+      'virtual memory to attacker-controlled physical pages.',
+    code:
+`# CVE pattern: DRAM row hammering flips PTE bit — kernel memory access
+class DRAMRow:
+    def __init__(self, addr, data):
+        self.addr = addr
+        self.data = data
+        self.access_count = 0
+
+    def flush_and_read(self):
+        self.access_count += 1
+        return self.data
+
+class VictimPTE:
+    def __init__(self, phys_page, flags):
+        self.phys_page = phys_page
+        self.flags = flags
+        self.bit_flipped = 0
+
+    def apply_bitflip(self, hammer_count):
+        if hammer_count > 100:
+            self.phys_page = self.phys_page + 4096
+            self.bit_flipped = 1
+        return self.bit_flipped
+
+    def resolve(self):
+        result = self.phys_page + self.flags
+        return result
+
+aggressor_a = DRAMRow(4096, 2425393296)
+aggressor_b = DRAMRow(12288, 2425393296)
+victim = VictimPTE(1048576, 7)
+i = 0
+while i < 128:
+    aggressor_a.flush_and_read()
+    aggressor_b.flush_and_read()
+    i += 1
+total = aggressor_a.access_count + aggressor_b.access_count
+victim.apply_bitflip(total)
+leaked = victim.resolve()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl', 'movl'],
+      description: 'addl increments access_count in the hammer loop 128 times per aggressor row with no cache fence; cmpl checks the combined count against the flip threshold — movl then overwrites phys_page with the corrupted PTE value, redirecting virtual memory to a physical page the attacker controls for kernel read-write access',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
