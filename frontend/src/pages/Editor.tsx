@@ -1908,6 +1908,78 @@ print(leaked)
       description: 'addl increments access_count in the hammer loop 128 times per aggressor row with no cache fence; cmpl checks the combined count against the flip threshold — movl then overwrites phys_page with the corrupted PTE value, redirecting virtual memory to a physical page the attacker controls for kernel read-write access',
     },
   },
+  {
+    id: 'dirty-pipe',
+    name: 'DIRTY PIPE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Uninitialized pipe buffer flag lets data written to a pipe merge into a read-only file\'s page cache, enabling arbitrary file overwrite and privilege escalation.',
+    explanation:
+      'Dirty Pipe (CVE-2022-0847 / CWE-281, CVSS 7.8) exploits an uninitialized flags field in Linux pipe buffer ' +
+      'structures. When a pipe is filled and drained, the PIPE_BUF_FLAG_CAN_MERGE flag is set to 1 so that ' +
+      'consecutive small writes can merge into the same buffer page. The bug: when splice() transfers a read-only ' +
+      'file\'s page cache entry into the pipe, the flags field retains its stale CAN_MERGE value instead of being ' +
+      'reset to zero. A subsequent write() to the pipe sees CAN_MERGE still set and appends data directly into the ' +
+      'cached page — bypassing all permission checks, read-only mount flags, and file immutability attributes. The ' +
+      'attacker overwrites /etc/passwd (replacing root\'s password hash), setuid binaries, or kernel modules to ' +
+      'escalate from unprivileged user to root. Discovered by Max Kellermann in March 2022, the root cause was a ' +
+      'missing flags initialization introduced in Linux 5.8 via the anonymous pipe-buffer merging feature — the ' +
+      'new code path in copy_page_to_iter_pipe and push_pipe never cleared the flags member of spliced page references. ' +
+      'The flaw existed in every Linux kernel from 5.8 through 5.16.10 and was immediately exploited in the wild, ' +
+      'including on Android devices. Named after CVE-2016-5195 (Dirty COW), Dirty Pipe achieves the same effect — ' +
+      'writing to read-only files — through pipe buffer semantics rather than COW page-fault races. ' +
+      'In the assembly, movl sets the flags field to 1 (CAN_MERGE) during fill_and_drain but no subsequent movl ' +
+      'resets it before splice_page loads the page reference; pipe_write\'s cmpl checks flags == 1 and the branch ' +
+      'allows movl to overwrite page_ref with the attacker\'s payload, silently corrupting the cached page.',
+    code:
+`# CVE pattern: uninitialized pipe flag lets write merge into read-only page
+class PipeBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.data = 0
+        self.flags = 0
+        self.page_ref = 0
+
+    def fill_and_drain(self, value):
+        self.data = value
+        self.flags = 1
+        self.data = 0
+        return self.flags
+
+    def splice_page(self, page_data):
+        self.page_ref = page_data
+        return self.page_ref
+
+    def pipe_write(self, payload):
+        if self.flags == 1:
+            self.page_ref = payload
+        return self.page_ref
+
+class CachedPage:
+    def __init__(self, inode, data):
+        self.inode = inode
+        self.data = data
+        self.readonly = 1
+        self.dirty = 0
+
+    def read(self):
+        result = self.data + self.inode
+        return result
+
+page = CachedPage(4196352, 1094795585)
+pipe = PipeBuffer(4096)
+pipe.fill_and_drain(2425393296)
+pipe.splice_page(page.data)
+page.data = pipe.pipe_write(3735928559)
+page.dirty = 0
+leaked = page.read()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl sets the flags field to 1 (CAN_MERGE) during fill_and_drain but no movl resets it before splice_page; cmpl in pipe_write checks flags == 1 and the branch allows movl to overwrite page_ref with the attacker\'s payload (0xDEADBEEF) — the read-only page cache is silently corrupted without any permission check or dirty-page writeback',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
