@@ -1980,6 +1980,77 @@ print(leaked)
       description: 'movl sets the flags field to 1 (CAN_MERGE) during fill_and_drain but no movl resets it before splice_page; cmpl in pipe_write checks flags == 1 and the branch allows movl to overwrite page_ref with the attacker\'s payload (0xDEADBEEF) — the read-only page cache is silently corrupted without any permission check or dirty-page writeback',
     },
   },
+  {
+    id: 'data-only-attack',
+    name: 'DATA-ONLY ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker corrupts non-control data — credentials, permission flags, security tokens — without altering control flow, bypassing CFI and shadow stacks entirely.',
+    explanation:
+      'Data-only attacks (CWE-284 adjacent / Data-Oriented Programming) corrupt non-control-flow variables — ' +
+      'permission levels, user IDs, authentication flags, configuration pointers — rather than function pointers ' +
+      'or return addresses. Because the program\'s control flow remains completely intact, all CFI defenses ' +
+      '(shadow stacks, Intel CET, ARM BTI/PAC) are entirely bypassed: the program executes its own legitimate ' +
+      'code paths but with attacker-corrupted data driving security-critical decisions. ' +
+      'CVE-2024-21338 (Windows AppLocker appid.sys, exploited by Lazarus Group) is a textbook data-only attack: ' +
+      'the exploit corrupted the current thread\'s PreviousMode field via an IOCTL vulnerability, granting a ' +
+      'user-mode thread the ability to read and write arbitrary kernel memory through legitimate ' +
+      'Nt(Read|Write)VirtualMemory syscalls — no code injection or control-flow hijack required. Lazarus used ' +
+      'this primitive to deploy the FudModule rootkit via Direct Kernel Object Manipulation (DKOM), disabling ' +
+      'CrowdStrike Falcon, Microsoft Defender, and other security products by zeroing their kernel callback ' +
+      'registrations. Data-Oriented Programming, formalized at IEEE S&P 2016, demonstrated that chaining ' +
+      'non-control-data corruptions through loop dispatchers creates a Turing-complete attack language — ' +
+      'researchers identified 7518 data-oriented gadgets across 9 real-world programs. CVE-2024-50264 (Linux ' +
+      'AF_VSOCK, Pwnie Award 2025 Best Privilege Escalation) used data-only techniques to overwrite cred_struct ' +
+      'uid/gid fields to zero without any control-flow hijack. ' +
+      'In the assembly, movl corrupts the uid, gid, and is_admin fields at their stack offsets without touching ' +
+      'any function pointer or return address; cmpl in check_access reads the corrupted is_admin value and the ' +
+      'legitimate branch grants access — the control flow is valid per CFI, but the data is attacker-controlled.',
+    code:
+`# CVE pattern: non-control data corruption bypasses CFI — data-only to root
+class Credentials:
+    def __init__(self, uid, gid, is_admin):
+        self.uid = uid
+        self.gid = gid
+        self.is_admin = is_admin
+        self.token = uid * 31 + gid
+
+    def check_access(self, required):
+        if self.is_admin == 1:
+            result = 1
+        elif self.uid < required:
+            result = 0
+        else:
+            result = 0
+        return result
+
+class KernelThread:
+    def __init__(self, prev_mode, cred):
+        self.prev_mode = prev_mode
+        self.cred_uid = cred
+        self.escalated = 0
+
+    def corrupt_data(self, new_uid, new_admin):
+        self.cred_uid = new_uid
+        self.escalated = new_admin
+        return self.escalated
+
+cred = Credentials(1000, 1000, 0)
+thread = KernelThread(1, cred.uid)
+access_before = cred.check_access(0)
+cred.uid = 0
+cred.gid = 0
+cred.is_admin = 1
+thread.corrupt_data(0, 1)
+access_after = cred.check_access(0)
+result = access_after + thread.escalated
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl corrupts the uid, gid, and is_admin fields at their stack offsets without touching any function pointer or return address; cmpl in check_access reads the corrupted is_admin value and the legitimate branch grants access — the control flow is completely valid per CFI verification, but the data driving the security decision is attacker-controlled',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
