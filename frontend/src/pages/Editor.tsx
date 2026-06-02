@@ -2051,6 +2051,83 @@ print(result)
       description: 'movl corrupts the uid, gid, and is_admin fields at their stack offsets without touching any function pointer or return address; cmpl in check_access reads the corrupted is_admin value and the legitimate branch grants access — the control flow is completely valid per CFI verification, but the data driving the security decision is attacker-controlled',
     },
   },
+  {
+    id: 'signal-handler-race',
+    name: 'SIGNAL HANDLER RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Async signal interrupts a non-reentrant function; the handler re-enters the same function, corrupting heap metadata for remote code execution.',
+    explanation:
+      'Signal handler race conditions (CWE-364 / CWE-479) occur when an asynchronous signal — such as SIGALRM — ' +
+      'fires while the main program is executing a non-reentrant function like malloc() or free(). If the signal ' +
+      'handler itself calls a function that internally uses the same allocator (e.g. syslog() which calls malloc()), the ' +
+      'heap allocator is re-entered in an inconsistent state: metadata pointers (fd/bk) are only partially updated, ' +
+      'and the second malloc() corrupts them, giving the attacker an arbitrary-write primitive or control of a ' +
+      'function pointer. CVE-2024-6387 (regreSSHion, CVSS 8.1) is the definitive example: OpenSSH\'s sshd fires ' +
+      'SIGALRM when a client fails to authenticate within LoginGraceTime (120 seconds). The handler calls syslog() — ' +
+      'which calls malloc() — while the main thread\'s public-key parser is mid-malloc. The heap metadata corruption ' +
+      'lets a remote unauthenticated attacker achieve RCE as root on glibc-based Linux systems. This is a regression ' +
+      'of CVE-2006-5051, the original 2006 OpenSSH signal handler race discovered by Mark Dowd, which was inadvertently ' +
+      'reintroduced in OpenSSH 8.5p1 (2020). Over 14 million sshd instances were exposed at disclosure. ' +
+      'In the assembly, malloc_begin\'s movl sets in_use=1 and writes fd_ptr; the signal handler\'s reenter_malloc ' +
+      'checks in_use via cmpl and overwrites bk_ptr with the attacker\'s payload while fd_ptr is still mid-update — ' +
+      'addl in read_metadata combines the partial fd_ptr with the corrupted bk_ptr, simulating the heap metadata ' +
+      'corruption that gives the attacker an arbitrary-write primitive.',
+    code:
+`# CVE pattern: SIGALRM interrupts malloc — handler re-enters heap allocator
+class HeapState:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.in_use = 0
+        self.fd_ptr = 0
+        self.bk_ptr = 0
+        self.corrupted = 0
+
+    def malloc_begin(self, size):
+        self.in_use = 1
+        self.fd_ptr = size * 8
+        return self.fd_ptr
+
+    def reenter_malloc(self, payload):
+        if self.in_use == 1:
+            self.bk_ptr = payload
+            self.corrupted = 1
+        return self.corrupted
+
+    def read_metadata(self):
+        result = self.fd_ptr + self.bk_ptr
+        return result
+
+class SshdServer:
+    def __init__(self, grace_time):
+        self.grace_time = grace_time
+        self.alarm_fired = 0
+        self.syslog_buf = 0
+        self.exploited = 0
+
+    def begin_auth(self, key_size):
+        self.syslog_buf = key_size * 4
+        return self.syslog_buf
+
+    def handle_sigalrm(self):
+        self.alarm_fired = 1
+        self.exploited = self.alarm_fired
+        return self.exploited
+
+heap = HeapState(4096)
+sshd = SshdServer(120)
+sshd.begin_auth(256)
+heap.malloc_begin(64)
+sshd.handle_sigalrm()
+heap.reenter_malloc(3735928559)
+corrupted = heap.read_metadata()
+print(corrupted)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'addl'],
+      description: 'movl sets in_use=1 and writes fd_ptr during malloc_begin while the allocation is incomplete; cmpl in reenter_malloc checks in_use==1 — the signal handler re-enters mid-allocation and movl overwrites bk_ptr with the attacker\'s payload (0xDEADBEEF); addl in read_metadata sums the partial fd_ptr with corrupted bk_ptr, simulating the heap metadata corruption from a non-reentrant malloc interrupted by SIGALRM',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
