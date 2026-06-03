@@ -2128,6 +2128,89 @@ print(corrupted)
       description: 'movl sets in_use=1 and writes fd_ptr during malloc_begin while the allocation is incomplete; cmpl in reenter_malloc checks in_use==1 — the signal handler re-enters mid-allocation and movl overwrites bk_ptr with the attacker\'s payload (0xDEADBEEF); addl in read_metadata sums the partial fd_ptr with corrupted bk_ptr, simulating the heap metadata corruption from a non-reentrant malloc interrupted by SIGALRM',
     },
   },
+  {
+    id: 'io-uring-page-uaf',
+    name: 'IO_URING PAGE UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Buffer ring mmap persists after unregister frees the pages, giving userspace read/write access to recycled kernel objects for data-only privilege escalation.',
+    explanation:
+      'io_uring page use-after-free (CWE-416) exploits a lifecycle mismatch in the Linux kernel\'s io_uring ' +
+      'async I/O subsystem: a user registers a provided buffer ring via IORING_REGISTER_PBUF_RING, maps it ' +
+      'into userspace with mmap(), then unregisters it — the kernel frees the underlying pages and returns them ' +
+      'to the page allocator, but the userspace VM_PFNMAP mapping is never torn down. The application retains ' +
+      'a valid virtual address pointing to freed physical pages that the kernel reallocates for other objects. ' +
+      'CVE-2024-0582 (Linux 6.4–6.7, discovered by Jann Horn of Google Project Zero) demonstrated this exact ' +
+      'primitive: once freed pages are reclaimed by the SLAB allocator for credential structures (struct cred), ' +
+      'the attacker reads the cred\'s uid/gid through the stale mapping, overwrites uid=0 and gid=0, and achieves ' +
+      'root — a pure data-only exploit requiring no ROP chain, bypassing CFI and stack canaries entirely. ' +
+      'CVE-2026-43494 (PinTheft) exploited a related page-pinning flaw where io_uring zerocopy and RDS failed ' +
+      'to reset op_nents, creating a reference-counting anomaly on pinned pages that led to the same freed-page ' +
+      'read/write primitive. CVE-2021-41073 (loop_rw_iter, IORING_OP_PROVIDE_BUFFERS) was an earlier variant. ' +
+      'Google banned io_uring in ChromeOS and Android (2023) after cataloging over 60% of Linux kernel exploits ' +
+      'targeting it. In the assembly, movl writes the registered buffer address into the ring slot; after unregister, ' +
+      'the same movl writes attacker data through the stale mapping into the freed page — addl in read_cred sums ' +
+      'the overwritten uid (0) with gid (0), confirming the data-only privilege escalation succeeded.',
+    code:
+`# CVE pattern: io_uring buffer ring mmap outlives free — page UAF to root
+class PageAllocator:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.page_data = 0
+        self.freed = 0
+        self.reused_by = 0
+
+    def alloc_page(self, data):
+        self.page_data = data
+        return self.page_data
+
+    def free_page(self):
+        self.freed = 1
+        return self.freed
+
+class BufferRing:
+    def __init__(self, ring_id):
+        self.ring_id = ring_id
+        self.mapped = 0
+        self.registered = 0
+
+    def register_and_mmap(self, page):
+        self.registered = 1
+        self.mapped = 1
+        return page.page_data
+
+    def unregister(self, page):
+        page.free_page()
+        self.registered = 0
+        return self.registered
+
+class CredStruct:
+    def __init__(self, uid, gid):
+        self.uid = uid
+        self.gid = gid
+        self.cap = 0
+
+    def read_cred(self):
+        result = self.uid + self.gid
+        return result
+
+page = PageAllocator(4096)
+page.alloc_page(305419896)
+ring = BufferRing(1)
+ring.register_and_mmap(page)
+ring.unregister(page)
+page.reused_by = 1
+cred = CredStruct(1000, 1000)
+cred.uid = 0
+cred.gid = 0
+escalated = cred.read_cred()
+print(escalated)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl writes the buffer ring data into the page slot during register_and_mmap; after unregister frees the page (movl sets freed=1), the stale mmap mapping persists — movl overwrites uid and gid to 0 through the dangling mapping; addl in read_cred sums uid + gid, confirming the data-only privilege escalation to root via the recycled page',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
