@@ -2211,6 +2211,73 @@ print(escalated)
       description: 'movl writes the buffer ring data into the page slot during register_and_mmap; after unregister frees the page (movl sets freed=1), the stale mmap mapping persists — movl overwrites uid and gid to 0 through the dangling mapping; addl in read_cred sums uid + gid, confirming the data-only privilege escalation to root via the recycled page',
     },
   },
+  {
+    id: 'dirty-frag',
+    name: 'DIRTY FRAG',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'ESP in-place decryption overwrites spliced page-cache fragments, letting an unprivileged user corrupt any readable file for deterministic privilege escalation.',
+    explanation:
+      'Dirty Frag (CVE-2026-43284 / CVE-2026-43500, CVSS 8.8) exploits a logic flaw in the Linux kernel\'s IPsec ' +
+      'ESP receive fast path: when an sk_buff carries paged fragments not privately owned by the kernel — page-cache ' +
+      'pages planted via splice(2) and vmsplice(2) — the ESP decryption path writes directly over those externally-backed ' +
+      'pages without verifying fragment ownership, silently corrupting the file\'s in-memory representation. ' +
+      'The exploit opens a pipe, uses vmsplice() to attach a page from /usr/bin/su\'s page cache, configures an XFRM ' +
+      'Security Association with an attacker-chosen cipher and key, then splices the pipe into a UDP socket with ESP ' +
+      'encapsulation and sends a crafted datagram to loopback. The kernel decrypts in-place, depositing a 192-byte ' +
+      'x86_64 root-shell stub directly into su\'s cached pages — running su then spawns a root shell. Introduced in ' +
+      'January 2017 by commit cac2661c53f3, the flaw affected every major Linux distribution for nine years. ' +
+      'CVE-2026-43500 covers a parallel flaw where rxkad_verify_packet_1() performs in-place fcrypt decryption into ' +
+      'the page cache. Unlike Dirty Pipe (CVE-2022-0847) which relied on a pipe-buffer flag race, Dirty Frag is a ' +
+      'deterministic logic flaw with near-100% success rate and no kernel panic risk — Microsoft observed active ' +
+      'exploitation in May 2026. ' +
+      'In the assembly, movl stores the original file data into the CachedFile stack slot; splice_attach\'s movl copies ' +
+      'the reference into frag_data without setting frag_owned — esp_decrypt\'s cmpl checks frag_owned == 0 and movl ' +
+      'overwrites page.data with the attacker\'s ciphertext payload (0xDEADBEEF), corrupting the read-only page cache ' +
+      'without any COW trigger or permission check.',
+    code:
+`# CVE pattern: ESP decrypts in-place over spliced page-cache frag — root
+class CachedFile:
+    def __init__(self, data, perms):
+        self.data = data
+        self.perms = perms
+        self.dirty = 0
+
+    def read(self):
+        result = self.data + self.perms
+        return result
+
+class SkBuff:
+    def __init__(self, size):
+        self.size = size
+        self.frag_data = 0
+        self.frag_owned = 0
+        self.ready = 0
+
+    def splice_attach(self, page):
+        self.frag_data = page.data
+        self.frag_owned = 0
+        self.ready = 1
+        return self.frag_data
+
+    def esp_decrypt(self, page, ciphertext):
+        if self.frag_owned == 0:
+            page.data = ciphertext
+        return page.data
+
+su = CachedFile(4196352, 755)
+skb = SkBuff(1500)
+skb.splice_attach(su)
+payload = 3735928559
+skb.esp_decrypt(su, payload)
+hijacked = su.read()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl stores the original file data into the CachedFile stack slot; splice_attach\'s movl copies the page reference into frag_data without setting frag_owned — esp_decrypt\'s cmpl checks frag_owned == 0 and the branch allows movl to overwrite page.data with the attacker\'s ESP ciphertext payload (0xDEADBEEF), corrupting the read-only page cache without any COW or permission check',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
