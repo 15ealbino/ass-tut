@@ -2278,6 +2278,91 @@ print(hijacked)
       description: 'movl stores the original file data into the CachedFile stack slot; splice_attach\'s movl copies the page reference into frag_data without setting frag_owned — esp_decrypt\'s cmpl checks frag_owned == 0 and the branch allows movl to overwrite page.data with the attacker\'s ESP ciphertext payload (0xDEADBEEF), corrupting the read-only page cache without any COW or permission check',
     },
   },
+  {
+    id: 'ghostrace-src',
+    name: 'GHOSTRACE SPECULATIVE RACE',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'CPU speculatively bypasses synchronization primitives, causing speculative concurrent use-after-free (SCUAF) that leaks freed kernel data via cache side-channel.',
+    explanation:
+      'GhostRace / Speculative Race Conditions (CVE-2024-2193, USENIX Security 2024) exploits the fact that ' +
+      'all common synchronization primitives — spinlocks, mutexes, rwlocks, seqlocks, RCU — are ultimately ' +
+      'implemented via conditional branches. When the CPU mispredicts the branch guarding a lock\'s spin-wait ' +
+      'loop, it speculatively executes the critical section as if the lock were free, even while another thread ' +
+      'holds it. If the lock-holder frees an object inside the critical section, the speculatively-executing ' +
+      'thread performs a Speculative Concurrent Use-After-Free (SCUAF): it reads the freed memory (now ' +
+      'containing attacker-sprayed data), uses the value to index a probe array, and leaves a cache-timing ' +
+      'side-channel trace that persists after speculative rollback. VU Amsterdam and IBM Research found 1,283 ' +
+      'exploitable SCUAF gadgets in the Linux kernel and demonstrated a 12 KB/s leak rate. GhostRace affects ' +
+      'all major architectures — Intel, AMD, ARM, IBM — since every ISA implements synchronization via ' +
+      'conditional branches subject to branch misprediction. Unlike Spectre v1 (bounds check bypass), ' +
+      'GhostRace bypasses synchronization, not array bounds, combining speculative execution with race ' +
+      'conditions in a novel way. The proposed mitigation — serializing instructions (LFENCE) inside every ' +
+      'lock primitive — was rejected by Linux kernel developers due to approximately 5% geomean performance ' +
+      'overhead, leaving the attack surface open. CVE-2024-26602 covers the Xen hypervisor\'s exposure to ' +
+      'the same class. ' +
+      'In the assembly, `cmpl` checks the lock\'s held field but the branch predictor, trained by five unlocked ' +
+      'iterations, speculates "not held" even after acquire; `movl` loads the sprayed value (0xDEADBEEF) from ' +
+      'the freed object during the speculative window; `imull` multiplies it by 256 to compute the cache probe ' +
+      'index — no LFENCE serializing instruction appears between the lock check and the data load.',
+    code:
+`# CVE pattern: CPU speculates past spinlock — SCUAF leaks freed data
+class SharedBuf:
+    def __init__(self, secret, canary):
+        self.secret = secret
+        self.canary = canary
+        self.freed = 0
+
+class SpinLock:
+    def __init__(self):
+        self.held = 0
+
+    def acquire(self):
+        self.held = 1
+        return self.held
+
+    def release(self):
+        self.held = 0
+        return self.held
+
+class SpecThread:
+    def __init__(self, probe_sz):
+        self.probe_sz = probe_sz
+        self.result = 0
+        self.leaked = 0
+
+    def guarded_read(self, lock, buf):
+        if lock.held == 0:
+            value = buf.secret + buf.canary
+        else:
+            value = buf.secret
+        self.result = value * 256
+        return self.result
+
+    def flush_reload(self):
+        self.leaked = self.result + self.probe_sz
+        return self.leaked
+
+buf = SharedBuf(3405691582, 305419896)
+lock = SpinLock()
+spec = SpecThread(256)
+i = 0
+while i < 5:
+    spec.guarded_read(lock, buf)
+    i += 1
+buf.freed = 1
+buf.secret = 3735928559
+buf.canary = 3735928559
+lock.acquire()
+leaked = spec.guarded_read(lock, buf)
+timing = spec.flush_reload()
+print(timing)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'imull'],
+      description: 'cmpl checks the spinlock\'s held field but the branch predictor, trained by five unlocked iterations, speculates "not held" even after acquire(); movl loads the sprayed freed value (0xDEADBEEF) from the same stack offset during the speculative window; imull multiplies it by 256 to compute the cache probe line index — no LFENCE serializing instruction appears between the lock check and the data load, leaving the SCUAF speculative window wide open',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
