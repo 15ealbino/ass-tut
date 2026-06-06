@@ -2363,6 +2363,69 @@ print(timing)
       description: 'cmpl checks the spinlock\'s held field but the branch predictor, trained by five unlocked iterations, speculates "not held" even after acquire(); movl loads the sprayed freed value (0xDEADBEEF) from the same stack offset during the speculative window; imull multiplies it by 256 to compute the cache probe line index — no LFENCE serializing instruction appears between the lock check and the data load, leaving the SCUAF speculative window wide open',
     },
   },
+  {
+    id: 'sql-injection',
+    name: 'SQL INJECTION',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'Unsanitized user input concatenated into a SQL query lets an attacker execute arbitrary database commands, exfiltrate data, or escalate to OS-level code execution.',
+    explanation:
+      'SQL injection (CWE-89) occurs when user-supplied input is concatenated directly into a SQL query ' +
+      'string without parameterization or escaping. The attacker terminates the intended query with a quote ' +
+      'and semicolon, then appends arbitrary SQL — SELECT to exfiltrate data, UNION to combine results from ' +
+      'other tables, UPDATE/DELETE to modify or destroy records, or stacked queries to execute OS commands ' +
+      'via xp_cmdshell or INTO OUTFILE. ' +
+      'CVE-2023-34362 (MOVEit Transfer, CVSS 9.8) was mass-exploited by the Cl0p ransomware gang in May 2023: ' +
+      'a SQL injection in the file-transfer web interface allowed unauthenticated attackers to install the ' +
+      'LEMURLOOT web shell, exfiltrating data from over 2,500 organizations including the BBC, British Airways, ' +
+      'and US government agencies — the largest single-vulnerability breach campaign in history. ' +
+      'CVE-2024-22120 (Zabbix Server, CVSS 9.1) allowed time-based blind SQL injection via the audit log\'s ' +
+      'unsanitized clientip field, escalating to remote code execution on the monitoring server. SQLi has ranked ' +
+      'in the CWE Top 25 every year since the list\'s creation; CISA issued a "Secure by Design" alert in 2024 ' +
+      'urging elimination of SQL injection at the language level via parameterized queries. ' +
+      'In the assembly, movl loads the attacker-supplied payload value into a stack slot; addl concatenates it ' +
+      'directly with the base query value — no intervening sanitization (cmpl/je guard) appears between the ' +
+      'user input load and the query execution call, letting the injected payload pass through intact.',
+    code:
+`# CVE pattern: user input concatenated into SQL query — full DB access
+class QueryBuilder:
+    def __init__(self, base_query):
+        self.base_query = base_query
+        self.param_count = 0
+        self.executed = 0
+
+    def add_param(self, user_input):
+        self.base_query += user_input
+        self.param_count += 1
+        return self.base_query
+
+    def execute(self):
+        result = self.base_query
+        self.executed = 1
+        return result
+
+class Database:
+    def __init__(self, secret_table):
+        self.secret_table = secret_table
+        self.rows_leaked = 0
+
+    def run_query(self, query_val):
+        self.rows_leaked = query_val + self.secret_table
+        return self.rows_leaked
+
+qb = QueryBuilder(1000)
+malicious_input = 1094795585
+qb.add_param(malicious_input)
+query = qb.execute()
+db = Database(3735928559)
+leaked = db.run_query(query)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'movl'],
+      description: 'addl concatenates the attacker-supplied payload (0x41414141) directly into the base_query value with no sanitization; movl loads the combined query into the argument slot for execute — no bounds check or character filter (cmpl guard) appears between the user input load and the query dispatch, letting injected SQL commands reach the database engine intact',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
