@@ -2426,6 +2426,77 @@ print(leaked)
       description: 'addl concatenates the attacker-supplied payload (0x41414141) directly into the base_query value with no sanitization; movl loads the combined query into the argument slot for execute — no bounds check or character filter (cmpl guard) appears between the user input load and the query dispatch, letting injected SQL commands reach the database engine intact',
     },
   },
+  {
+    id: 'path-traversal',
+    name: 'PATH TRAVERSAL',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'User-controlled path sequences escape the restricted directory, exposing arbitrary files on the filesystem.',
+    explanation:
+      'Path traversal (CWE-22) occurs when user-supplied input containing directory traversal sequences — such ' +
+      'as ../ or encoded variants (%2e%2e%2f) — is concatenated into a file-path construction without validation. ' +
+      'The resolved path escapes the application\'s intended directory root and reaches arbitrary files on the ' +
+      'filesystem: /etc/shadow, private keys, application secrets, and database credentials. ' +
+      'CWE-22 ranked third in CISA\'s Known Exploited Vulnerabilities catalog in 2025 with 13 entries, prompting ' +
+      'CISA to issue a dedicated "Secure by Design" alert urging elimination of the entire bug class. ' +
+      'CVE-2024-23897 (Jenkins CLI, CVSS 9.8) used @ argument expansion to read arbitrary files from the ' +
+      'controller — secrets, SSH keys, and build credentials were exfiltrated from thousands of Jenkins servers ' +
+      'within hours of disclosure. CVE-2025-64446 (Fortinet FortiWeb, CVSS 9.8) exploited relative path traversal ' +
+      'in pre-authentication request routing to execute privileged commands as administrator, achieving unauthenticated ' +
+      'RCE on enterprise web application firewalls. CVE-2025-9713 (Ivanti Endpoint Manager) bypassed file-path ' +
+      'validation during file-system operations to place or execute arbitrary files outside authorized locations. ' +
+      'In the assembly, `addl` combines the base_dir value with the user-supplied traversal offset without any ' +
+      'intervening `cmpl` guard — the result underflows past the directory root, and `movl` reads file content from the ' +
+      'unrestricted path directly into the response buffer.',
+    code:
+`# CVE pattern: ../ sequences escape base_dir — reads arbitrary files
+class FileServer:
+    def __init__(self, base_dir, depth):
+        self.base_dir = base_dir
+        self.depth = depth
+        self.served = 0
+        self.leaked = 0
+
+    def resolve_path(self, user_path):
+        resolved = self.base_dir + user_path
+        self.served += 1
+        return resolved
+
+    def read_file(self, resolved):
+        if resolved < self.base_dir:
+            self.leaked = resolved
+        else:
+            self.leaked = 0
+        return self.leaked
+
+class Attacker:
+    def __init__(self, target):
+        self.target = target
+        self.traversals = 0
+        self.payload = 0
+
+    def build_payload(self, levels):
+        offset = 0
+        i = 0
+        while i < levels:
+            offset -= 4096
+            self.traversals += 1
+            i += 1
+        self.payload = offset + self.target
+        return self.payload
+
+server = FileServer(1048576, 3)
+attacker = Attacker(3735928559)
+payload = attacker.build_payload(6)
+resolved = server.resolve_path(payload)
+leaked = server.read_file(resolved)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'movl'],
+      description: 'addl combines the base_dir value with the attacker-supplied traversal offset (negative from ../ sequences) without any bounds check; the resolved path underflows past the directory root — movl reads the leaked file content from the unrestricted path into the response, exposing /etc/shadow, private keys, and application secrets',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
