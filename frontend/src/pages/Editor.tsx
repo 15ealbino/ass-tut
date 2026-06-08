@@ -2497,6 +2497,79 @@ print(leaked)
       description: 'addl combines the base_dir value with the attacker-supplied traversal offset (negative from ../ sequences) without any bounds check; the resolved path underflows past the directory root — movl reads the leaked file content from the unrestricted path into the response, exposing /etc/shadow, private keys, and application secrets',
     },
   },
+  {
+    id: 'ssrf',
+    name: 'SERVER-SIDE REQUEST FORGERY',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'User-controlled URLs trick the server into making requests to internal services, leaking cloud credentials and enabling lateral movement.',
+    explanation:
+      'Server-Side Request Forgery (CWE-918) occurs when an application fetches a remote resource using a ' +
+      'user-supplied URL without validating the destination. The attacker points the URL at internal services — ' +
+      'most critically the cloud metadata endpoint at 169.254.169.254 — to steal IAM credentials, API keys, and ' +
+      'instance secrets. Once credentials are exfiltrated, the attacker pivots laterally across the cloud tenant. ' +
+      'CVE-2024-21893 (Ivanti Connect Secure SAML, CVSS 8.2) exploited SSRF in the SAML XML signature retrieval ' +
+      'method to bypass authentication and chain into CVE-2024-21887 for unauthenticated RCE on enterprise VPN ' +
+      'appliances — actively exploited by multiple APT groups in early 2024. CVE-2025-29972 (Azure Storage Resource ' +
+      'Provider) allowed SSRF against internal Azure infrastructure, enabling attackers to retrieve managed identity ' +
+      'tokens and access cross-tenant resources. SonicWall reported a 452% increase in SSRF attacks from 2023 to ' +
+      '2024, driven by AI-powered URL fuzzing tools. SSRF ranked in the OWASP Top 10 (A10:2021) and CISA issued ' +
+      'advisories urging allowlist-only URL validation. In the assembly, movl loads the attacker-controlled metadata ' +
+      'address (0xA9FEA9FE = 169.254.169.254) into the request target register; addl appends the credential path ' +
+      'offset — no cmpl guard validates the destination before the fetch is dispatched, and the response value is ' +
+      'stored directly into attacker-readable memory.',
+    code:
+`# CVE pattern: user-controlled URL fetches internal metadata — leaks IAM creds
+class HttpClient:
+    def __init__(self, allow_internal):
+        self.allow_internal = allow_internal
+        self.requests_made = 0
+        self.last_response = 0
+
+    def fetch(self, url):
+        self.requests_made += 1
+        self.last_response = url
+        return self.last_response
+
+class MetadataService:
+    def __init__(self):
+        self.base_addr = 2852039166
+        self.iam_path = 4096
+        self.secret_token = 3735928559
+
+    def handle_request(self, requested_addr):
+        if requested_addr == self.base_addr + self.iam_path:
+            return self.secret_token
+        return 0
+
+class Attacker:
+    def __init__(self):
+        self.target = 2852039166
+        self.cred_offset = 4096
+        self.stolen_creds = 0
+
+    def build_ssrf_url(self):
+        payload = self.target + self.cred_offset
+        return payload
+
+    def exfiltrate(self, response):
+        self.stolen_creds = response
+        return self.stolen_creds
+
+client = HttpClient(0)
+metadata = MetadataService()
+attacker = Attacker()
+ssrf_url = attacker.build_ssrf_url()
+response = client.fetch(ssrf_url)
+token = metadata.handle_request(response)
+stolen = attacker.exfiltrate(token)
+print(stolen)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads the attacker-controlled metadata address (0xA9FEA9FE = 169.254.169.254) into the request target; addl appends the IAM credential path offset without any destination validation — no cmpl guard checks whether the target is internal before dispatching the fetch, letting the cloud metadata response (secret_token) flow directly into attacker-readable memory via movl',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
