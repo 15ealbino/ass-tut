@@ -2570,6 +2570,70 @@ print(stolen)
       description: 'movl loads the attacker-controlled metadata address (0xA9FEA9FE = 169.254.169.254) into the request target; addl appends the IAM credential path offset without any destination validation — no cmpl guard checks whether the target is internal before dispatching the fetch, letting the cloud metadata response (secret_token) flow directly into attacker-readable memory via movl',
     },
   },
+  {
+    id: 'insecure-deser',
+    name: 'INSECURE DESERIALIZATION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Untrusted serialized object is deserialized without validation, letting an attacker inject a crafted payload that triggers arbitrary code execution.',
+    explanation:
+      'Insecure deserialization (CWE-502) occurs when an application reconstructs objects from untrusted serialized ' +
+      'data — Java ObjectInputStream, PHP unserialize(), Python pickle, .NET BinaryFormatter — without validating the ' +
+      'type or contents. An attacker crafts a serialized object with a malicious type tag and payload: upon ' +
+      'deserialization, the runtime invokes the object\'s constructor, __reduce__, readObject(), or __wakeup() method, ' +
+      'which executes attacker-controlled code. No authentication or special privileges are required — the serialized ' +
+      'stream itself IS the exploit. ' +
+      'CVE-2025-59287 (Microsoft WSUS, CVSS 9.8) exploited unsafe deserialization in WSUS reporting web services: ' +
+      'a remote unauthenticated attacker sent crafted serialized requests to execute arbitrary code as SYSTEM on ' +
+      'Windows Server — actively exploited within days of disclosure. CVE-2025-55182 (React Server Components, ' +
+      'CVSS 10.0) achieved pre-auth RCE via the React Flight protocol\'s deserialization of promise chains and ' +
+      'nested references, allowing file reads, process spawning, and arbitrary command execution across React, ' +
+      'Next.js, and Remix applications — Microsoft and Palo Alto Unit 42 issued emergency advisories. ' +
+      'CVE-2025-49113 (Roundcube Webmail, CVSS 9.9) turned PHP object deserialization into authenticated RCE. ' +
+      'In the assembly, `movl` loads the attacker-supplied type_tag (99, outside the expected range) and payload ' +
+      '(0xDEADBEEF) into stack slots; no `cmpl` type-whitelist guard rejects the unknown tag before `addl` passes ' +
+      'the raw payload to the execution path — the deserialized object\'s payload flows directly into the result ' +
+      'register as if it were trusted application data.',
+    code:
+`# CVE pattern: untrusted payload deserialized — attacker object triggers RCE
+class SerializedObj:
+    def __init__(self, type_tag, payload):
+        self.type_tag = type_tag
+        self.payload = payload
+        self.verified = 0
+
+    def get_payload(self):
+        result = self.payload
+        return result
+
+class Deserializer:
+    def __init__(self, max_types):
+        self.max_types = max_types
+        self.exec_count = 0
+        self.last_result = 0
+
+    def process(self, obj):
+        if obj.type_tag == 1:
+            self.last_result = obj.get_payload()
+        elif obj.type_tag == 2:
+            self.last_result = obj.get_payload() * 2
+        else:
+            self.last_result = obj.get_payload()
+        self.exec_count += 1
+        return self.last_result
+
+trusted = SerializedObj(1, 100)
+malicious = SerializedObj(99, 3735928559)
+deser = Deserializer(2)
+deser.process(trusted)
+hijacked = deser.process(malicious)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl loads the attacker-supplied type_tag (99) and payload (0xDEADBEEF) into stack slots; cmpl checks type_tag against known types (1, 2) but the else branch passes the payload through without rejection — no type-whitelist guard blocks the unknown tag, so the deserialized attacker payload flows directly into the result as executable data',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
