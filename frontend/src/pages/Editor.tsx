@@ -2634,6 +2634,92 @@ print(hijacked)
       description: 'movl loads the attacker-supplied type_tag (99) and payload (0xDEADBEEF) into stack slots; cmpl checks type_tag against known types (1, 2) but the else branch passes the payload through without rejection — no type-whitelist guard blocks the unknown tag, so the deserialized attacker payload flows directly into the result as executable data',
     },
   },
+  {
+    id: 'xxe-injection',
+    name: 'XXE INJECTION',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'XML parser resolves attacker-supplied external entity references, reading arbitrary files and enabling SSRF or remote code execution.',
+    explanation:
+      'XML External Entity injection (CWE-611) occurs when an XML parser processes input containing external entity ' +
+      'declarations — such as <!ENTITY xxe SYSTEM "file:///etc/shadow"> — without disabling DTD resolution. The parser ' +
+      'faithfully resolves the entity reference, reading arbitrary files from the server filesystem and embedding their ' +
+      'contents into the XML output. Beyond file disclosure, out-of-band (OOB) XXE sends exfiltrated data to an ' +
+      'attacker-controlled server via HTTP or DNS, bypassing firewalls that block inline responses. XXE can also escalate ' +
+      'to SSRF (reaching internal services like cloud metadata endpoints) or denial-of-service via recursive entity ' +
+      'expansion (the "Billion Laughs" attack). ' +
+      'CVE-2024-34102 (CosmicSting, CVSS 9.8) exploited XXE in Adobe Commerce and Magento\'s deserialization pipeline: ' +
+      'unauthenticated attackers extracted the secret encryption key from app/etc/env.php, gaining API write access to ' +
+      'inject payment skimmers — Sansec reported hacks at a rate of 3 to 5 stores per hour, with 5% of all Magento ' +
+      'stores compromised. CVE-2025-68493 (Apache Struts S2-069, CVSS 8.1) allowed XXE via the XWork XML configuration ' +
+      'parser, affecting all Struts versions from 2.0.0 through 6.1.0 — two affected version ranges are end-of-life ' +
+      'with no fix available. CVE-2025-66516 (Apache Tika) enabled XXE through embedded XFA content in PDF files, ' +
+      'exposing over 500 internet-facing instances to file read, SSRF, and RCE. OWASP ranks XXE as A05:2021 ' +
+      '(Security Misconfiguration). ' +
+      'In the assembly, `movl` loads the attacker-crafted entity target (the shadow file reference) into a stack ' +
+      'slot; `addl` in parse_entity increments entity_count with no DTD-resolution restriction — expand_output\'s ' +
+      '`movl` copies the resolved file contents directly into the parser output, and exfiltrate\'s `movl` stores ' +
+      'them into attacker-readable memory with no entity validation or allowlist check.',
+    code:
+`# CVE pattern: XML parser resolves external entity — reads arbitrary files
+class XMLParser:
+    def __init__(self, max_depth):
+        self.max_depth = max_depth
+        self.entity_count = 0
+        self.resolved = 0
+        self.output = 0
+
+    def parse_entity(self, entity_ref, target):
+        self.entity_count += 1
+        self.resolved = target
+        return self.resolved
+
+    def expand_output(self):
+        self.output = self.resolved
+        return self.output
+
+class FileSystem:
+    def __init__(self, passwd, shadow):
+        self.passwd = passwd
+        self.shadow = shadow
+        self.reads = 0
+
+    def read_file(self, path_id):
+        self.reads += 1
+        if path_id == 1:
+            return self.passwd
+        elif path_id == 2:
+            return self.shadow
+        return 0
+
+class Attacker:
+    def __init__(self):
+        self.stolen = 0
+        self.target_file = 0
+
+    def craft_dtd(self, file_id):
+        self.target_file = file_id
+        return self.target_file
+
+    def exfiltrate(self, data):
+        self.stolen = data
+        return self.stolen
+
+parser = XMLParser(10)
+fs = FileSystem(1094795585, 3735928559)
+attacker = Attacker()
+entity = attacker.craft_dtd(2)
+file_data = fs.read_file(entity)
+parser.parse_entity(1, file_data)
+expanded = parser.expand_output()
+stolen = attacker.exfiltrate(expanded)
+print(stolen)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads the attacker-crafted entity target (referencing /etc/shadow) into a stack slot; parse_entity\'s addl increments entity_count without any DTD-resolution restriction — expand_output\'s movl copies the resolved file contents directly into the parser output, and exfiltrate\'s movl stores them into attacker-readable memory with no entity validation or allowlist check',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
