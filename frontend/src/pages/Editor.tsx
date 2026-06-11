@@ -2720,6 +2720,84 @@ print(stolen)
       description: 'movl loads the attacker-crafted entity target (referencing /etc/shadow) into a stack slot; parse_entity\'s addl increments entity_count without any DTD-resolution restriction — expand_output\'s movl copies the resolved file contents directly into the parser output, and exfiltrate\'s movl stores them into attacker-readable memory with no entity validation or allowlist check',
     },
   },
+  {
+    id: 'tcache-poison',
+    name: 'TCACHE POISONING',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted free-list pointer in a tcache bin makes malloc return an arbitrary address, giving the attacker a controlled write into any memory region.',
+    explanation:
+      'Tcache poisoning (CWE-416 / CWE-122 adjacent) corrupts the singly-linked free list in glibc\'s per-thread ' +
+      'tcache bins. When a chunk is freed into the tcache, its first 8 bytes (the fd pointer) point to the previously ' +
+      'freed chunk in the same size class. If an attacker can write to a freed chunk — via a use-after-free, double-free, ' +
+      'or heap overflow — they overwrite the fd pointer with an arbitrary target address. The next two malloc calls of ' +
+      'that size class first return the legitimately freed chunk, then return the attacker\'s fake address — giving a ' +
+      'controlled write anywhere in the process address space. The attacker typically targets __free_hook (pre-glibc 2.34), ' +
+      'GOT entries, or stack return addresses to redirect control flow to system("/bin/sh"). ' +
+      'CVE-2024-1086 (Linux netfilter nf_tables, CVSS 7.8, CISA KEV) used a double-free in nft_verdict_init() to poison ' +
+      'the allocator free list and achieve arbitrary page-table writes, escalating to root on all kernels 3.15 through ' +
+      '6.8 — actively exploited in RansomHub and Akira ransomware campaigns throughout 2025. CVE-2023-4911 (Looney ' +
+      'Tunables, glibc ld.so, CVSS 7.8) exploited a GLIBC_TUNABLES buffer overflow to corrupt tcache metadata in the ' +
+      'dynamic linker itself, achieving root on Debian, Ubuntu, and Fedora. glibc 2.32 added safe-linking (XOR-encrypting ' +
+      'fd pointers with a per-thread random key) as a mitigation, but it is bypassable once the attacker leaks the heap ' +
+      'base address via an information disclosure primitive. ' +
+      'In the assembly, movl overwrites the head_fd field (the tcache bin\'s forward pointer) with the attacker\'s target ' +
+      'address; malloc_from_bin\'s movl reads this corrupted pointer and returns it as the next allocation — the subsequent ' +
+      'movl writes 0xDEADBEEF into the overlapping TargetStruct\'s func_ptr field, and addl in dispatch combines it with ' +
+      'uid for control-flow hijack.',
+    code:
+`# CVE pattern: corrupted tcache fd pointer — malloc returns arbitrary addr
+class TcacheBin:
+    def __init__(self, max_entries):
+        self.max_entries = max_entries
+        self.count = 0
+        self.head_fd = 0
+        self.next_fd = 0
+
+    def free_to_bin(self, chunk_addr):
+        self.next_fd = self.head_fd
+        self.head_fd = chunk_addr
+        self.count += 1
+        return self.count
+
+    def poison_fd(self, fake_addr):
+        self.head_fd = fake_addr
+        return self.head_fd
+
+    def malloc_from_bin(self):
+        result = self.head_fd
+        self.head_fd = self.next_fd
+        self.count -= 1
+        return result
+
+class TargetStruct:
+    def __init__(self, func_ptr, uid):
+        self.func_ptr = func_ptr
+        self.uid = uid
+        self.active = 1
+
+    def dispatch(self):
+        result = self.func_ptr + self.uid
+        return result
+
+tcache = TcacheBin(7)
+tcache.free_to_bin(4210688)
+tcache.free_to_bin(4210752)
+target_addr = 4196352
+tcache.poison_fd(target_addr)
+drain = tcache.malloc_from_bin()
+overlapping = tcache.malloc_from_bin()
+target = TargetStruct(4196608, 1000)
+target.func_ptr = 3735928559
+target.uid = 0
+hijacked = target.dispatch()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl overwrites the head_fd field (the tcache bin\'s singly-linked forward pointer) with the attacker\'s target address; malloc_from_bin\'s movl reads this corrupted pointer and returns it as the next allocation — the subsequent movl writes 0xDEADBEEF into the overlapping TargetStruct\'s func_ptr field, and addl in dispatch combines it with uid for control-flow hijack',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
