@@ -2798,6 +2798,84 @@ print(hijacked)
       description: 'movl overwrites the head_fd field (the tcache bin\'s singly-linked forward pointer) with the attacker\'s target address; malloc_from_bin\'s movl reads this corrupted pointer and returns it as the next allocation — the subsequent movl writes 0xDEADBEEF into the overlapping TargetStruct\'s func_ptr field, and addl in dispatch combines it with uid for control-flow hijack',
     },
   },
+  {
+    id: 'branch-target-injection',
+    name: 'BRANCH TARGET INJECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Attacker poisons the CPU indirect branch predictor so kernel-mode indirect calls speculate to a leak gadget, exfiltrating secrets via cache timing.',
+    explanation:
+      'Branch Target Injection (Spectre v2 / CVE-2017-5715 / CWE-200) exploits the CPU\'s indirect branch predictor: ' +
+      'unlike Spectre v1 which bypasses a bounds check on a conditional branch, Spectre v2 poisons the Branch Target ' +
+      'Buffer (BTB) and Branch History Buffer (BHB) so that an indirect call or jump — call *%rax, jmp *(%rbx) — ' +
+      'speculates to an attacker-chosen gadget address instead of the real target. The attacker trains the predictor ' +
+      'from userspace by executing indirect branches at congruent addresses, then triggers a syscall; the kernel\'s ' +
+      'indirect call mispredicts to the trained gadget, which speculatively reads a secret and encodes it into the ' +
+      'cache via a dependent load. A Flush+Reload timing measurement recovers the secret byte. ' +
+      'Branch History Injection (BHI / CVE-2022-0001, VUSec) demonstrated that Intel\'s eIBRS and Arm\'s CSV2 — ' +
+      'hardware mitigations designed to isolate predictor state across privilege levels — could be bypassed by ' +
+      'manipulating the Branch History Buffer from within the victim domain, leaking /etc/shadow hashes at 160 bytes/sec ' +
+      'on fully patched Intel systems. Training Solo (CVE-2024-28956 / CVE-2025-24495, VUSec 2025) showed that even ' +
+      'self-training within a single privilege domain re-enables the attack at 17 KB/sec, breaking all domain-isolation ' +
+      'defenses on Intel Coffee Lake through Rocket Lake. CVE-2024-45332 (Branch Privilege Injection, ETH Zürich 2025) ' +
+      'exploited a race condition in the branch predictor during privilege transitions, leaking kernel memory at ' +
+      '5.6 KB/sec with 99.8% accuracy on every Intel CPU since 9th-gen Coffee Lake despite all Spectre v2 mitigations ' +
+      'being enabled. Intel\'s retpoline mitigation replaces indirect branches with a return trampoline, but hardware ' +
+      'IBRS/eIBRS was meant to make retpoline unnecessary — BHI and BPRC proved it insufficient. ' +
+      'In the assembly, the attacker loop\'s addl trains the branch history by accumulating gadget addresses; the ' +
+      'victim\'s cmpl tests bp.poisoned but the CPU speculatively follows the trained prediction — imull multiplies ' +
+      'the secret by 256 to index a probe array cache line, and no lfence serializes between the indirect branch ' +
+      'resolution and the dependent load, leaving the speculative window open for Flush+Reload recovery.',
+    code:
+`# CVE pattern: poisoned BTB redirects indirect call — leaks via cache
+class BranchPredictor:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.history = 0
+        self.train_count = 0
+        self.poisoned = 0
+
+    def train(self, target, count):
+        i = 0
+        while i < count:
+            self.history += target
+            self.train_count += 1
+            i += 1
+        self.poisoned = 1
+        return self.train_count
+
+class VictimModule:
+    def __init__(self, safe_target, secret):
+        self.safe_target = safe_target
+        self.secret = secret
+        self.cache_probe = 0
+        self.leaked = 0
+
+    def indirect_call(self, bp):
+        if bp.poisoned == 1:
+            self.cache_probe = self.secret * 256
+            self.leaked = 1
+        else:
+            self.cache_probe = self.safe_target
+        return self.cache_probe
+
+    def flush_reload(self):
+        result = self.cache_probe + self.leaked
+        return result
+
+bp = BranchPredictor(4096)
+gadget_addr = 4196352
+bp.train(gadget_addr, 8)
+victim = VictimModule(4196608, 3405691582)
+victim.indirect_call(bp)
+leaked = victim.flush_reload()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'imull'],
+      description: 'addl in the training loop accumulates gadget addresses into the branch history, poisoning the BTB/BHB; the victim\'s cmpl checks bp.poisoned but the CPU speculatively follows the trained prediction — imull multiplies the secret (0xCAFEBABE) by 256 to compute the cache probe line index, and no lfence appears between the mispredicted branch and the dependent load, leaving the speculative window open for Flush+Reload secret recovery',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
