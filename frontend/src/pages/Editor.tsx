@@ -2876,6 +2876,93 @@ print(leaked)
       description: 'addl in the training loop accumulates gadget addresses into the branch history, poisoning the BTB/BHB; the victim\'s cmpl checks bp.poisoned but the CPU speculatively follows the trained prediction — imull multiplies the secret (0xCAFEBABE) by 256 to compute the cache probe line index, and no lfence appears between the mispredicted branch and the dependent load, leaving the speculative window open for Flush+Reload secret recovery',
     },
   },
+  {
+    id: 'ptrace-exit-race',
+    name: 'PTRACE EXIT RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Race window during privileged process exit lets an unprivileged attacker steal open file descriptors via pidfd_getfd(), leaking SSH host keys and shadow passwords.',
+    explanation:
+      'The ptrace exit-race (CVE-2026-46333 / CWE-362, codename "ssh-keysign-pwn") exploits a logic flaw in the ' +
+      'Linux kernel\'s __ptrace_may_access() authorization check. When a SUID process exits, the kernel detaches its ' +
+      'memory descriptor (mm) before closing its file descriptor table. During this window, __ptrace_may_access() calls ' +
+      'get_dumpable() which returns a permissive value when mm is NULL — skipping the privilege check that should block ' +
+      'unprivileged access. An attacker monitors SUID binary exits (ssh-keysign, chage) via pidfd and races pidfd_getfd() ' +
+      'into the window: because mm=NULL passes the dumpable guard, the kernel duplicates the privileged process\'s open ' +
+      'file descriptors — including handles to /etc/shadow and SSH host private keys — into the attacker\'s process. ' +
+      'The flaw was introduced in v4.10-rc1 (November 2016) but became a full privilege-escalation chain with the ' +
+      'pidfd_getfd() syscall added in v5.6 (January 2020), affecting every major Linux distribution for six years. ' +
+      'Qualys reported the vulnerability on May 11, 2026; the upstream patch landed May 14. Ubuntu, RHEL, Debian, and ' +
+      'Fedora issued emergency kernel updates. Unlike race-based exploits that require precise timing, the exit window ' +
+      'is deterministic and wide enough to hit reliably. CISA rated it High severity (CVSS 7.1). ' +
+      'In the assembly, movl zeroes the mm field (simulating mm detachment); cmpl in may_access checks mm == 0 and the ' +
+      'branch grants access — movl then copies fd_table (the secret data) into stolen_fd before close_fds zeroes the ' +
+      'descriptor table, completing the fd theft through the unguarded race window.',
+    code:
+`# CVE pattern: ptrace mm=NULL race lets unprivileged fd theft from exiting SUID
+class SuidProcess:
+    def __init__(self, pid, priv_level):
+        self.pid = pid
+        self.priv_level = priv_level
+        self.mm = 1
+        self.fd_table = 0
+        self.fd_open = 0
+
+    def open_secret(self, secret_data):
+        self.fd_table = secret_data
+        self.fd_open = 1
+        return self.fd_open
+
+    def begin_exit(self):
+        self.mm = 0
+        return self.mm
+
+    def close_fds(self):
+        self.fd_table = 0
+        self.fd_open = 0
+        return self.fd_open
+
+class PtraceChecker:
+    def __init__(self, ptrace_scope):
+        self.ptrace_scope = ptrace_scope
+        self.access_granted = 0
+
+    def may_access(self, proc):
+        if proc.mm == 0:
+            self.access_granted = 1
+        elif proc.priv_level > 0:
+            self.access_granted = 0
+        else:
+            self.access_granted = 0
+        return self.access_granted
+
+class Attacker:
+    def __init__(self):
+        self.stolen_fd = 0
+        self.leaked_data = 0
+
+    def pidfd_getfd(self, checker, proc):
+        allowed = checker.may_access(proc)
+        if allowed == 1:
+            self.stolen_fd = proc.fd_table
+            self.leaked_data = self.stolen_fd
+        return self.leaked_data
+
+suid = SuidProcess(1234, 1)
+shadow_hash = 3735928559
+suid.open_secret(shadow_hash)
+checker = PtraceChecker(1)
+suid.begin_exit()
+attacker = Attacker()
+stolen = attacker.pidfd_getfd(checker, suid)
+suid.close_fds()
+print(stolen)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl zeroes the mm field (simulating memory descriptor detachment during exit); cmpl in may_access checks mm == 0 and the branch grants ptrace access — movl then copies fd_table (containing the shadow hash 0xDEADBEEF) into stolen_fd before close_fds zeroes the descriptor table, completing the file descriptor theft through the unguarded exit-race window',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
