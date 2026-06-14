@@ -2963,6 +2963,84 @@ print(stolen)
       description: 'movl zeroes the mm field (simulating memory descriptor detachment during exit); cmpl in may_access checks mm == 0 and the branch grants ptrace access — movl then copies fd_table (containing the shadow hash 0xDEADBEEF) into stolen_fd before close_fds zeroes the descriptor table, completing the file descriptor theft through the unguarded exit-race window',
     },
   },
+  {
+    id: 'dma-iommu-bypass',
+    name: 'DMA IOMMU BYPASS',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Malicious PCIe/Thunderbolt peripheral bypasses IOMMU to read and write arbitrary physical memory, extracting encryption keys and hijacking kernel execution.',
+    explanation:
+      'Direct Memory Access (DMA) attacks (CWE-693 / CWE-1262) exploit the hardware-level trust granted to PCIe ' +
+      'peripherals. Devices like network cards, GPUs, and Thunderbolt adapters are given direct read/write access to ' +
+      'system RAM without CPU mediation — the IOMMU (Input/Output Memory Management Unit) is supposed to restrict each ' +
+      'device to its assigned memory regions, but firmware bugs, lazy initialization, or missing configuration leave the ' +
+      'IOMMU disabled or misconfigured during critical boot phases. An attacker with brief physical access plugs in a ' +
+      'malicious PCIe/Thunderbolt device (or a compromised peripheral) that issues DMA reads across all of physical ' +
+      'memory — extracting disk encryption keys (BitLocker, LUKS), login credentials, and ASLR base addresses in ' +
+      'seconds. DMA writes can overwrite kernel code, page tables, or security-critical structures to achieve code ' +
+      'execution at ring 0. CVE-2025-11901 and CVE-2025-14302 (CVSS 7.0) revealed that UEFI firmware on ASUS, ' +
+      'GIGABYTE, MSI, and ASRock motherboards reported DMA protection as active while failing to initialize the IOMMU, ' +
+      'leaving systems exposed to pre-boot DMA attacks via any PCIe slot. The Thunderclap research (NDSS 2019) ' +
+      'demonstrated that even with IOMMU enabled, OS drivers grant peripherals access to shared memory containing ' +
+      'cleartext VPN traffic, keystrokes, and kernel pointers — a compromised USB-C charger could launch a root shell ' +
+      'in under 10 seconds. The Thunderspy attack (2020) bypassed Intel Thunderbolt security levels entirely. ' +
+      'In the assembly, movl loads the DMA base address and the kernel secret into separate stack slots representing ' +
+      'distinct physical memory regions; the scan loop\'s addl sweeps across memory offsets without any cmpl bounds ' +
+      'check against an IOMMU page table — the device reads every slot including the kernel credential, then movl in ' +
+      'inject_payload writes 0xDEADBEEF directly into the kernel code page with no permission check.',
+    code:
+`# CVE pattern: DMA peripheral bypasses IOMMU — reads/writes kernel memory
+class PhysicalMemory:
+    def __init__(self, size):
+        self.size = size
+        self.user_data = 4196352
+        self.kernel_cred = 3405691582
+        self.kernel_code = 4196608
+        self.encryption_key = 305419896
+
+    def read_region(self, offset):
+        if offset == 0:
+            result = self.user_data
+        elif offset == 1:
+            result = self.kernel_cred
+        elif offset == 2:
+            result = self.kernel_code
+        else:
+            result = self.encryption_key
+        return result
+
+class DMADevice:
+    def __init__(self, dev_id):
+        self.dev_id = dev_id
+        self.dma_base = 0
+        self.leaked_total = 0
+        self.writes = 0
+
+    def scan_memory(self, mem, count):
+        i = 0
+        while i < count:
+            val = mem.read_region(i)
+            self.leaked_total += val
+            i += 1
+        return self.leaked_total
+
+    def inject_payload(self, mem, payload):
+        mem.kernel_code = payload
+        self.writes += 1
+        return self.writes
+
+phys = PhysicalMemory(4294967296)
+rogue = DMADevice(1094795585)
+stolen = rogue.scan_memory(phys, 4)
+rogue.inject_payload(phys, 3735928559)
+result = phys.kernel_code + stolen
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads kernel credentials (0xCAFEBABE) and encryption keys (0x12345678) into stack slots representing physical memory regions; the scan loop\'s addl sweeps across all offsets without any IOMMU bounds check — inject_payload\'s movl writes 0xDEADBEEF directly into the kernel code slot with no permission guard, achieving full physical memory read-write via a rogue PCIe device',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
