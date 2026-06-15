@@ -3041,6 +3041,78 @@ print(result)
       description: 'movl loads kernel credentials (0xCAFEBABE) and encryption keys (0x12345678) into stack slots representing physical memory regions; the scan loop\'s addl sweeps across all offsets without any IOMMU bounds check — inject_payload\'s movl writes 0xDEADBEEF directly into the kernel code slot with no permission guard, achieving full physical memory read-write via a rogue PCIe device',
     },
   },
+  {
+    id: 'int-truncation',
+    name: 'INTEGER TRUNCATION',
+    severity: 'CRITICAL',
+    category: 'Arithmetic',
+    description: 'Wide integer silently truncated to a narrower type for allocation size, while the full untruncated value drives the copy — massive heap overflow.',
+    explanation:
+      'Integer truncation (CWE-197) occurs when a value in a wider type (e.g. 64-bit size_t) is cast to a ' +
+      'narrower type (e.g. 16-bit uint16_t) for a buffer allocation size. The high bits are silently discarded: ' +
+      'a value like 65600 (0x10040) becomes 64 (0x0040) when stored in a 16-bit field. The program allocates a ' +
+      '64-byte buffer but then copies 65600 bytes using the original untruncated value — a catastrophic heap overflow ' +
+      'that corrupts adjacent objects, function pointers, and allocator metadata. Unlike integer overflow (CWE-190) ' +
+      'where a value wraps past MAX, truncation discards upper bits during a width-narrowing cast — the arithmetic ' +
+      'never overflows, but the stored result is silently wrong. ' +
+      'CVE-2025-49679 (Windows Shell) exploited 64-to-32-bit truncation in file-path handling to corrupt memory ' +
+      'addresses and escalate privileges. CVE-2025-3277 (SQLite) truncated an extremely large input size during ' +
+      'allocation, producing a tiny buffer while the subsequent write used the original untruncated length — a ~4GB ' +
+      'heap overflow. CVE-2025-53723 (Windows Hyper-V) exploited numeric truncation in the virtualization stack for ' +
+      'incorrect memory handling. CVE-2025-21333 (Windows Kernel vkrnlintvsp.sys) truncated a 64-bit value past ' +
+      'the LONG range, causing incorrect buffer sizing in a kernel driver. FastNetMon\'s AS_PATH parser stored a ' +
+      'computed attribute_length in a uint8_t — any AS_PATH exceeding 63 ASNs silently truncated the length to ' +
+      'its low 8 bits, allocating a tiny buffer while writing the full untruncated data. ' +
+      'In the assembly, `cmpl` checks the truncated alloc_size (64) against the buffer capacity, which trivially ' +
+      'passes; `imull` then multiplies the full untruncated value (65600) by 4 to compute the copy length — ' +
+      'the resulting offset far exceeds the allocated region, and `movl` writes 0xDEADBEEF into the adjacent ' +
+      'object\'s handler field via the heap spill.',
+    code:
+`# CVE pattern: 64-bit size truncated to 16-bit — tiny alloc, massive copy
+class SizeCalc:
+    def __init__(self, input_size):
+        self.full_size = input_size
+        self.alloc_size = 0
+        self.copy_len = 0
+        self.overflow_bytes = 0
+
+    def truncate_width(self):
+        if self.full_size > 65535:
+            self.alloc_size = self.full_size - 65536
+        else:
+            self.alloc_size = self.full_size
+        return self.alloc_size
+
+    def do_copy(self):
+        self.copy_len = self.full_size * 4
+        if self.copy_len > self.alloc_size:
+            self.overflow_bytes = self.copy_len - self.alloc_size
+        return self.overflow_bytes
+
+class Adjacent:
+    def __init__(self, handler, refcount):
+        self.handler = handler
+        self.refcount = refcount
+        self.corrupted = 0
+
+    def check_integrity(self):
+        result = self.handler + self.refcount
+        return result
+
+calc = SizeCalc(65600)
+tiny_buf = calc.truncate_width()
+overflow = calc.do_copy()
+victim = Adjacent(4196352, 1)
+victim.handler = 3735928559
+victim.corrupted = 1
+hijacked = victim.check_integrity()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'imull', 'movl'],
+      description: 'cmpl checks the truncated alloc_size (64) against the buffer capacity — the guard trivially passes because the high bits were silently discarded during the width-narrowing cast; imull then multiplies the full untruncated value (65600) by 4 to compute the copy length, producing an offset that far exceeds the allocation; movl writes 0xDEADBEEF into the adjacent object\'s handler field via the heap spill, hijacking the next virtual dispatch',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
