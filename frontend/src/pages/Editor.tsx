@@ -3113,6 +3113,77 @@ print(hijacked)
       description: 'cmpl checks the truncated alloc_size (64) against the buffer capacity — the guard trivially passes because the high bits were silently discarded during the width-narrowing cast; imull then multiplies the full untruncated value (65600) by 4 to compute the copy length, producing an offset that far exceeds the allocation; movl writes 0xDEADBEEF into the adjacent object\'s handler field via the heap spill, hijacking the next virtual dispatch',
     },
   },
+  {
+    id: 'buffer-underflow',
+    name: 'BUFFER UNDERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Negative index or pointer decrement writes before the buffer start, corrupting heap metadata or stack-saved registers that precede the allocation.',
+    explanation:
+      'Buffer underflow (CWE-124 / CWE-786) occurs when a write operation targets memory addresses before ' +
+      'the beginning of an allocated buffer — the mirror image of a buffer overflow. A negative index, an ' +
+      'unchecked pointer decrement, or arithmetic underflow in offset calculation causes the write to land ' +
+      'in heap allocator metadata (prev_size, fd/bk pointers) or stack-saved registers that lie at lower ' +
+      'addresses than the buffer base. Corrupting glibc\'s malloc metadata enables the classic unsafe unlink ' +
+      'exploit: the attacker forges fd and bk pointers so that free() performs an arbitrary write during ' +
+      'chunk consolidation. ' +
+      'CVE-2023-0179 (Linux kernel nftables, CVSS 7.8) exploited an integer underflow in nft_payload_copy_vlan — ' +
+      'a crafted VLAN header caused the offset to wrap negative, writing before the payload buffer on the kernel ' +
+      'stack and achieving local privilege escalation to root via arbitrary code execution. ' +
+      'CVE-2026-44631 (Apache HTTP Server 2.4.0–2.4.67) is a heap underwrite in ap_regname caused by a signed ' +
+      'char overflow in regex configuration parsing, enabling remote code execution. ' +
+      'CVE-2024-21762 (FortiOS SSL VPN, CVSS 9.6, CISA KEV) used a pre-buffer out-of-bounds write primitive ' +
+      'for unauthenticated remote code execution, actively exploited by state-sponsored actors before public ' +
+      'disclosure. ' +
+      'In the assembly, cmpl checks the index but allows negative values through the else branch; movl writes ' +
+      'the attacker\'s value into the fd_ptr/bk_ptr fields that precede the data slots on the stack; addl in ' +
+      'unsafe_unlink sums the forged pointers — in a real heap exploit, free() dereferences these corrupted ' +
+      'pointers during chunk consolidation, achieving an arbitrary write primitive.',
+    code:
+`# CVE pattern: negative index underflows buffer — corrupts heap metadata
+class HeapChunk:
+    def __init__(self, capacity):
+        self.prev_size = 0
+        self.chunk_size = capacity * 8
+        self.fd_ptr = 4196352
+        self.bk_ptr = 4196608
+        self.slot0 = 0
+        self.slot1 = 0
+        self.write_count = 0
+
+    def write_at(self, index, value):
+        if index >= 0:
+            if index == 0:
+                self.slot0 = value
+            else:
+                self.slot1 = value
+        else:
+            if index == 0 - 1:
+                self.bk_ptr = value
+            else:
+                self.fd_ptr = value
+        self.write_count += 1
+        return self.write_count
+
+    def unsafe_unlink(self):
+        result = self.fd_ptr + self.bk_ptr
+        return result
+
+chunk = HeapChunk(16)
+chunk.write_at(0, 42)
+chunk.write_at(1, 84)
+neg = 0 - 1
+chunk.write_at(neg, 3735928559)
+deep_neg = 0 - 2
+chunk.write_at(deep_neg, 1094795585)
+hijacked = chunk.unsafe_unlink()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl checks the index but allows negative values to reach the else branch; movl writes the attacker values (0xDEADBEEF, 0x41414141) into fd_ptr and bk_ptr fields that precede the buffer data slots — addl in unsafe_unlink sums the forged pointers, simulating the arbitrary write that glibc\'s free() performs during unsafe chunk consolidation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
