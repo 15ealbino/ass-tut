@@ -3184,6 +3184,82 @@ print(hijacked)
       description: 'cmpl checks the index but allows negative values to reach the else branch; movl writes the attacker values (0xDEADBEEF, 0x41414141) into fd_ptr and bk_ptr fields that precede the buffer data slots — addl in unsafe_unlink sums the forged pointers, simulating the arbitrary write that glibc\'s free() performs during unsafe chunk consolidation',
     },
   },
+  {
+    id: 'untrusted-ptr-deref',
+    name: 'UNTRUSTED POINTER DEREF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Kernel dereferences an attacker-supplied pointer without validation, granting an arbitrary memory read/write primitive from user context.',
+    explanation:
+      'Untrusted pointer dereference (CWE-822) occurs when a kernel syscall handler or driver IOCTL receives a ' +
+      'pointer from user-mode and dereferences it without verifying the address falls within a valid, authorized ' +
+      'memory region. Unlike buffer overflows that reach adjacent memory incrementally, untrusted pointer dereference ' +
+      'gives the attacker surgical precision: they supply the exact kernel address to read or write, bypassing all ' +
+      'spatial bounds checking. ' +
+      'CVE-2026-40369 (Windows kernel, CVSS 7.8) is the textbook example: NtQuerySystemInformation invoked with ' +
+      'info class 253 (SystemProcessInformationExtension) and buffer length zero passes a caller-controlled pointer ' +
+      'into ExpGetProcessInformation without validation, creating an arbitrary 12-byte kernel write from any ' +
+      'standard user context — enabling browser sandbox escape from all major render processes. ' +
+      'CVE-2025-49661 (Windows AFD.sys, CVSS 7.8) exploited the same class in the WinSock kernel driver: user-mode ' +
+      'pointers passed to the Ancillary Function Driver were dereferenced in ring 0 without ProbeForRead/ProbeForWrite ' +
+      'validation, escalating to SYSTEM. CVE-2025-47985 (Windows Event Tracing) allowed crafted LPC messages with ' +
+      'unvalidated pointers to perform arbitrary kernel read/write. CWE-822 has appeared in over a dozen Windows ' +
+      'kernel CVEs across 2025-2026 alone, making it one of the most actively exploited vulnerability classes ' +
+      'in modern operating systems. ' +
+      'In the assembly, cmpl in query_info checks buf_len but the zero-length bypass skips validation entirely; ' +
+      'movl loads the attacker-supplied user_ptr offset and writes to the computed stack slot without any ' +
+      'ProbeForWrite guard — the else branch sets priv_level to 0, simulating the kernel token corruption.',
+    code:
+`# CVE pattern: user-supplied pointer dereferenced without validation
+class KernelMemory:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.counter0 = 0
+        self.counter1 = 0
+        self.token_addr = 4196352
+        self.priv_level = 1000
+
+    def increment_at(self, offset):
+        if offset == 0:
+            self.counter0 += 1
+        elif offset == 1:
+            self.counter1 += 1
+        elif offset == 2:
+            self.token_addr += 1
+        else:
+            self.priv_level = 0
+        return offset
+
+    def read_priv(self):
+        result = self.priv_level + self.token_addr
+        return result
+
+class SyscallHandler:
+    def __init__(self, info_class):
+        self.info_class = info_class
+        self.buf_len = 0
+        self.validated = 0
+
+    def query_info(self, kmem, user_ptr):
+        if self.buf_len > 0:
+            self.validated = 1
+        kmem.increment_at(user_ptr)
+        return self.validated
+
+kmem = KernelMemory(4096)
+handler = SyscallHandler(253)
+handler.buf_len = 0
+handler.query_info(kmem, 0)
+attacker_ptr = 99
+handler.query_info(kmem, attacker_ptr)
+leaked = kmem.read_priv()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks buf_len > 0 but the zero-length bypass skips validation entirely; movl loads the attacker-supplied user_ptr offset and writes to the computed stack slot without any ProbeForWrite guard — the else branch sets priv_level to 0, simulating the arbitrary kernel write that corrupts security tokens at an attacker-chosen address',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
