@@ -3260,6 +3260,73 @@ print(leaked)
       description: 'cmpl checks buf_len > 0 but the zero-length bypass skips validation entirely; movl loads the attacker-supplied user_ptr offset and writes to the computed stack slot without any ProbeForWrite guard — the else branch sets priv_level to 0, simulating the arbitrary kernel write that corrupts security tokens at an attacker-chosen address',
     },
   },
+  {
+    id: 'proto-pollution',
+    name: 'PROTOTYPE POLLUTION',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'Attacker-controlled key merges into Object.prototype, poisoning all downstream objects and escalating to remote code execution.',
+    explanation:
+      'Prototype pollution (CWE-1321) exploits JavaScript\'s prototype chain: when a recursive merge or deep-clone ' +
+      'function processes attacker-supplied keys like __proto__ or constructor.prototype, the assigned value propagates ' +
+      'to Object.prototype — the root prototype inherited by every JavaScript object. Any subsequent property lookup ' +
+      'on any object that lacks its own definition for the poisoned key resolves to the attacker\'s value, silently ' +
+      'corrupting authentication checks (isAdmin becomes true), template engine options (enabling code evaluation), ' +
+      'or child_process spawn arguments (injecting shell commands). ' +
+      'CVE-2025-55182 (React2Shell, CVSS 10.0) is the most impactful example: React Server Components\' Flight ' +
+      'protocol decoded attacker-supplied __proto__ keys during request parsing, enabling unauthenticated RCE on ' +
+      'every Next.js application using server components — a single HTTP request poisons the server process and ' +
+      'executes arbitrary code without authentication. CVE-2025-66478 extended the attack to Next.js App Router. ' +
+      'CVE-2019-10744 (Lodash, CVSS 9.1) and CVE-2019-7609 (Kibana) both achieved RCE through prototype pollution ' +
+      'chained with template engines or child_process.spawn — the Kibana exploit was used in the wild for cryptomining. ' +
+      'In the assembly, movl stores the attacker\'s poisoned value (0xDEADBEEF) into the base_proto field via merge_key; ' +
+      'resolve_prop\'s cmpl checks whether own_value > 0, and when it is not, movl reads from the poisoned base_proto ' +
+      'slot — every object without its own property inherits the attacker\'s value, turning auth checks into guaranteed bypass.',
+    code:
+`# CVE pattern: __proto__ key poisons all objects — auth bypass to RCE
+class ProtoChain:
+    def __init__(self):
+        self.base_proto = 0
+        self.polluted = 0
+
+    def merge_key(self, key_type, value):
+        if key_type == 1:
+            self.base_proto = value
+            self.polluted = 1
+        return self.polluted
+
+    def resolve_prop(self, own_value):
+        if own_value > 0:
+            result = own_value
+        else:
+            result = self.base_proto
+        return result
+
+class UserObj:
+    def __init__(self, role):
+        self.role = role
+        self.is_admin = 0
+        self.token = 0
+
+    def check_admin(self, proto):
+        if self.is_admin > 0:
+            self.token = 4196352
+        else:
+            resolved = proto.resolve_prop(self.is_admin)
+            self.token = resolved
+        return self.token
+
+proto = ProtoChain()
+proto.merge_key(1, 3735928559)
+user = UserObj(100)
+hijacked = user.check_admin(proto)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl stores the attacker\'s poisoned value (0xDEADBEEF) into the base_proto slot via merge_key; cmpl in resolve_prop checks own_value > 0 and falls through to the else branch — movl reads from the poisoned base_proto slot, so every object without its own property inherits the attacker\'s value, turning authentication checks into guaranteed bypass',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
