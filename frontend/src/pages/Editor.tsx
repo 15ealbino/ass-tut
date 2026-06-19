@@ -3327,6 +3327,78 @@ print(hijacked)
       description: 'movl stores the attacker\'s poisoned value (0xDEADBEEF) into the base_proto slot via merge_key; cmpl in resolve_prop checks own_value > 0 and falls through to the else branch — movl reads from the poisoned base_proto slot, so every object without its own property inherits the attacker\'s value, turning authentication checks into guaranteed bypass',
     },
   },
+  {
+    id: 'msg-oob-uaf',
+    name: 'MSG_OOB SOCKET UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Consumed out-of-band socket buffers linger in the receive queue as boundary markers, allowing a stale recv to dereference freed kernel memory.',
+    explanation:
+      'CVE-2025-38236 (CWE-416) exploits a subtle flaw in the Linux kernel\'s AF_UNIX MSG_OOB handling, ' +
+      'discovered by Jann Horn of Google Project Zero. When out-of-band data is sent on a UNIX domain ' +
+      'stream socket, the kernel stores it in an sk_buff (socket buffer) on the receive queue. After the ' +
+      'receiver reads the OOB data with recv(MSG_OOB), the skb is not removed — it remains in the queue ' +
+      'as a boundary marker with its data length zeroed. When multiple consecutive OOB sends and receives ' +
+      'occur, the queue accumulates consumed OOB skbs with zero length. A subsequent normal recv() walks ' +
+      'the queue, hits a consumed OOB skb, and manage_oob() returns the next skb; ' +
+      'unix_stream_read_generic() then reads and frees the not-yet-consumed OOB skb. The final ' +
+      'recv(MSG_OOB) dereferences the now-freed skb — a classic use-after-free. This bug is particularly ' +
+      'dangerous because AF_UNIX sockets are accessible from within sandboxed processes: Jann Horn ' +
+      'demonstrated exploitation directly from Chrome\'s renderer sandbox, achieving full kernel-level ' +
+      'code execution without any user interaction. The SO_PEEK_OFF code path does not expect ' +
+      'unix_skb_len(skb) to be 0, which is exactly the state of a consumed OOB boundary marker, creating ' +
+      'the mismatch that leads to the use-after-free. The fix modifies unix_stream_recv_urg() to check ' +
+      'whether the previous skb is a consumed OOB skb and frees it before processing the current OOB ' +
+      'message, preventing the stale reference chain. ' +
+      'In the assembly, movl stores OOB data into the oob_data field via send_oob; recv_stream\'s cmpl ' +
+      'checks consumed == 1 and zeroes oob_data (simulating sk_buff free); recv_oob_stale\'s movl reads ' +
+      'from the same zeroed slot — at runtime the freed sk_buff region holds attacker-controlled data ' +
+      'from heap spray, yielding kernel code execution from inside a sandbox.',
+    code:
+`# CVE pattern: MSG_OOB consumed skb stays queued — stale recv triggers UAF
+class OobSocket:
+    def __init__(self):
+        self.oob_data = 0
+        self.consumed = 0
+        self.freed = 0
+        self.queue_len = 0
+
+    def send_oob(self, value):
+        self.oob_data = value
+        self.consumed = 0
+        self.queue_len += 1
+        return self.queue_len
+
+    def recv_oob(self):
+        result = self.oob_data
+        self.consumed = 1
+        return result
+
+    def recv_stream(self):
+        if self.consumed == 1:
+            self.freed = 1
+            self.oob_data = 0
+            self.queue_len -= 1
+        return self.queue_len
+
+    def recv_oob_stale(self):
+        stale = self.oob_data
+        return stale
+
+sock = OobSocket()
+sock.send_oob(3735928559)
+sock.recv_oob()
+sock.send_oob(3405691582)
+sock.recv_oob()
+freed = sock.recv_stream()
+dangling = sock.recv_oob_stale()
+print(dangling)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl stores OOB data via send_oob, then recv_stream\'s cmpl checks consumed == 1 and zeroes oob_data (simulating sk_buff free); recv_oob_stale\'s movl reads from the same zeroed slot — at runtime the freed sk_buff contains attacker-controlled heap spray data, yielding kernel code execution from inside a sandbox',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
