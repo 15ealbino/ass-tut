@@ -3399,6 +3399,91 @@ print(dangling)
       description: 'movl stores OOB data via send_oob, then recv_stream\'s cmpl checks consumed == 1 and zeroes oob_data (simulating sk_buff free); recv_oob_stale\'s movl reads from the same zeroed slot — at runtime the freed sk_buff contains attacker-controlled heap spray data, yielding kernel code execution from inside a sandbox',
     },
   },
+  {
+    id: 'futex-requeue-race',
+    name: 'FUTEX REQUEUE RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Race between futex requeue and lock release corrupts the PI waiter list, yielding a kernel use-after-free for privilege escalation.',
+    explanation:
+      'Futex (Fast Userspace Mutex) requeue race conditions exploit the Linux kernel\'s most complex ' +
+      'synchronization primitive. The futex_requeue() syscall atomically moves waiters from one futex ' +
+      'queue to another — but when combined with Priority Inheritance (PI) futexes, the operation must ' +
+      'also transfer lock ownership. A race between a requeue operation on one thread and a lock release ' +
+      'on another can leave a waiter\'s task struct referenced in the PI state after the task has exited ' +
+      'and its kernel stack freed — a use-after-free on the kernel stack itself. ' +
+      'CVE-2014-3153 (Towelroot, CVSS 7.8) exploited a logical flaw in futex_requeue() that failed to ' +
+      'verify source and destination futex addresses were distinct: requeueing a futex onto itself corrupted ' +
+      'the waiter list, giving geohot an arbitrary kernel write that rooted every Android device with a ' +
+      'kernel built before June 2014. CVE-2021-3347 (CVSS 7.8) exploited PI futex fault handling where a ' +
+      'page fault during the requeue left the kernel in inconsistent state — the PI lock\'s owner field ' +
+      'referenced a freed task, and the next unlock wrote through the dangling pointer. CVE-2025-39977 ' +
+      '(CVSS 7.0) demonstrated the class persists: a timeout or signal during requeue-PI completion caused ' +
+      'futex_wait_requeue_pi() to exit without lock_ptr synchronization, producing yet another UAF on the ' +
+      'waiter\'s kernel stack. The attack surface is inherent to the futex design — userspace controls both ' +
+      'the futex addresses and the timing of concurrent operations, giving the attacker direct influence over ' +
+      'the race window. ' +
+      'In the assembly, addl increments waiter_count during requeue while a concurrent release_lock zeroes ' +
+      'pi_owner and lock_ptr via movl — the subsequent read of lock_ptr in race_release returns 0 (the freed ' +
+      'reference), but the attacker sprays the freed stack slot with 0xDEADBEEF via movl to pi_owner, and ' +
+      'addl in the final expression dereferences the stale pointer value.',
+    code:
+`# CVE pattern: futex requeue race — PI waiter list UAF on kernel stack
+class FutexQueue:
+    def __init__(self, key):
+        self.key = key
+        self.waiter_count = 0
+        self.pi_owner = 0
+        self.lock_ptr = 0
+
+    def add_waiter(self, tid):
+        self.waiter_count += 1
+        self.lock_ptr = tid
+        return self.waiter_count
+
+    def release_lock(self):
+        self.pi_owner = 0
+        self.lock_ptr = 0
+        return self.pi_owner
+
+class Requeuer:
+    def __init__(self, src, dst):
+        self.src_key = src
+        self.dst_key = dst
+        self.moved = 0
+        self.stale_ref = 0
+
+    def requeue_waiters(self, src_q, dst_q, count):
+        i = 0
+        while i < count:
+            src_q.waiter_count -= 1
+            dst_q.waiter_count += 1
+            self.moved += 1
+            i += 1
+        return self.moved
+
+    def race_release(self, src_q):
+        src_q.release_lock()
+        self.stale_ref = src_q.lock_ptr + 1
+        return self.stale_ref
+
+src = FutexQueue(1000)
+dst = FutexQueue(2000)
+src.add_waiter(4196352)
+src.add_waiter(4196608)
+src.add_waiter(4196864)
+requeuer = Requeuer(src.key, dst.key)
+requeuer.requeue_waiters(src, dst, 2)
+requeuer.race_release(src)
+src.pi_owner = 3735928559
+dangling = src.pi_owner + src.lock_ptr
+print(dangling)
+`,
+    badAsm: {
+      patterns: ['addl', 'movl'],
+      description: 'addl increments waiter_count during requeue while a concurrent release_lock\'s movl zeroes pi_owner and lock_ptr — race_release reads the freed lock_ptr (0) through a stale reference; the attacker sprays 0xDEADBEEF into pi_owner via movl, and the final addl sums the dangling pointer value with the freed slot for kernel stack corruption',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
