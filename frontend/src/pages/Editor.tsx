@@ -3484,6 +3484,76 @@ print(dangling)
       description: 'addl increments waiter_count during requeue while a concurrent release_lock\'s movl zeroes pi_owner and lock_ptr — race_release reads the freed lock_ptr (0) through a stale reference; the attacker sprays 0xDEADBEEF into pi_owner via movl, and the final addl sums the dangling pointer value with the freed slot for kernel stack corruption',
     },
   },
+  {
+    id: 'mds-zombieload',
+    name: 'MDS ZOMBIELOAD',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Faulting load forwards stale data from CPU-internal fill buffers, leaking secrets across processes, VMs, and SGX enclaves via cache timing.',
+    explanation:
+      'Microarchitectural Data Sampling (MDS / CWE-200) is a family of hardware vulnerabilities in Intel CPUs that ' +
+      'leak data from CPU-internal buffers — Line Fill Buffers, Store Buffers, and Load Ports — that are never ' +
+      'architecturally visible to software. Unlike Spectre (which exploits branch prediction), MDS exploits the ' +
+      'CPU\'s data-forwarding logic: when a faulting or assisted load occurs, the microarchitecture speculatively ' +
+      'forwards stale data from these internal buffers before aborting the faulted instruction. The attacker encodes ' +
+      'the leaked byte into a cache line via a dependent load on a probe array, then uses Flush+Reload timing to ' +
+      'recover it — identical to Meltdown\'s extraction step but targeting internal buffers instead of L1D cache. ' +
+      'ZombieLoad (CVE-2018-12130 / MFBDS) targets Line Fill Buffers and is the most severe variant, leaking data ' +
+      'across OS processes, virtual machines, and SGX enclaves at rates up to 2.5 KB/s. RIDL (CVE-2018-12127 / MLPDS) ' +
+      'targets Load Ports; Fallout (CVE-2018-12126 / MSBDS) targets Store Buffers. ZombieLoad v2 / TAA ' +
+      '(CVE-2019-11135) bypassed Intel\'s hardware MDS mitigations on Cascade Lake CPUs by exploiting TSX ' +
+      'Asynchronous Abort to access fill buffer contents from within a transactional region. Researchers demonstrated ' +
+      'real-time keystroke recovery, ASLR derandomization, and TLS session key extraction across VM boundaries. Intel ' +
+      'has no complete hardware fix; software mitigation requires the VERW instruction to flush internal buffers on ' +
+      'every privilege transition and optionally disabling Hyper-Threading, incurring up to 20% performance loss. ' +
+      'In the assembly, movl loads a faulting address (0x0) that triggers a microcode assist; the CPU speculatively ' +
+      'forwards stale data from the fill buffer into the probe index calculation — imull multiplies the leaked byte ' +
+      'by 256 (cache line size) to select a probe array line, and addl sums the timing result without any VERW ' +
+      'serialization between the fault and the dependent load.',
+    code:
+`# CVE pattern: faulting load leaks fill-buffer data via cache timing
+class FillBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.stale_data = 3405691582
+        self.tls_key = 305419896
+        self.aslr_base = 4196352
+        self.slot_count = 0
+
+    def load_victim(self, secret):
+        self.stale_data = secret
+        self.slot_count += 1
+        return self.slot_count
+
+class Attacker:
+    def __init__(self, probe_size):
+        self.probe_size = probe_size
+        self.leaked_byte = 0
+        self.probe_index = 0
+        self.timing_hit = 0
+
+    def faulting_load(self, fb):
+        self.leaked_byte = fb.stale_data
+        self.probe_index = self.leaked_byte * 256
+        return self.probe_index
+
+    def flush_reload(self):
+        self.timing_hit = self.probe_index + self.leaked_byte
+        return self.timing_hit
+
+fb = FillBuffer(64)
+fb.load_victim(3405691582)
+fb.load_victim(305419896)
+attacker = Attacker(65536)
+leaked = attacker.faulting_load(fb)
+result = attacker.flush_reload()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'movl loads stale data from the fill buffer slot after the victim\'s value has been evicted; imull multiplies the leaked byte by 256 to compute the probe array cache line index — no VERW serialization instruction appears between the faulting load and the dependent access, leaving the transient execution window open for Flush+Reload extraction across VM and process boundaries',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
