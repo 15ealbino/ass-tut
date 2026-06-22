@@ -3554,6 +3554,84 @@ print(result)
       description: 'movl loads stale data from the fill buffer slot after the victim\'s value has been evicted; imull multiplies the leaked byte by 256 to compute the probe array cache line index — no VERW serialization instruction appears between the faulting load and the dependent access, leaving the transient execution window open for Flush+Reload extraction across VM and process boundaries',
     },
   },
+  {
+    id: 'userfaultfd-race',
+    name: 'USERFAULTFD RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Userfaultfd blocks kernel copy_from_user mid-syscall, giving an attacker thread an unbounded race window to free the target object and achieve use-after-free.',
+    explanation:
+      'Userfaultfd race exploitation (CWE-362 / CWE-416) weaponizes the Linux kernel\'s userfaultfd mechanism — ' +
+      'designed to let userspace handle page faults — as a deterministic race-condition amplifier. The attacker ' +
+      'registers a memory region with userfaultfd, then triggers a syscall whose copy_from_user() reads from that ' +
+      'region. When the kernel touches the registered page, the page fault is forwarded to the attacker\'s uffd ' +
+      'handler thread, which blocks the kernel thread indefinitely. While the kernel is frozen mid-copy, the ' +
+      'attacker frees the target kernel object (buffer, socket, file struct) from a second thread, then resolves ' +
+      'the fault — the kernel resumes copy_from_user into the now-freed object, producing a deterministic ' +
+      'use-after-free with no timing uncertainty. This transforms normally-microsecond race windows into ' +
+      'arbitrarily long ones, making otherwise-unexploitable races trivially reliable. ' +
+      'CVE-2021-22555 (Linux Netfilter, CVSS 7.8) used userfaultfd to deterministically trigger a heap out-of-bounds ' +
+      'write in Netfilter\'s x_tables compat layer, achieving container escape and root from an unprivileged user. ' +
+      'CVE-2022-29582 (Linux io_uring) exploited a timeout UAF by using userfaultfd to pause the kernel during ' +
+      'io_uring request processing while a second thread cancelled the timer, freeing the request struct mid-copy. ' +
+      'CVE-2021-26708 (Linux vsock, CVSS 7.0) leveraged userfaultfd to hold the kernel during virtio transport ' +
+      'operations while racing to corrupt vsock socket state from another thread. CVE-2019-18683 (V4L2) and ' +
+      'CVE-2020-27786 (MIDI) similarly used userfaultfd to widen race windows for reliable kernel exploitation. ' +
+      'Kernel 5.11+ restricts unprivileged userfaultfd via /proc/sys/vm/unprivileged_userfaultfd=0, but many ' +
+      'distributions still ship with it enabled, and the FUSE-based "Minotaur" variant achieves the same effect. ' +
+      'In the assembly, begin_copy\'s movl sets in_copy=1 marking the kernel as mid-syscall; fault_block\'s movl ' +
+      'sets blocked=1 freezing the kernel thread — free_and_resolve\'s movl then zeroes the buffer\'s data and size ' +
+      'fields while the kernel is paused. When the copy resumes, movl writes 0xDEADBEEF into the freed object\'s ' +
+      'stack slot, and addl in the stale read sums attacker-controlled data from the recycled memory.',
+    code:
+`# CVE pattern: userfaultfd blocks copy_from_user — free object in race window
+class KernelBuf:
+    def __init__(self, size, data):
+        self.size = size
+        self.data = data
+        self.freed = 0
+        self.in_copy = 0
+
+    def begin_copy(self):
+        self.in_copy = 1
+        return self.in_copy
+
+    def complete_copy(self, user_val):
+        self.data = user_val
+        self.in_copy = 0
+        return self.data
+
+class UffdHandler:
+    def __init__(self, page_addr):
+        self.page_addr = page_addr
+        self.blocked = 0
+        self.resolved = 0
+
+    def fault_block(self):
+        self.blocked = 1
+        return self.blocked
+
+    def free_and_resolve(self, buf):
+        buf.data = 0
+        buf.size = 0
+        buf.freed = 1
+        self.resolved = 1
+        return self.resolved
+
+kbuf = KernelBuf(256, 4196352)
+uffd = UffdHandler(1048576)
+kbuf.begin_copy()
+uffd.fault_block()
+uffd.free_and_resolve(kbuf)
+kbuf.data = 3735928559
+stale = kbuf.data + kbuf.size
+print(stale)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl sets in_copy=1 marking the kernel mid-syscall then fault_block\'s movl sets blocked=1 freezing the thread; free_and_resolve\'s movl zeroes data and size in the freed buffer while the kernel is paused — after the fault resolves, movl writes 0xDEADBEEF into the freed slot and addl sums the attacker-controlled value with the zeroed size, producing a stale read from recycled memory',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
