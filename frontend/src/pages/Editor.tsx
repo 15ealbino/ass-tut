@@ -3632,6 +3632,85 @@ print(stale)
       description: 'movl sets in_copy=1 marking the kernel mid-syscall then fault_block\'s movl sets blocked=1 freezing the thread; free_and_resolve\'s movl zeroes data and size in the freed buffer while the kernel is paused — after the fault resolves, movl writes 0xDEADBEEF into the freed slot and addl sums the attacker-controlled value with the zeroed size, producing a stale read from recycled memory',
     },
   },
+  {
+    id: 'dirty-cred',
+    name: 'DIRTYCRED CREDENTIAL SWAP',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Kernel UAF frees an unprivileged credential object; the slab allocator hands the same slot to a privileged allocation, and the task\'s dangling pointer now references root credentials.',
+    explanation:
+      'DirtyCred (CWE-416 / CWE-269) is a kernel exploitation technique presented at ACM CCS 2022 and Black Hat USA 2022 ' +
+      'by Zhenpeng Lin (Northwestern University) that transforms any kernel use-after-free or double-free into a privilege ' +
+      'escalation — without needing KASLR bypass, heap address leaks, or ROP chains. The attack has two variants: ' +
+      'Task credential swap targets the struct cred in the dedicated cred_jar slab cache: the attacker triggers a UAF to ' +
+      'free a task\'s unprivileged cred, then races a privileged process (e.g. su or sshd) to allocate a new cred that fills ' +
+      'the freed slot — the victim task\'s dangling cred pointer now references uid=0, cap=0xFFFFFFFF (CAP_ALL). ' +
+      'File struct swap targets struct file in the filp slab cache: the attacker opens a read-only file, frees the struct ' +
+      'file via UAF, then opens /etc/shadow — the original file descriptor now points to the privileged file\'s struct, ' +
+      'granting write access. Because the swap is data-only (no code pointers are corrupted), SMEP, SMAP, and CFI are all ' +
+      'bypassed. CVE-2021-4154 (cgroup v1 UAF) and CVE-2022-2588 (cls_route double-free, CVSS 7.8) were demonstrated; ' +
+      'CVE-2023-3269 (StackRot) and CVE-2024-1086 (netfilter nf_tables) provide the same UAF primitive for DirtyCred. ' +
+      'In the assembly, movl zeros the freed cred fields (uid, gid, cap); realloc_privileged\'s movl writes 0xFFFFFFFF ' +
+      'into the cap slot — the same stack offset — and the task\'s addl in check_priv sums the now-root uid (0) with ' +
+      'CAP_ALL, confirming privilege escalation without corrupting a single code pointer.',
+    code:
+`# CVE pattern: UAF frees unprivileged cred — slab reuse fills slot with root cred
+class Cred:
+    def __init__(self, uid, gid, cap):
+        self.uid = uid
+        self.gid = gid
+        self.cap = cap
+        self.refcount = 1
+
+class Task:
+    def __init__(self, pid, uid, cap):
+        self.pid = pid
+        self.cred_uid = uid
+        self.cred_cap = cap
+        self.swapped = 0
+
+    def check_priv(self):
+        result = self.cred_uid + self.cred_cap
+        return result
+
+class SlabCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.alloc_count = 0
+        self.last_freed = 0
+
+    def free_cred(self, cred):
+        cred.uid = 0
+        cred.gid = 0
+        cred.cap = 0
+        cred.refcount = 0
+        self.last_freed = 1
+        return self.last_freed
+
+    def realloc_privileged(self, cred):
+        cred.uid = 0
+        cred.gid = 0
+        cred.cap = 4294967295
+        cred.refcount = 1
+        self.alloc_count += 1
+        return self.alloc_count
+
+unpriv = Cred(1000, 1000, 0)
+task = Task(1337, unpriv.uid, unpriv.cap)
+slab = SlabCache(64)
+slab.free_cred(unpriv)
+slab.realloc_privileged(unpriv)
+task.cred_uid = unpriv.uid
+task.cred_cap = unpriv.cap
+task.swapped = 1
+hijacked = task.check_priv()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl zeros the freed credential fields (uid, gid, cap) in free_cred; realloc_privileged\'s movl writes 0xFFFFFFFF (CAP_ALL) into the same cap stack offset — the task\'s dangling reference now reads root credentials, and addl in check_priv sums uid=0 with cap=0xFFFFFFFF confirming privilege escalation without corrupting any code pointers',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
