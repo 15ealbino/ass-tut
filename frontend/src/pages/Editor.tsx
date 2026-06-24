@@ -3711,6 +3711,88 @@ print(hijacked)
       description: 'movl zeros the freed credential fields (uid, gid, cap) in free_cred; realloc_privileged\'s movl writes 0xFFFFFFFF (CAP_ALL) into the same cap stack offset — the task\'s dangling reference now reads root credentials, and addl in check_priv sums uid=0 with cap=0xFFFFFFFF confirming privilege escalation without corrupting any code pointers',
     },
   },
+  {
+    id: 'use-after-realloc',
+    name: 'USE-AFTER-REALLOC',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Buffer resized by realloc shrinks or moves, but stale pointers still reference the old size/location — writes through them corrupt adjacent heap metadata or freed memory.',
+    explanation:
+      'Use-after-realloc (CWE-416 adjacent) is a subtle variant of use-after-free that occurs when realloc() ' +
+      'shrinks or relocates a buffer but existing pointers still reference the original size or address. ' +
+      'When realloc reduces a buffer from N to M bytes (M < N), the allocator may free the tail portion or ' +
+      'move the data entirely; either way, code that cached the old capacity continues writing up to N bytes, ' +
+      'overflowing past the new M-byte boundary into adjacent heap objects or freed memory. ' +
+      'CVE-2023-29491 (ncurses, CVSS 7.8) is the textbook example: the terminfo parser calls realloc() to ' +
+      'shrink ptr->Strings based on an attacker-controlled str_count field from a malicious .terminfo file, ' +
+      'then immediately writes beyond the new boundary — Microsoft\'s analysis confirmed heap corruption ' +
+      'enabling local privilege escalation via any setuid ncurses application. ' +
+      'CVE-2023-25136 (OpenSSH 9.1, pre-auth) exposed a double-free during options.kex_algorithms handling ' +
+      'where a failed realloc path freed the buffer twice, giving an unauthenticated remote attacker heap ' +
+      'corruption before authentication — rated critical for its pre-auth attack surface. ' +
+      'CVE-2026-4446 (Chrome WebRTC) exploited a use-after-free where WebRTC objects were freed and the ' +
+      'underlying memory reallocated for other purposes while stale references remained, achieving RCE in ' +
+      'the renderer process. The pattern is endemic in C codebases that cache buffer pointers across realloc ' +
+      'calls — any resize invalidates every alias, but compilers cannot warn about it. ' +
+      'In the assembly, movl stores values using the old capacity as the bound; after realloc_shrink reduces ' +
+      'the capacity, cmpl in write_stale still checks against the cached old_cap — the subsequent movl writes ' +
+      'past the new boundary into the adjacent_meta field, corrupting heap metadata for arbitrary code execution.',
+    code:
+`# CVE pattern: realloc shrinks buffer — stale pointer writes past new boundary
+class Buffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.data0 = 0
+        self.data1 = 0
+        self.data2 = 0
+        self.adjacent_meta = 4196352
+
+    def fill(self, v0, v1, v2):
+        self.data0 = v0
+        self.data1 = v1
+        self.data2 = v2
+        return self.capacity
+
+    def realloc_shrink(self, new_cap):
+        self.capacity = new_cap
+        if new_cap < 3:
+            self.data2 = 0
+        if new_cap < 2:
+            self.data1 = 0
+        return self.capacity
+
+class StaleWriter:
+    def __init__(self, old_cap):
+        self.old_cap = old_cap
+        self.written = 0
+
+    def write_stale(self, buf, index, value):
+        if index < self.old_cap:
+            if index == 0:
+                buf.data0 = value
+            elif index == 1:
+                buf.data1 = value
+            elif index == 2:
+                buf.data2 = value
+            else:
+                buf.adjacent_meta = value
+            self.written += 1
+        return self.written
+
+buf = Buffer(4)
+buf.fill(100, 200, 300)
+buf.realloc_shrink(2)
+stale = StaleWriter(4)
+stale.write_stale(buf, 2, 3735928559)
+stale.write_stale(buf, 3, 1094795585)
+leaked = buf.adjacent_meta
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl in write_stale checks the index against the cached old_cap (4) instead of the post-realloc capacity (2); movl then writes 0xDEADBEEF into the data2 slot that realloc freed and 0x41414141 into adjacent_meta — the stale capacity bound lets both writes proceed, corrupting heap metadata past the shrunk buffer boundary',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
