@@ -1,1 +1,2 @@
 - [TOCTOU Research](reference_toctou_research.md) — Key CVEs (CVE-2024-30088, CVE-2024-50379, CVE-2016-5195), assembly mechanism, demo approaches
+- [Use-After-Realloc CVE Reference](reference_use_after_realloc_cves.md) — CVE-2023-25136 (OpenSSH), CVE-2023-29491 (ncurses), CVE-2026-33986/33984 (FreeRDP), CVE-2024-56759 (btrfs)
