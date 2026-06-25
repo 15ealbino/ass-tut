@@ -3793,6 +3793,84 @@ print(leaked)
       description: 'cmpl in write_stale checks the index against the cached old_cap (4) instead of the post-realloc capacity (2); movl then writes 0xDEADBEEF into the data2 slot that realloc freed and 0x41414141 into adjacent_meta — the stale capacity bound lets both writes proceed, corrupting heap metadata past the shrunk buffer boundary',
     },
   },
+  {
+    id: 'vsock-vm-escape',
+    name: 'VSOCK VM ESCAPE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Transport reassignment in the vsock subsystem incorrectly decrements the socket refcount, freeing it while dangling references remain — enabling VM-to-host privilege escalation.',
+    explanation:
+      'Vsock transport use-after-free (CWE-416 / CWE-911) exploits a refcount lifecycle mismatch in the Linux ' +
+      'kernel\'s vsock (virtual socket) subsystem — the IPC mechanism connecting guests to their hypervisor host. ' +
+      'When a vsock connection attempt fails (e.g. targeting a non-existent CID), the transport is released via ' +
+      'transport->release(), which calls vsock_remove_bound() without verifying the socket was ever moved to the ' +
+      'bound list — decrementing the refcount from 2 to 1. A subsequent vsock_bind() call assumes the socket is ' +
+      'still in the unbound list and calls __vsock_remove_bound() again, dropping the refcount to zero and freeing ' +
+      'the socket while the process still holds a file descriptor referencing it. ' +
+      'CVE-2025-21756 ("Attack of the Vsock", CVSS 7.8) demonstrated this exact primitive: the attacker triggers ' +
+      'the double-decrement from inside a guest VM, reclaims the freed socket\'s memory with pipe backing pages ' +
+      '(using the same cross-cache technique as CVE-2024-0582), then overwrites the host kernel\'s cred struct ' +
+      'uid/gid to zero — escaping the VM and achieving root on the host. The exploit uses vsock_diag_dump() as a ' +
+      'side channel to leak init_net\'s address, defeating KASLR, and bypasses AppArmor by targeting functions not ' +
+      'covered by LSM hooks. The vulnerability existed in every kernel from 5.5 through 6.13.3, affecting QEMU/KVM, ' +
+      'VMware, and cloud workloads. ' +
+      'In the assembly, two separate movl instructions decrement the refcount field — the second decrement\'s cmpl ' +
+      'sees refcount == 0 and movl zeroes the socket fields (simulating free); the subsequent invoke\'s addl reads ' +
+      'from the same stack offset where the attacker has reclaimed the memory with controlled data via pipe page ' +
+      'spraying, crossing the VM isolation boundary.',
+    code:
+`# CVE pattern: vsock transport rebind drops refcount — UAF crosses VM boundary
+class VsockSocket:
+    def __init__(self, cid, port):
+        self.cid = cid
+        self.port = port
+        self.refcount = 2
+        self.transport = 1
+        self.freed = 0
+
+    def transport_release(self):
+        self.refcount -= 1
+        self.transport = 0
+        return self.refcount
+
+    def rebind_remove(self):
+        self.refcount -= 1
+        if self.refcount == 0:
+            self.freed = 1
+            self.cid = 0
+            self.port = 0
+        return self.freed
+
+    def invoke(self):
+        result = self.cid + self.port
+        return result
+
+class VMHost:
+    def __init__(self, kernel_base):
+        self.kernel_base = kernel_base
+        self.cred_uid = 1000
+        self.escaped = 0
+
+    def reclaim_freed(self, payload):
+        self.cred_uid = payload
+        self.escaped = 1
+        return self.escaped
+
+sock = VsockSocket(3, 9999)
+sock.transport_release()
+sock.rebind_remove()
+host = VMHost(4196352)
+host.reclaim_freed(0)
+sock.cid = 3735928559
+sock.port = 4196608
+leaked = sock.invoke()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'movl decrements refcount twice via transport_release and rebind_remove; cmpl in rebind_remove sees refcount == 0 and movl zeroes the socket fields (simulating free) — but invoke\'s addl reads from the same stack offset where the attacker has reclaimed memory with 0xDEADBEEF via pipe page spraying, crossing the VM isolation boundary to achieve host-level code execution',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
