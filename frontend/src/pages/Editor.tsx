@@ -3871,6 +3871,90 @@ print(leaked)
       description: 'movl decrements refcount twice via transport_release and rebind_remove; cmpl in rebind_remove sees refcount == 0 and movl zeroes the socket fields (simulating free) — but invoke\'s addl reads from the same stack offset where the attacker has reclaimed memory with 0xDEADBEEF via pipe page spraying, crossing the VM isolation boundary to achieve host-level code execution',
     },
   },
+  {
+    id: 'symlink-following',
+    name: 'SYMLINK FOLLOWING',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Privileged process follows an attacker-planted symlink, redirecting file operations to sensitive targets like /etc/shadow for arbitrary overwrite.',
+    explanation:
+      'Symlink following (CWE-59) occurs when a privileged process — a setuid binary, root daemon, or system ' +
+      'service — performs a file operation on a path without verifying whether it has been replaced by a symbolic ' +
+      'link. The attacker creates or replaces a file in a world-writable directory (typically /tmp) with a symlink ' +
+      'pointing to a sensitive target such as /etc/shadow, /etc/passwd, or SSH host keys. When the privileged ' +
+      'process opens, writes, or changes permissions on the path, the kernel resolves the symlink transparently ' +
+      'and the operation lands on the attacker\'s chosen target with the process\'s elevated privileges. ' +
+      'CVE-2021-44731 (snap-confine, CVSS 7.8) exploited a race in setup_private_mount() — the function passed ' +
+      'an absolute path to mount() which follows symlinks, allowing an attacker to replace /tmp/snap.$SNAP_NAME ' +
+      'with a directory containing a symlink named "tmp", achieving root on Ubuntu via bind-mount redirection. ' +
+      'CVE-2026-3888 (snap-confine + systemd-tmpfiles) showed the same class persists: when systemd-tmpfiles ' +
+      'cleaned the snap private /tmp directory after 10–30 days, an attacker could re-create it with malicious ' +
+      'symlinks, achieving root on Ubuntu Desktop 24.04+. CVE-2023-38175 (Windows Defender) redirected privileged ' +
+      'antivirus file operations via a planted symlink for local privilege escalation. The O_NOFOLLOW flag and ' +
+      'the protected_symlinks sysctl (Linux 3.6+) mitigate the class, but many legacy and containerized ' +
+      'applications still follow symlinks unconditionally. ' +
+      'In the assembly, movl stores the original tmpfile path reference; replace_with_link\'s movl sets is_link=1 ' +
+      'and stores the /etc/shadow address in link_target; cmpl in resolve() checks is_link and the branch returns ' +
+      'link_target instead of the original path — write_config\'s addl combines the redirected target with the ' +
+      'payload, landing the privileged write on /etc/shadow without any symlink validation between path resolution ' +
+      'and the write operation.',
+    code:
+`# CVE pattern: setuid process follows symlink — writes to /etc/shadow
+class FileNode:
+    def __init__(self, inode, data, owner):
+        self.inode = inode
+        self.data = data
+        self.owner = owner
+        self.link_target = 0
+        self.is_link = 0
+
+    def replace_with_link(self, target_data):
+        self.link_target = target_data
+        self.is_link = 1
+        return self.is_link
+
+    def resolve(self):
+        if self.is_link == 1:
+            result = self.link_target
+        else:
+            result = self.data
+        return result
+
+class SetuidService:
+    def __init__(self, real_uid, eff_uid):
+        self.real_uid = real_uid
+        self.eff_uid = eff_uid
+        self.written = 0
+
+    def write_config(self, node, payload):
+        target = node.resolve()
+        result = target + payload
+        self.written = 1
+        return result
+
+class ShadowFile:
+    def __init__(self, hash_val):
+        self.hash_val = hash_val
+        self.corrupted = 0
+
+    def read(self):
+        result = self.hash_val + self.corrupted
+        return result
+
+shadow = ShadowFile(4196352)
+tmpfile = FileNode(1001, 42, 1000)
+service = SetuidService(1000, 0)
+tmpfile.replace_with_link(shadow.hash_val)
+shadow.hash_val = service.write_config(tmpfile, 3735928559)
+shadow.corrupted = 1
+leaked = shadow.read()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'movl stores the original tmpfile data; replace_with_link\'s movl overwrites link_target with the /etc/shadow address and sets is_link=1; cmpl in resolve() checks is_link and the branch returns link_target instead of the original path — write_config\'s addl combines the redirected target with the attacker payload (0xDEADBEEF), landing the privileged write on /etc/shadow without any symlink validation or O_NOFOLLOW guard',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
