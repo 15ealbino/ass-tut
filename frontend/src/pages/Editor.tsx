@@ -3955,6 +3955,77 @@ print(leaked)
       description: 'movl stores the original tmpfile data; replace_with_link\'s movl overwrites link_target with the /etc/shadow address and sets is_link=1; cmpl in resolve() checks is_link and the branch returns link_target instead of the original path — write_config\'s addl combines the redirected target with the attacker payload (0xDEADBEEF), landing the privileged write on /etc/shadow without any symlink validation or O_NOFOLLOW guard',
     },
   },
+  {
+    id: 'meltdown-ooo',
+    name: 'MELTDOWN OOO READ',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'CPU out-of-order execution reads kernel memory before a permission fault is delivered, leaking secrets via cache timing side-channel.',
+    explanation:
+      'Meltdown (CVE-2017-5754 / CWE-200), also called Rogue Data Cache Load, exploits out-of-order execution ' +
+      'in Intel and some ARM CPUs. When a user-mode load targets a kernel address, the CPU raises a fault — but ' +
+      'the micro-op scheduler has already dispatched dependent instructions using the speculatively loaded value ' +
+      'before the fault retires. The transient instructions use the kernel byte to index a 256-entry probe array ' +
+      '(multiplied by cache-line size), loading exactly one cache line. After the fault is delivered and the ' +
+      'transient results are architecturally squashed, the cache state persists — a Flush+Reload timing measurement ' +
+      'reveals which line was loaded, recovering the secret byte. Repeating across every address dumps the entire ' +
+      'kernel address space — /etc/shadow hashes, cryptographic keys, other processes\' memory — at up to 503 KB/s. ' +
+      'CVE-2017-5754 affected virtually every Intel CPU manufactured from 1995 to 2018 and ARM Cortex-A75. The ' +
+      'kernel Page Table Isolation (KPTI/KAISER) mitigation unmaps kernel pages from user-space page tables ' +
+      'entirely, imposing 5-30% performance overhead. CVE-2018-3615 (Foreshadow/L1TF) extended the attack to SGX ' +
+      'enclave memory, breaking cloud tenant isolation. CVE-2024-45332 (Branch Privilege Injection, ETH Zurich, ' +
+      'USENIX Security 2025) showed that Intel\'s own eIBRS/IBPB hardware mitigations could be bypassed via a ' +
+      'branch predictor race condition, leaking kernel memory at 5.6 KB/s on all Intel CPUs since 9th-gen Coffee Lake. ' +
+      'Unlike Spectre (which exploits branch prediction), Meltdown exploits the CPU\'s failure to enforce privilege ' +
+      'checks before forwarding data from the L1 data cache to dependent transient instructions. ' +
+      'In the assembly, cmpl checks the supervisor ring level but the CPU\'s out-of-order pipeline has already ' +
+      'dispatched the movl that loads the kernel secret; imull multiplies the transient value by 256 to compute ' +
+      'the probe array cache-line index — no lfence serializing instruction appears between the permission check ' +
+      'and the dependent load, so the cache side-channel encodes the secret before the fault squashes the result.',
+    code:
+`# CVE pattern: out-of-order exec reads kernel page before fault delivery
+class KernelPage:
+    def __init__(self, secret, flags):
+        self.secret = secret
+        self.flags = flags
+        self.supervisor = 1
+        self.cached = 0
+
+    def check_ring(self, ring):
+        if ring == 0:
+            self.cached = self.secret
+        else:
+            self.cached = 0
+        return self.cached
+
+class ProbeArray:
+    def __init__(self, lines):
+        self.lines = lines
+        self.hot_index = 0
+        self.timing = 0
+        self.recovered = 0
+
+    def transient_load(self, secret_val):
+        self.hot_index = secret_val * 256
+        self.timing = 1
+        return self.hot_index
+
+    def flush_reload(self):
+        self.recovered = self.hot_index + self.timing
+        return self.recovered
+
+kpage = KernelPage(3405691582, 7)
+probe = ProbeArray(256)
+kpage.check_ring(3)
+leaked = probe.transient_load(kpage.secret)
+result = probe.flush_reload()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'imull'],
+      description: 'cmpl checks the ring level (user-mode ring 3 vs kernel ring 0) and the branch sets cached=0 — but the CPU\'s out-of-order pipeline has already dispatched movl to load kpage.secret from the L1 cache; imull multiplies the transient value by 256 to index the probe array, loading a specific cache line — no lfence appears between the check and the dependent load, so the Flush+Reload side-channel recovers the kernel secret after the fault squashes the architectural result',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
