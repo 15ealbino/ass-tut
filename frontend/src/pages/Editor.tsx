@@ -4026,6 +4026,86 @@ print(result)
       description: 'cmpl checks the ring level (user-mode ring 3 vs kernel ring 0) and the branch sets cached=0 — but the CPU\'s out-of-order pipeline has already dispatched movl to load kpage.secret from the L1 cache; imull multiplies the transient value by 256 to index the probe array, loading a specific cache line — no lfence appears between the check and the dependent load, so the Flush+Reload side-channel recovers the kernel secret after the fault squashes the architectural result',
     },
   },
+  {
+    id: 'timing-side-channel',
+    name: 'TIMING SIDE-CHANNEL',
+    severity: 'CRITICAL',
+    category: 'Cryptographic',
+    description: 'Non-constant-time comparison of secret tokens leaks byte-by-byte timing differences, letting an attacker recover HMAC keys, session tokens, or signing MACs remotely.',
+    explanation:
+      'Timing side-channel attacks (CWE-208) exploit the fact that standard comparison functions — memcmp(), ' +
+      'strcmp(), == — terminate early on the first mismatched byte. When used to verify a cryptographic MAC, HMAC, ' +
+      'or session token, the response time reveals how many leading bytes of the attacker\'s guess matched the ' +
+      'secret: a guess that fails on byte 0 returns faster than one that fails on byte 10. By measuring response ' +
+      'latency across 256 candidates per position, the attacker recovers the full secret one byte at a time — ' +
+      'reducing a 2^128 brute-force to 256×16 = 4,096 guesses for a 16-byte HMAC. ' +
+      'CVE-2026-23364 (Linux ksmbd, CVSS 8.1) used memcmp() instead of crypto_memneq() when verifying SMB3 ' +
+      'signing MACs, allowing network-adjacent attackers to forge signed SMB packets and achieve RCE on kernel ' +
+      'file-sharing servers. CVE-2026-21713 (Node.js Web Cryptography API) verified HMAC and KMAC digests with ' +
+      'non-constant-time memcmp, enabling remote timing attacks against any application using subtle.verify(). ' +
+      'CVE-2022-4304 (OpenSSL RSA, CVSS 5.9) leaked RSA plaintext via a timing oracle in PKCS#1 v1.5 decryption — ' +
+      'a Bleichenbacher-style attack exploitable across TLS connections. The fix in every case is identical: ' +
+      'replace early-exit comparison with a constant-time function (CRYPTO_memcmp, hmac.compare_digest, ' +
+      'crypto_memneq) that always examines every byte regardless of mismatch position. ' +
+      'In the assembly, the chain of cmpl + jne instructions forms a cascade where each byte comparison branches ' +
+      'out immediately on mismatch — the attacker measures which cmpl was the last to execute before the return, ' +
+      'recovering the secret byte at that position. A constant-time implementation would replace the cascade with ' +
+      'a single xorl accumulator loop that never branches on individual byte results.',
+    code:
+`# CVE pattern: non-constant-time MAC verify leaks secret byte-by-byte
+class SecureToken:
+    def __init__(self, b0, b1, b2, b3):
+        self.b0 = b0
+        self.b1 = b1
+        self.b2 = b2
+        self.b3 = b3
+        self.verified = 0
+
+    def verify(self, g0, g1, g2, g3):
+        if g0 != self.b0:
+            return 1
+        if g1 != self.b1:
+            return 2
+        if g2 != self.b2:
+            return 3
+        if g3 != self.b3:
+            return 4
+        self.verified = 1
+        return 0
+
+class TimingOracle:
+    def __init__(self):
+        self.attempts = 0
+        self.last_exit = 0
+        self.recovered = 0
+
+    def probe(self, token, g0, g1, g2, g3):
+        self.last_exit = token.verify(g0, g1, g2, g3)
+        self.attempts += 1
+        return self.last_exit
+
+    def check_progress(self, prev, curr):
+        if curr > prev:
+            self.recovered += 1
+        return self.recovered
+
+token = SecureToken(222, 173, 190, 239)
+oracle = TimingOracle()
+e1 = oracle.probe(token, 0, 0, 0, 0)
+e2 = oracle.probe(token, 222, 0, 0, 0)
+e3 = oracle.probe(token, 222, 173, 0, 0)
+e4 = oracle.probe(token, 222, 173, 190, 0)
+oracle.check_progress(e1, e2)
+oracle.check_progress(e2, e3)
+oracle.check_progress(e3, e4)
+result = oracle.recovered + oracle.attempts
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'jne'],
+      description: 'Each cmpl compares one byte of the guess against the secret and jne branches out immediately on mismatch — the cascade of cmpl+jne instructions forms an early-exit chain where the attacker measures which comparison was the last to execute before return, recovering the secret byte at that position; a constant-time fix replaces this with a single xorl accumulator that never branches on individual byte results',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
