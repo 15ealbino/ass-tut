@@ -4106,6 +4106,81 @@ print(result)
       description: 'Each cmpl compares one byte of the guess against the secret and jne branches out immediately on mismatch — the cascade of cmpl+jne instructions forms an early-exit chain where the attacker measures which comparison was the last to execute before return, recovering the secret byte at that position; a constant-time fix replaces this with a single xorl accumulator that never branches on individual byte results',
     },
   },
+  {
+    id: 'fsop-vtable',
+    name: 'FILE STREAM ORIENTED PROGRAMMING',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted FILE structure vtable redirects I/O operations to attacker-controlled code on fclose or fflush.',
+    explanation:
+      'File Stream Oriented Programming (FSOP, CWE-416/CWE-122 adjacent) exploits the glibc _IO_FILE_plus ' +
+      'structure, which stores buffer pointers, flags, and a vtable — a table of function pointers for I/O ' +
+      'operations like read, write, and close. When a heap overflow or use-after-free corrupts a FILE object ' +
+      'on the heap, the attacker overwrites the vtable pointer to reference a fake vtable containing shellcode ' +
+      'addresses. The next I/O operation (fclose, fflush, or even exit() which flushes all streams) invokes ' +
+      'the corrupted function pointer, redirecting execution to attacker-controlled code. ' +
+      'CVE-2024-2961 (glibc iconv buffer overflow, CVSS 8.8) exploited a 24-year-old glibc bug via FILE ' +
+      'structure corruption to achieve remote code execution in PHP — the exploit overwrote function pointers ' +
+      'in the FILE object to call system(). CVE-2023-6246 (glibc __vsyslog_internal heap overflow) allowed ' +
+      'local privilege escalation to root through heap corruption reaching FILE structures. ' +
+      'Glibc 2.24 introduced IO_validate_vtable to restrict vtable pointers to the __libc_IO_vtables section, ' +
+      'but researchers demonstrated bypasses via vtable misalignment — shifting the pointer within the valid ' +
+      'range to invoke different function slots with attacker-controlled arguments. ' +
+      'In the assembly, movl stores the legitimate vtable address during IOFile construction; the corrupt_stream ' +
+      'call overwrites that slot with 0xDEADBEEF via another movl, and the subsequent close() method\'s addl ' +
+      'uses the corrupted vtable value directly — on a real system, this becomes an indirect call through a ' +
+      'fake vtable to attacker shellcode.',
+    code:
+`# CVE pattern: corrupted FILE vtable redirects fclose to attacker shellcode
+class IOFile:
+    def __init__(self, fd, buf_base, buf_end):
+        self.fd = fd
+        self.buf_base = buf_base
+        self.buf_end = buf_end
+        self.vtable = 4196352
+        self.flags = 4222427272
+        self.write_ptr = buf_base
+
+    def write(self, size):
+        self.write_ptr += size
+        if self.write_ptr > self.buf_end:
+            self.write_ptr = self.buf_end
+        return self.write_ptr
+
+    def close(self):
+        result = self.vtable + self.fd
+        self.flags = 0
+        return result
+
+class Attacker:
+    def __init__(self):
+        self.target = 0
+        self.hijacked = 0
+
+    def corrupt_stream(self, stream, fake_vtable):
+        stream.vtable = fake_vtable
+        stream.buf_base = 0
+        stream.buf_end = 0
+        self.target = fake_vtable
+        return self.target
+
+    def trigger_close(self, stream):
+        result = stream.close()
+        self.hijacked = 1
+        return result
+
+f = IOFile(3, 8192, 16384)
+f.write(4096)
+attacker = Attacker()
+attacker.corrupt_stream(f, 3735928559)
+hijacked = attacker.trigger_close(f)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the legitimate vtable address (0x400800) into the IOFile stack slot during construction; corrupt_stream\'s movl overwrites it with 0xDEADBEEF — close()\'s addl then computes a jump target from the corrupted vtable, which on a real system becomes an indirect call through a fake vtable to attacker shellcode',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
