@@ -4181,6 +4181,77 @@ print(hijacked)
       description: 'movl stores the legitimate vtable address (0x400800) into the IOFile stack slot during construction; corrupt_stream\'s movl overwrites it with 0xDEADBEEF — close()\'s addl then computes a jump target from the corrupted vtable, which on a real system becomes an indirect call through a fake vtable to attacker shellcode',
     },
   },
+  {
+    id: 'uninit-callback',
+    name: 'UNINITIALIZED CALLBACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Partially initialized callback table invokes a stale function pointer left on the stack by a prior frame, jumping to attacker-sprayed shellcode.',
+    explanation:
+      'Uninitialized callback pointers (CWE-824) arise when a driver or kernel module allocates an operations ' +
+      'structure but only populates some of its function pointer fields — the rest retain whatever stale values ' +
+      'occupy that memory from a prior stack frame or heap allocation. When the program later invokes one of the ' +
+      'uninitialized callbacks (e.g. calling a .close handler that was never set), execution jumps to the garbage ' +
+      'address left in that slot. An attacker who can spray the stack or heap with controlled values before the ' +
+      'allocation ensures the stale slot contains a shellcode or ROP gadget address. ' +
+      'CVE-2025-23352 (NVIDIA Virtual GPU Manager, CVSS 7.8) exposed an uninitialized pointer in the vGPU guest ' +
+      'interface: a malicious guest VM sent crafted GPU commands that triggered a code path where a pointer variable ' +
+      'was accessed before being initialized, enabling code execution and privilege escalation on the hypervisor host ' +
+      'without user interaction. CVE-2009-3620 (Linux ATI Radeon r128 KMS driver) allowed local users to dereference ' +
+      'an uninitialized function pointer via a crafted ioctl because the driver failed to check whether the Concurrent ' +
+      'Command Engine state was initialized before dispatching operations. ' +
+      'Unlike NULL pointer dereference (where the pointer is explicitly 0x0 and requires mapping page zero), ' +
+      'uninitialized callbacks contain arbitrary stale data — making exploitation more reliable when paired with ' +
+      'deterministic stack spraying, since the attacker controls the exact value without needing to bypass mmap_min_addr. ' +
+      'In the assembly, movl stores the stale shellcode address (0xDEADBEEF) into the close_fn stack slot during ' +
+      'construction; partial_init\'s movl only touches read_fn and write_fn, leaving close_fn untouched — ' +
+      'invoke_close\'s addl then operates on the stale value, which in a real system becomes an indirect call ' +
+      'to attacker-controlled code.',
+    code:
+`# CVE pattern: ops table partially init — stale handler jumps to sprayed addr
+class DriverOps:
+    def __init__(self, total_ops):
+        self.total_ops = total_ops
+        self.read_fn = 0
+        self.write_fn = 0
+        self.close_fn = 3735928559
+        self.ioctl_fn = 4196352
+        self.init_count = 0
+
+    def partial_init(self, read_addr, write_addr):
+        self.read_fn = read_addr
+        self.write_fn = write_addr
+        self.init_count = 2
+        return self.init_count
+
+    def invoke_close(self):
+        result = self.close_fn + self.ioctl_fn
+        return result
+
+class StackSpray:
+    def __init__(self, payload):
+        self.payload = payload
+        self.spray_count = 0
+
+    def fill(self, count):
+        i = 0
+        while i < count:
+            self.spray_count += 1
+            i += 1
+        return self.payload * self.spray_count
+
+spray = StackSpray(3735928559)
+spray.fill(4)
+ops = DriverOps(4)
+ops.partial_init(4196352, 4196608)
+hijacked = ops.invoke_close()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the stale shellcode address (0xDEADBEEF) into the close_fn stack slot during construction; partial_init\'s movl only writes to read_fn and write_fn slots — invoke_close\'s addl sums the stale close_fn and ioctl_fn values, which in a real driver becomes an indirect call through a garbage function pointer to attacker-sprayed code',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
