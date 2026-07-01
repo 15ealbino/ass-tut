@@ -4252,6 +4252,99 @@ print(hijacked)
       description: 'movl stores the stale shellcode address (0xDEADBEEF) into the close_fn stack slot during construction; partial_init\'s movl only writes to read_fn and write_fn slots — invoke_close\'s addl sums the stale close_fn and ioctl_fn values, which in a real driver becomes an indirect call through a garbage function pointer to attacker-sprayed code',
     },
   },
+  {
+    id: 'timer-callback-uaf',
+    name: 'TIMER CALLBACK UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Kernel timer fires after its owning object is freed, executing a callback that dereferences attacker-controlled data in the recycled memory slot.',
+    explanation:
+      'Timer callback use-after-free (CWE-416 / CWE-672) occurs when a kernel object has an associated timer or ' +
+      'delayed-work callback that is not properly cancelled before the object is freed. The timer subsystem holds ' +
+      'a reference to the object, but this reference is invisible to the object\'s lifecycle — when the owning code ' +
+      'calls kfree(), the timer wheel still holds a stale pointer. Milliseconds later, the timer fires and its ' +
+      'callback dereferences the freed slot. If an attacker heap-sprays the freed memory with controlled data before ' +
+      'the callback runs, the callback operates on attacker-chosen values — typically corrupting a function pointer ' +
+      'or dispatching through an attacker-supplied vtable for arbitrary code execution. The asynchronous, time-delayed ' +
+      'nature makes this class uniquely dangerous: the free and use happen in different execution contexts (process vs ' +
+      'softirq/workqueue), making the race window wide and deterministic without tight timing requirements. ' +
+      'CVE-2021-0920 (Linux AF_UNIX garbage collection, CVSS 6.4) was exploited in the wild on Android devices: ' +
+      'a race between close() and the AF_UNIX garbage collector\'s deferred reclaim allowed a UAF on socket inflight ' +
+      'file descriptors — the freed socket structure was reclaimed by a heap spray, and the garbage collector\'s ' +
+      'callback operated on attacker-controlled data for kernel code execution. Google TAG confirmed active exploitation ' +
+      'targeting Android as an in-the-wild zero-day. CVE-2024-1085 (netfilter nf_tables, CVSS 7.8) triggered when the ' +
+      'nft_setelem_catchall_deactivate() function freed a catch-all set element that was still referenced by the next ' +
+      'generation — the deferred cleanup callback fired on the freed element, enabling unprivileged local privilege ' +
+      'escalation to root on kernels 5.13 through 6.7. CVE-2022-0995 (Linux watch_queue, CVSS 7.8) exposed the ' +
+      'same pattern: a notification filter\'s cleanup work raced with pipe destruction, yielding kernel code ' +
+      'execution from unprivileged user namespaces. ' +
+      'In the assembly, movl stores the handler and data into TimerObj stack slots; destroy\'s movl zeroes them ' +
+      '(simulating kfree); the sprayer\'s movl writes 0xDEADBEEF into those same offsets before the timer fires — ' +
+      'fire_callback\'s addl sums the attacker-controlled handler and data, which in a real kernel becomes an indirect ' +
+      'call through a corrupted function pointer to attacker-sprayed code.',
+    code:
+`# CVE pattern: timer fires after kfree — callback hits attacker-sprayed slot
+class TimerObj:
+    def __init__(self, handler, interval):
+        self.handler = handler
+        self.interval = interval
+        self.data = 0
+        self.freed = 0
+
+    def arm(self, callback_data):
+        self.data = callback_data
+        return self.data
+
+    def destroy(self):
+        self.handler = 0
+        self.data = 0
+        self.freed = 1
+        return self.freed
+
+class TimerWheel:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.pending = 0
+        self.fired = 0
+
+    def schedule(self, obj):
+        self.pending += 1
+        return self.pending
+
+    def fire_callback(self, obj):
+        result = obj.handler + obj.data
+        self.fired += 1
+        return result
+
+class HeapSprayer:
+    def __init__(self, payload):
+        self.payload = payload
+        self.count = 0
+
+    def spray(self, target, rounds):
+        i = 0
+        while i < rounds:
+            self.count += 1
+            i += 1
+        target.handler = self.payload
+        target.data = self.payload
+        return self.count
+
+timer_obj = TimerObj(4196352, 100)
+timer_obj.arm(256)
+wheel = TimerWheel(64)
+wheel.schedule(timer_obj)
+timer_obj.destroy()
+sprayer = HeapSprayer(3735928559)
+sprayer.spray(timer_obj, 4)
+hijacked = wheel.fire_callback(timer_obj)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the original handler and data into TimerObj stack slots; destroy\'s movl zeroes them (simulating kfree) but the timer wheel retains a stale reference — the sprayer\'s movl overwrites the freed slots with 0xDEADBEEF before fire_callback\'s addl sums the attacker-controlled values, which in a real kernel becomes an indirect call through a corrupted function pointer in the recycled memory slot',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
