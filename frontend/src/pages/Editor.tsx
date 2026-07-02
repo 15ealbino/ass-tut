@@ -4345,6 +4345,88 @@ print(hijacked)
       description: 'movl stores the original handler and data into TimerObj stack slots; destroy\'s movl zeroes them (simulating kfree) but the timer wheel retains a stale reference — the sprayer\'s movl overwrites the freed slots with 0xDEADBEEF before fire_callback\'s addl sums the attacker-controlled values, which in a real kernel becomes an indirect call through a corrupted function pointer in the recycled memory slot',
     },
   },
+  {
+    id: 'zenbleed-regfile',
+    name: 'ZENBLEED REGISTER LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Speculative vzeroupper rollback fails to restore register state, leaking cross-process data from the shared CPU register file.',
+    explanation:
+      'Zenbleed (CVE-2023-20593 / CWE-1303) exploits a microarchitectural bug in AMD Zen 2 processors: the ' +
+      'vzeroupper instruction zeroes the upper 128 bits of YMM registers to optimize AVX-to-SSE transitions. ' +
+      'When vzeroupper is speculatively executed but the branch mispredicts and rolls back, the Zen 2 register ' +
+      'rename logic fails to properly restore the register\'s prior state — the physical register entry is left ' +
+      'in an undefined state containing data from a different process, thread, or virtual machine that previously ' +
+      'used the same physical register. Crucially, this is not a timing attack or side-channel: the stale register ' +
+      'contents can be read directly by unprivileged code at up to 30 KB per core per second — fast enough to ' +
+      'capture AES keys, passwords, authentication cookies, and session tokens from any workload sharing the ' +
+      'same physical core. Discovered by Tavis Ormandy of Google Project Zero in July 2023, Zenbleed affects ' +
+      'all AMD Zen 2 CPUs: Ryzen 3000/4000 desktop and laptop processors, Threadripper PRO 3000, and EPYC ' +
+      '"Rome" server chips deployed across AWS, Azure, and GCP. Unlike Spectre, no victim cooperation, shared ' +
+      'address space, or cache probing is needed — the attacker simply polls the register file from an ' +
+      'unprivileged process. The specific trigger sequence is vcvtsi2ss/vmovupd/vzeroupper, where overlapping ' +
+      'XMM and YMM register dependencies cause the rollback to leave the YMM register in an undefined state. ' +
+      'AMD issued microcode fix AGESA ComboAM4v2PI 1.2.0.Ca (chicken bit DE_CFG[9]) with no measurable ' +
+      'performance impact, but unpatched systems remain fully exposed. ' +
+      'In the assembly, movl stores the victim\'s AES key and session token into stack slots representing the ' +
+      'register file; spec_vzeroupper\'s movl zeroes them but rollback\'s movl restores the stale values — ' +
+      'the attacker\'s addl in sample_register sums the leaked register contents without any cache timing or ' +
+      'shared memory, directly observing cross-process secrets from the physical register file.',
+    code:
+`# CVE pattern: vzeroupper rollback leaks stale register data cross-process
+class RegisterFile:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.ymm0_lo = 0
+        self.ymm0_hi = 0
+        self.ymm1_lo = 0
+        self.ymm1_hi = 0
+        self.rename_valid = 1
+
+    def load_victim_data(self, key, token):
+        self.ymm0_hi = key
+        self.ymm1_hi = token
+        return self.ymm0_hi + self.ymm1_hi
+
+    def spec_vzeroupper(self):
+        self.ymm0_hi = 0
+        self.ymm1_hi = 0
+        self.rename_valid = 0
+        return self.rename_valid
+
+    def rollback(self, stale_key, stale_token):
+        if self.rename_valid == 0:
+            self.ymm0_hi = stale_key
+            self.ymm1_hi = stale_token
+            self.rename_valid = 1
+        return self.rename_valid
+
+class Attacker:
+    def __init__(self, core_id):
+        self.core_id = core_id
+        self.leaked = 0
+        self.samples = 0
+
+    def sample_register(self, regfile):
+        self.leaked = regfile.ymm0_hi + regfile.ymm1_hi
+        self.samples += 1
+        return self.leaked
+
+regfile = RegisterFile(16)
+aes_key = 3405691582
+session_tok = 3735928559
+regfile.load_victim_data(aes_key, session_tok)
+regfile.spec_vzeroupper()
+regfile.rollback(aes_key, session_tok)
+attacker = Attacker(0)
+leaked = attacker.sample_register(regfile)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the victim\'s AES key (0xCAFEBABE) and session token (0xDEADBEEF) into register-file stack slots; spec_vzeroupper\'s movl zeroes them but rollback\'s movl restores the stale values — the attacker\'s addl in sample_register sums the leaked register contents without any cache timing or shared memory, directly observing cross-process secrets from the physical register file',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
