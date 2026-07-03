@@ -4427,6 +4427,77 @@ print(leaked)
       description: 'movl stores the victim\'s AES key (0xCAFEBABE) and session token (0xDEADBEEF) into register-file stack slots; spec_vzeroupper\'s movl zeroes them but rollback\'s movl restores the stale values — the attacker\'s addl in sample_register sums the leaked register contents without any cache timing or shared memory, directly observing cross-process secrets from the physical register file',
     },
   },
+  {
+    id: 'use-before-init',
+    name: 'USE-BEFORE-INITIALIZATION',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Conditional branch skips variable initialization; attacker stack-sprays the prior frame so the uninitialized variable inherits a controlled value used as a function pointer.',
+    explanation:
+      'Use-before-initialization (CWE-457) occurs when a variable is declared but a conditional code path ' +
+      'skips its assignment, leaving it with whatever garbage value occupies that stack slot from a prior call ' +
+      'frame. Unlike uninitialized buffer reads (CWE-908), which leak stale data passively, use-before-init ' +
+      'lets the attacker CONTROL the uninitialized value via targeted stack spraying: a prior syscall ' +
+      'deliberately places a payload (e.g. a shellcode address) at the exact stack offset the vulnerable ' +
+      'function\'s local variable will occupy. When the branch skips initialization, the variable inherits the ' +
+      'sprayed value — if it\'s used as a function pointer, array index, or allocation size, the attacker gains ' +
+      'code execution or arbitrary memory access. ' +
+      'CVE-2025-20766 (MediaTek display subsystem, CVSS 7.8) exploited an uninitialized variable in the display ' +
+      'driver to achieve local privilege escalation across 30+ chipset models without user interaction. ' +
+      'CVE-2025-29952 (AMD SEV firmware) exploited CWE-457 to corrupt Reverse Map Table memory, compromising ' +
+      'guest VM integrity from a privileged host context. Research presented at NDSS 2017 ("Unleashing ' +
+      'Use-Before-Initialization Vulnerabilities in the Linux Kernel Using Targeted Stack Spraying") demonstrated ' +
+      'that deterministic stack spraying — combining symbolic execution with guided fuzzing to identify kernel ' +
+      'inputs that leave attacker-controlled data at specific stack offsets — could weaponize eight kernel ' +
+      'uninitialized-variable CVEs, converting low-CVSS information leaks into reliable privilege escalation. ' +
+      'In the assembly, movl loads the spray payload (0xDEADBEEF) from the StackRegion into the fn_ptr slot; ' +
+      'cmpl checks cmd against 42 but when cmd==0 the conditional branch skips the safe movl that would ' +
+      'overwrite fn_ptr with a legitimate address — addl then uses the stale spray value directly as a ' +
+      'function pointer offset, giving the attacker deterministic code execution.',
+    code:
+`# CVE pattern: branch skips init — stack-sprayed value used as fn_ptr
+class StackRegion:
+    def __init__(self, size):
+        self.size = size
+        self.frame0 = 0
+        self.frame1 = 0
+        self.frame2 = 0
+        self.sprayed = 0
+
+    def spray_via_syscall(self, payload, rounds):
+        self.frame0 = payload
+        self.frame1 = payload
+        self.frame2 = payload
+        i = 0
+        while i < rounds:
+            self.sprayed += 1
+            i += 1
+        return self.sprayed
+
+class VulnIoctl:
+    def __init__(self, stack):
+        self.fn_ptr = stack.frame0
+        self.initialized = 0
+        self.result = 0
+
+    def handle(self, cmd, arg):
+        if cmd == 42:
+            self.fn_ptr = 4196352
+            self.initialized = 1
+        self.result = self.fn_ptr + arg
+        return self.result
+
+region = StackRegion(8192)
+region.spray_via_syscall(3735928559, 4)
+handler = VulnIoctl(region)
+hijacked = handler.handle(0, 256)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl loads the spray payload (0xDEADBEEF) from the prior frame into the fn_ptr stack slot during VulnIoctl construction; cmpl checks cmd against 42 but the conditional branch skips the safe movl that would overwrite fn_ptr with a legitimate address — addl then uses the stale attacker-sprayed value as a function pointer offset, giving the attacker code execution via deterministic stack spraying',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
