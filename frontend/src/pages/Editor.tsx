@@ -4498,6 +4498,71 @@ print(hijacked)
       description: 'movl loads the spray payload (0xDEADBEEF) from the prior frame into the fn_ptr stack slot during VulnIoctl construction; cmpl checks cmd against 42 but the conditional branch skips the safe movl that would overwrite fn_ptr with a legitimate address — addl then uses the stale attacker-sprayed value as a function pointer offset, giving the attacker code execution via deterministic stack spraying',
     },
   },
+  {
+    id: 'auth-bypass',
+    name: 'AUTHORIZATION BYPASS',
+    severity: 'CRITICAL',
+    category: 'Access Control',
+    description: 'Missing role check after authentication lets any logged-in user reach admin endpoints, creating unauthorized accounts or exfiltrating sensitive data.',
+    explanation:
+      'Authorization bypass (CWE-862 / CWE-863) occurs when an application verifies that a user is authenticated ' +
+      '(valid session token) but fails to verify that the authenticated user is authorized (correct role or permission) ' +
+      'for the requested action. The attacker authenticates as a low-privileged user, then directly accesses admin-only ' +
+      'endpoints — creating administrator accounts, modifying configurations, or exfiltrating sensitive data. ' +
+      'CWE-862 (Missing Authorization) ranks in the 2025 CWE Top 25 Most Dangerous Software Weaknesses and ' +
+      'Broken Access Control holds the #1 position in the OWASP Top 10. ' +
+      'CVE-2023-22515 (Atlassian Confluence, CVSS 10.0) allowed unauthenticated remote attackers to create unauthorized ' +
+      'administrator accounts by accessing the server setup endpoint directly — exploited as a zero-day by nation-state ' +
+      'actors before the patch and added to CISA\'s Known Exploited Vulnerabilities catalog. CVE-2024-0204 (Fortra ' +
+      'GoAnywhere MFT, CVSS 9.8) let any user create an admin account via the administration portal by navigating to ' +
+      'the initial setup wizard path, bypassing all role checks entirely. CVE-2024-57726 (SimpleHelp, CISA KEV 2026) ' +
+      'allowed low-privileged technicians to create API keys with server-admin permissions, escalating from a ' +
+      'constrained support role to full platform control. ' +
+      'In the assembly, cmpl checks only token validity (session.valid == 1) but no subsequent cmpl verifies ' +
+      'role_level >= required_role — the branch jumps directly to the movl that returns sensitive data, skipping ' +
+      'the authorization gate entirely. The absence of a second comparison instruction is the vulnerability itself.',
+    code:
+`# CVE pattern: authn without authz — low-priv user reaches admin endpoint
+class Session:
+    def __init__(self, user_id, role_level):
+        self.user_id = user_id
+        self.role_level = role_level
+        self.token = user_id * 1337
+        self.valid = 1
+
+class AdminPanel:
+    def __init__(self, required_role):
+        self.required_role = required_role
+        self.secret_config = 3405691582
+        self.user_records = 3735928559
+        self.accessed_by = 0
+
+    def check_auth(self, session):
+        if session.valid == 1:
+            self.accessed_by = session.user_id
+        return self.accessed_by
+
+    def get_records(self, record_id):
+        if record_id == 0:
+            result = self.secret_config
+        elif record_id == 1:
+            result = self.user_records
+        else:
+            result = 0
+        return result
+
+panel = AdminPanel(100)
+attacker = Session(42, 1)
+panel.check_auth(attacker)
+stolen = panel.get_records(0)
+total = stolen + attacker.role_level
+print(total)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks session.valid == 1 (authentication) but no subsequent cmpl verifies role_level >= required_role (authorization) — the branch jumps directly past the missing authz gate; movl returns secret_config (0xCAFEBABE) to the attacker\'s low-privilege session, granting full admin data access without role verification',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
