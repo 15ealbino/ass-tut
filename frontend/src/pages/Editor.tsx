@@ -4563,6 +4563,79 @@ print(total)
       description: 'cmpl checks session.valid == 1 (authentication) but no subsequent cmpl verifies role_level >= required_role (authorization) — the branch jumps directly past the missing authz gate; movl returns secret_config (0xCAFEBABE) to the attacker\'s low-privilege session, granting full admin data access without role verification',
     },
   },
+  {
+    id: 'supply-chain-backdoor',
+    name: 'SUPPLY CHAIN BACKDOOR',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'A trojanized library function contains a hidden trigger that redirects control flow to execute attacker-controlled payloads when a magic value is detected in input.',
+    explanation:
+      'Supply chain backdoors (CWE-506 Embedded Malicious Code) are inserted into trusted libraries by compromised maintainers ' +
+      'or build systems, lying dormant until a specific trigger activates the payload. The canonical example is CVE-2024-3094 ' +
+      '(XZ Utils, CVSS 10.0): a multi-year social engineering campaign planted IFUNC resolvers in liblzma that hooked ' +
+      'OpenSSH\'s RSA_public_decrypt at library load time. When sshd called the hooked function, the backdoor checked the RSA ' +
+      'modulus for an Ed448 signature matching the attacker\'s private key — if valid, it executed the decrypted payload via ' +
+      'system() before authentication completed, granting full remote code execution to anyone holding the key. Build-system ' +
+      'guards ensured the payload only activated on x86-64 glibc systems using dpkg or rpm, evading detection on other platforms. ' +
+      'Similarly, CVE-2021-44228 (Log4Shell, CVSS 10.0) turned a ubiquitous logging library into an RCE vector via JNDI lookup ' +
+      'strings embedded in user input. The supply chain attack surface extends to package registries (event-stream/CVE-2018-16492, ' +
+      'ua-parser-js/CVE-2022-25927) and build pipelines (SolarWinds/CVE-2020-14005). ' +
+      'In the assembly, a cmpl against a magic constant (the trigger value) gates a conditional jump: if the comparison matches, ' +
+      'execution branches to movl instructions that load the hidden payload address into a register and call it — otherwise the ' +
+      'benign path continues normally, making the backdoor invisible during ordinary operation.',
+    code:
+`# CVE pattern: library IFUNC hook with magic-value trigger (XZ/CVE-2024-3094 style)
+class CryptoLib:
+    def __init__(self, version):
+        self.version = version
+        self.hook_installed = 0
+        self.calls_processed = 0
+        self.payload_addr = 3735929054
+        self.magic_trigger = 3405691582
+
+    def install_hook(self, target_func):
+        if self.version == 56001:
+            self.hook_installed = 1
+        return self.hook_installed
+
+    def decrypt(self, modulus, key_id):
+        self.calls_processed += 1
+        result = 0
+        if self.hook_installed == 1:
+            if modulus == self.magic_trigger:
+                result = self.payload_addr
+            else:
+                result = modulus * 2
+        else:
+            result = modulus * 2
+        return result
+
+class Server:
+    def __init__(self, lib):
+        self.lib = lib
+        self.auth_count = 0
+
+    def handle_connection(self, client_key):
+        decrypted = self.lib.decrypt(client_key, 0)
+        if decrypted == self.lib.payload_addr:
+            self.auth_count += 99
+        else:
+            self.auth_count += 1
+        return self.auth_count
+
+lib = CryptoLib(56001)
+lib.install_hook(0)
+srv = Server(lib)
+normal = srv.handle_connection(12345)
+backdoor = srv.handle_connection(3405691582)
+total = normal + backdoor
+print(total)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'je', 'movl'],
+      description: 'cmpl compares the modulus argument against the magic trigger constant (0xCAFEBABE); je branches to the backdoor path only when the attacker\'s crafted input matches — movl then loads the payload address (0xDEAD_C0DE) into the return register, redirecting execution to attacker-controlled code while all other inputs follow the benign decryption path undetected',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
