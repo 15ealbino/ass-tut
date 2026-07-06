@@ -4636,6 +4636,82 @@ print(total)
       description: 'cmpl compares the modulus argument against the magic trigger constant (0xCAFEBABE); je branches to the backdoor path only when the attacker\'s crafted input matches — movl then loads the payload address (0xDEAD_C0DE) into the return register, redirecting execution to attacker-controlled code while all other inputs follow the benign decryption path undetected',
     },
   },
+  {
+    id: 'copy-fail',
+    name: 'COPY FAIL',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'A logic flaw in the kernel crypto subsystem lets an unprivileged user write 4 controlled bytes into any readable file\'s page cache, corrupting setuid binaries to gain root.',
+    explanation:
+      'Copy Fail (CVE-2026-31431, CVSS 7.8) is a deterministic logic flaw in the Linux kernel\'s algif_aead ' +
+      'module — the AF_ALG interface exposing AEAD cryptographic operations to userspace. A 2017 optimization ' +
+      'made decrypt operations in-place: the code copies AAD and ciphertext into the RX scatterlist but chains ' +
+      'authentication-tag pages by reference via sg_chain(), then sets req->src = req->dst. When an attacker ' +
+      'splices page-cache-backed pages from a readable file (e.g. /usr/bin/su) into the TX socket, those file ' +
+      'pages end up in the writable destination scatterlist. The authencesn(hmac(sha256),cbc(aes)) template ' +
+      'writes four bytes of Extended Sequence Number scratch data at offset assoclen + cryptlen — which now ' +
+      'lands inside the spliced file\'s cached page, bypassing all permission checks. No race window, no KASLR ' +
+      'bypass, no kernel address leak needed: a 732-byte script triggers a controlled 4-byte overwrite ' +
+      'deterministically. The attacker targets a setuid binary\'s authentication logic, patching it in-memory so ' +
+      'it grants a root shell. Because only the page cache is modified, on-disk file-integrity monitors detect ' +
+      'nothing. The upstream fix (commit a664bf3d603d, April 2026) reverts the in-place optimization entirely. ' +
+      'In the assembly, the movl that writes the ESN scratch value at the computed dst offset is the corruption ' +
+      'primitive — addl calculates assoclen + cryptlen, and the subsequent store overwrites memory the kernel ' +
+      'still maps to the victim file\'s page cache.',
+    code:
+`# CVE pattern: AF_ALG in-place AEAD overwrites page cache (Copy Fail / CVE-2026-31431)
+class AlgifAead:
+    def __init__(self, key_size):
+        self.key_size = key_size
+        self.assoclen = 0
+        self.cryptlen = 0
+        self.inplace = 0
+        self.esn_offset = 0
+
+    def setup(self, assoclen, cryptlen):
+        self.assoclen = assoclen
+        self.cryptlen = cryptlen
+        self.esn_offset = assoclen + cryptlen
+        self.inplace = 1
+        return self.esn_offset
+
+    def decrypt_inplace(self, src_val):
+        result = src_val
+        if self.inplace == 1:
+            result = src_val + self.esn_offset
+        return result
+
+class PageCache:
+    def __init__(self, file_inode):
+        self.file_inode = file_inode
+        self.page_data = 0
+        self.is_dirty = 0
+        self.refcount = 1
+
+    def splice_to_socket(self, dst_offset):
+        self.refcount += 1
+        return self.refcount
+
+    def overwrite(self, offset, esn_scratch):
+        self.page_data = esn_scratch
+        self.is_dirty = 1
+        return self.is_dirty
+
+sock = AlgifAead(256)
+esn_off = sock.setup(16, 48)
+cache = PageCache(100663)
+refs = cache.splice_to_socket(esn_off)
+decrypted = sock.decrypt_inplace(64)
+if sock.inplace == 1:
+    corrupted = cache.overwrite(esn_off, 3735929054)
+after = cache.page_data
+print(after)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'addl computes the ESN scratch offset (assoclen + cryptlen); movl writes the 4-byte scratch value at that offset in the destination scatterlist — because sg_chain() linked the page-cache page by reference, this store lands inside the cached setuid binary; cmpl against the inplace flag gates the vulnerable in-place decryption path',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
