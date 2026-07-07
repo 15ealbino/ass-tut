@@ -4712,6 +4712,80 @@ print(after)
       description: 'addl computes the ESN scratch offset (assoclen + cryptlen); movl writes the 4-byte scratch value at that offset in the destination scatterlist — because sg_chain() linked the page-cache page by reference, this store lands inside the cached setuid binary; cmpl against the inplace flag gates the vulnerable in-place decryption path',
     },
   },
+  {
+    id: 'canary-leak',
+    name: 'STACK CANARY LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Out-of-bounds read or format specifier leaks the stack canary, letting the attacker craft overflow payloads that pass __stack_chk_fail verification.',
+    explanation:
+      'Stack canaries (SSP / __stack_chk_guard / CWE-200 adjacent) are random sentinel values placed between ' +
+      'local buffers and saved registers on each stack frame. Before returning, the function epilogue compares ' +
+      'the canary against the original value loaded from %fs:0x28 (thread-local storage on x86-64) — if they ' +
+      'differ, __stack_chk_fail aborts the process, blocking naive stack smashing. However, a separate ' +
+      'information-disclosure primitive — a format string %p leak, an out-of-bounds read, or a partial ' +
+      'overwrite that leaves the canary intact — can reveal the sentinel to the attacker. With the canary ' +
+      'known, the overflow payload includes the correct value at the exact stack offset, and the epilogue\'s ' +
+      'comparison passes silently, allowing the overwritten return address to redirect execution. ' +
+      'In fork-and-accept servers (Apache prefork, OpenSSH), child processes inherit the parent\'s canary, ' +
+      'enabling byte-by-byte brute force — only 256 × 8 = 2048 attempts to recover the full 64-bit value. ' +
+      'CVE-2023-6246 (glibc __vsyslog_internal heap overflow, CVSS 8.4) required canary bypass for its ' +
+      'local privilege escalation chain on Debian 12, Ubuntu 23.04/23.10, and Fedora 37–38. CVE-2025-32756 ' +
+      '(Fortinet stack overflow, CVSS 9.8) was actively exploited in the wild where canary values were ' +
+      'recoverable via adjacent format-string disclosure. A 2018 EURECOM study ("Smashing the Stack ' +
+      'Protector for Fun and Profit") demonstrated a generic attack vector bypassing canaries on multi-threaded ' +
+      'Linux software by overwriting the TLS-stored master canary from an adjacent thread\'s stack overflow. ' +
+      'GCC\'s -fstack-protector-strong only instruments functions containing character arrays or address-taken ' +
+      'locals, leaving many functions entirely unprotected. ' +
+      'In the assembly, `movl` loads the canary from the guard slot during leak_past_buf; the overflow\'s ' +
+      '`movl` writes the leaked value back at the same stack offset; `cmpl` in check_canary compares them — ' +
+      'the match lets `ret` execute with the attacker\'s overwritten return address, redirecting control ' +
+      'flow to libc system() despite stack protection being enabled.',
+    code:
+`# CVE pattern: OOB read leaks canary — crafted overflow passes __stack_chk
+class ProtectedFrame:
+    def __init__(self, buf_val, guard):
+        self.buf = buf_val
+        self.canary = guard
+        self.saved_rbp = 4196352
+        self.ret_addr = 4196608
+        self.check_ok = 0
+
+    def leak_past_buf(self, index):
+        if index == 0:
+            result = self.buf
+        elif index == 1:
+            result = self.canary
+        elif index == 2:
+            result = self.saved_rbp
+        else:
+            result = self.ret_addr
+        return result
+
+    def overflow(self, data, canary_val, ret):
+        self.buf = data
+        self.canary = canary_val
+        self.saved_rbp = 1094795585
+        self.ret_addr = ret
+        return self.ret_addr
+
+    def check_canary(self, original):
+        if self.canary == original:
+            self.check_ok = 1
+        return self.check_ok
+
+frame = ProtectedFrame(256, 305419896)
+stolen = frame.leak_past_buf(1)
+frame.overflow(3735928559, stolen, 4151632)
+passed = frame.check_canary(305419896)
+hijacked = frame.ret_addr + passed
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl in leak_past_buf reads the canary value (0x12345678) from the guard stack slot; the overflow\'s movl writes the leaked value back at the same offset; cmpl in check_canary compares them and the match lets execution continue — the attacker\'s ret_addr (libc system) is loaded by the final movl, hijacking control flow despite -fstack-protector-strong',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
