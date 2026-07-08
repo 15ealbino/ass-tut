@@ -4786,6 +4786,86 @@ print(hijacked)
       description: 'movl in leak_past_buf reads the canary value (0x12345678) from the guard stack slot; the overflow\'s movl writes the leaked value back at the same offset; cmpl in check_canary compares them and the match lets execution continue — the attacker\'s ret_addr (libc system) is loaded by the final movl, hijacking control flow despite -fstack-protector-strong',
     },
   },
+  {
+    id: 'seh-overwrite',
+    name: 'EXCEPTION HANDLER HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Buffer overflow overwrites stack-resident exception handler records, redirecting exception dispatch to attacker code while bypassing stack canaries entirely.',
+    explanation:
+      'Structured Exception Handler overwrite (CWE-121 / CWE-460) exploits the stack-resident exception handler ' +
+      'chain that Windows (SEH) and C++ runtimes maintain for stack unwinding. Each stack frame registers an exception ' +
+      'record — a {next, handler} pair — linked into a singly-linked list anchored at the Thread Information Block ' +
+      '(FS:[0] on x86, GS:[0] on x86-64). When an exception fires (access violation, divide-by-zero, or any hardware ' +
+      'fault), the dispatcher walks the chain and calls each handler until one handles the exception. A buffer overflow ' +
+      'that reaches the SEH records overwrites the handler pointer with a shellcode or gadget address; the attacker then ' +
+      'triggers an exception — often the overflow itself touching an unmapped page — and the dispatcher jumps to ' +
+      'attacker-controlled code. The critical insight: stack canaries (__stack_chk_guard) are verified only in the ' +
+      'function epilogue (before ret), but SEH dispatch occurs during execution when the exception fires — before ' +
+      'the canary check ever runs — so the entire stack protection mechanism is bypassed. ' +
+      'CVE-2017-11882 (Microsoft Equation Editor, CVSS 7.8) is the defining example: a 40-byte stack buffer overflow ' +
+      'in EQNEDT32.EXE allowed overwriting the SEH chain and return address — with no ASLR, DEP, or SafeSEH compiled ' +
+      'into the binary, exploitation was trivial via malicious Office documents. Lazarus Group, APT28, and dozens of ' +
+      'cybercrime operations weaponized this CVE for years after disclosure, making it one of the most exploited Office ' +
+      'vulnerabilities in history. CVE-2009-1535 (IIS 6.0 WebDAV) was the classic network-facing SEH overwrite enabling ' +
+      'remote code execution on web servers. On Linux, GCC-generated .eh_frame DWARF unwind tables contain personality ' +
+      'routine function pointers serving the same role; corruption of these tables redirects C++ exception unwinding to ' +
+      'attacker-chosen addresses. Microsoft introduced SafeSEH (validating handlers against a compile-time whitelist) ' +
+      'and SEHOP (verifying chain integrity via a sentinel record at the tail), but binaries compiled without /SAFESEH ' +
+      'or legacy 32-bit software remain fully vulnerable. ' +
+      'In the assembly, movl stores the legitimate handler address into the SEH record stack slot during construction; ' +
+      'the overflow loop\'s addl spills past buf_cap — movl then overwrites the handler slot with 0xDEADBEEF; ' +
+      'dispatch_exception\'s addl combines the hijacked handler with the chain pointer for execution; cmpl in ' +
+      'canary_check verifies the canary AFTER the exception has already dispatched, demonstrating why SEH overwrite ' +
+      'bypasses stack protection entirely.',
+    code:
+`# CVE pattern: overflow corrupts SEH record — exception dispatch bypasses canary
+class SEHRecord:
+    def __init__(self, handler, next_ptr):
+        self.handler = handler
+        self.next_ptr = next_ptr
+        self.dispatched = 0
+
+    def dispatch_exception(self):
+        result = self.handler + self.next_ptr
+        self.dispatched = 1
+        return result
+
+class StackFrame:
+    def __init__(self, buf_cap, canary):
+        self.buf_cap = buf_cap
+        self.buf_data = 0
+        self.canary = canary
+        self.spill = 0
+
+    def overflow(self, value, count):
+        i = 0
+        while i < count:
+            self.buf_data += value
+            if i >= self.buf_cap:
+                self.spill += 1
+            i += 1
+        return self.spill
+
+    def canary_check(self, original):
+        if self.canary == original:
+            return 1
+        return 0
+
+seh = SEHRecord(4196352, 4196608)
+frame = StackFrame(8, 305419896)
+frame.overflow(16, 12)
+seh.handler = 3735928559
+hijacked = seh.dispatch_exception()
+passed = frame.canary_check(305419896)
+result = hijacked + passed
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'movl stores the legitimate handler address (0x400800) into the SEH record stack slot during construction; the overflow loop\'s addl spills past buf_cap — movl overwrites the handler slot with 0xDEADBEEF; dispatch_exception\'s addl combines the hijacked handler with the chain pointer; cmpl in canary_check verifies the canary AFTER the exception has already dispatched, demonstrating why SEH overwrite bypasses stack protection entirely',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
