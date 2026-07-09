@@ -4866,6 +4866,80 @@ print(result)
       description: 'movl stores the legitimate handler address (0x400800) into the SEH record stack slot during construction; the overflow loop\'s addl spills past buf_cap — movl overwrites the handler slot with 0xDEADBEEF; dispatch_exception\'s addl combines the hijacked handler with the chain pointer; cmpl in canary_check verifies the canary AFTER the exception has already dispatched, demonstrating why SEH overwrite bypasses stack protection entirely',
     },
   },
+  {
+    id: 'dirty-clone',
+    name: 'DIRTYCLONE SKB FLAG LOSS',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Packet cloning drops the SKBFL_SHARED_FRAG safety flag, letting IPsec decrypt in-place into the page cache and silently overwrite setuid binaries for root.',
+    explanation:
+      'DirtyClone (CVE-2026-43503 / CWE-416, CVSS 8.8) exploits a flag-propagation flaw in the Linux kernel\'s ' +
+      'skbuff networking stack. The kernel tags any sk_buff holding page-cache-backed fragment references with the ' +
+      'SKBFL_SHARED_FRAG flag — skb_has_shared_frag() reads this tag to decide whether a payload can be mutated ' +
+      'in place. The bug: __pskb_copy_fclone() silently drops the flag when cloning a packet. A netfilter TEE rule ' +
+      '(which duplicates packets internally via __pskb_copy_fclone) creates a cloned skb that references a ' +
+      'page-cache page from /usr/bin/su but reports nothing is shared. The cloned skb reaches esp_input() where ' +
+      'IPsec decrypts the payload directly into the buffer — which still maps the page cache page. By manipulating ' +
+      'the AES-CBC key, IV, and packet layout, the attacker computes ciphertext that decrypts into specific bytes, ' +
+      'patching the authentication logic of su in memory. The next execution of su uses the modified cached page ' +
+      'and grants root without a password. Because page cache is shared at the host level but capabilities are ' +
+      'namespaced, an unprivileged user with user-namespace access (default on Debian and Fedora) can trigger the ' +
+      'clone path. Discovered by JFrog Security Research and disclosed June 2026, the fix was merged as commit ' +
+      '48f6a5356a33 in Linux v7.1-rc5 (May 24, 2026). File integrity tools that hash on-disk files report no change ' +
+      'because DirtyClone corrupts only the in-memory page cache, never touching disk. ' +
+      'In the assembly, movl sets the shared_frag flag to 1 on the original skb; clone_packet\'s movl copies the ' +
+      'payload but does NOT copy the flag — cmpl in decrypt_inplace checks shared_frag == 0 on the clone and the ' +
+      'branch allows movl to overwrite page_data with the decrypted payload (0xDEADBEEF), silently corrupting the ' +
+      'page cache of the setuid binary.',
+    code:
+`# CVE pattern: skb clone drops SHARED_FRAG — IPsec writes page cache
+class SkBuff:
+    def __init__(self, data, frag_page):
+        self.data = data
+        self.frag_page = frag_page
+        self.shared_frag = 1
+        self.cloned = 0
+
+    def clone_packet(self):
+        clone = SkBuff(self.data, self.frag_page)
+        clone.shared_frag = 0
+        clone.cloned = 1
+        return clone
+
+class PageCache:
+    def __init__(self, inode, data):
+        self.inode = inode
+        self.data = data
+        self.dirty = 0
+
+    def read(self):
+        result = self.data + self.inode
+        return result
+
+class EspDecryptor:
+    def __init__(self, key):
+        self.key = key
+        self.decrypted = 0
+
+    def decrypt_inplace(self, skb, cache, payload):
+        if skb.shared_frag == 0:
+            cache.data = payload
+            self.decrypted = 1
+        return self.decrypted
+
+su_page = PageCache(4196352, 1094795585)
+original = SkBuff(256, su_page.data)
+clone = original.clone_packet()
+esp = EspDecryptor(305419896)
+esp.decrypt_inplace(clone, su_page, 3735928559)
+hijacked = su_page.read()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl sets shared_frag=1 on the original skb, but clone_packet\'s movl copies the payload without the flag — cmpl in decrypt_inplace checks shared_frag == 0 on the clone and the branch allows movl to overwrite page_data with the decrypted payload (0xDEADBEEF), silently corrupting the page cache of /usr/bin/su without touching disk',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
