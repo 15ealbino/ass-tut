@@ -11,6 +11,7 @@ import tempfile
 from functools import partial
 from typing import Dict, List, Tuple
 
+from app.metrics import build_expansion_metrics
 from app.transpiler import TranspileError, build_line_map, transpile
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,7 @@ async def compile_python(python_source: str) -> dict:
 
     c_to_asm, filtered_asm = _parse_asm_line_map(asm_text)
     line_map = build_line_map(lines, py_to_c, c_to_asm)
+    metrics = build_expansion_metrics(line_map)
 
     return {
         "python_lines": lines,
@@ -152,4 +154,5 @@ async def compile_python(python_source: str) -> dict:
         "asm_code": filtered_asm,
         "asm_lines": filtered_asm.splitlines(),
         "line_map": line_map,
+        "metrics": metrics,
     }

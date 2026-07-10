@@ -5521,11 +5521,37 @@ export default function EditorPage() {
           }}>
             TRACE::
           </span>
+          {result.metrics && result.metrics.total_asm_instructions > 0 && (
+            <span
+              title={
+                `${result.metrics.total_asm_instructions} asm instructions total · ` +
+                `avg ${result.metrics.mean_asm_per_line}/line · ` +
+                `${result.metrics.hotspots.length} hotspot(s) ≥ ${result.metrics.hotspot_threshold} instr`
+              }
+              style={{
+                fontSize: 9,
+                color: 'var(--text-dim)',
+                letterSpacing: '0.08em',
+                marginRight: 8,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              COST:: {result.metrics.total_asm_instructions} INSTR
+              {result.metrics.hotspots.length > 0 && (
+                <span style={{ color: '#FF6B6B', marginLeft: 6 }}>
+                  ⚠ {result.metrics.hotspots.length} HOT
+                </span>
+              )}
+            </span>
+          )}
           {result.python_lines.map((line, i) => {
             const pyLine = i + 1
             const mapping = result.line_map[pyLine] as LineMapping | undefined
             if (!mapping) return null
             const isActive = activePyLine === pyLine
+            const asmCount = mapping.asm_count ?? mapping.asm_lines.length
+            const threshold = result.metrics?.hotspot_threshold ?? Infinity
+            const isHotspot = asmCount >= threshold
             return (
               <button
                 key={pyLine}
@@ -5546,9 +5572,23 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line}`}
+                title={
+                  `Line ${pyLine}: ${line}\n` +
+                  `→ ${asmCount} asm instruction(s)` +
+                  (isHotspot ? ' — HOTSPOT (heavy expansion)' : '')
+                }
               >
+                {isHotspot && <span style={{ color: '#FF6B6B' }}>⚠ </span>}
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
+                {asmCount > 0 && (
+                  <span style={{
+                    marginLeft: 6,
+                    opacity: 0.7,
+                    fontVariantNumeric: 'tabular-nums',
+                  }}>
+                    ×{asmCount}
+                  </span>
+                )}
               </button>
             )
           })}

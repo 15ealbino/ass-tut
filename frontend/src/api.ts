@@ -30,7 +30,26 @@ export function login(email: string, password: string) {
   return request<AuthResponse>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })
 }
 
-export interface LineMapping { c_lines: number[]; asm_lines: number[]; color: string }
+export interface LineMapping {
+  c_lines: number[]
+  asm_lines: number[]
+  color: string
+  c_count?: number
+  asm_count?: number
+}
+
+export interface LineMetric { c_count: number; asm_count: number }
+
+export interface ExpansionMetrics {
+  total_asm_instructions: number
+  total_c_lines: number
+  line_count: number
+  mean_asm_per_line: number
+  max_asm_line: number | null
+  hotspots: number[]
+  hotspot_threshold: number
+  per_line: Record<number, LineMetric>
+}
 
 export interface CompileResponse {
   python_lines: string[]
@@ -39,6 +58,7 @@ export interface CompileResponse {
   asm_code: string
   asm_lines: string[]
   line_map: Record<number, LineMapping>
+  metrics?: ExpansionMetrics | null
 }
 
 export type CompileMethod = 'transpile' | 'pyghidra'

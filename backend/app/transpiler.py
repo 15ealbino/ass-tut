@@ -1042,9 +1042,15 @@ def build_line_map(
         for cl in c_linenos:
             asm_linenos.extend(c_to_asm.get(cl, []))
         color = COLORS[(py_lineno - 1) % len(COLORS)]
+        c_dedup = sorted(set(c_linenos))
+        asm_dedup = sorted(set(asm_linenos))
         result[py_lineno] = {
-            "c_lines": sorted(set(c_linenos)),
-            "asm_lines": sorted(set(asm_linenos)),
+            "c_lines": c_dedup,
+            "asm_lines": asm_dedup,
             "color": color,
+            # Convenience counts for the "cost lens" so the frontend can badge a
+            # line's expansion without re-deriving it from the arrays above.
+            "c_count": len(c_dedup),
+            "asm_count": len(asm_dedup),
         }
     return result
