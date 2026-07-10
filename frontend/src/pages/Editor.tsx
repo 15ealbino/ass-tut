@@ -4940,6 +4940,82 @@ print(hijacked)
       description: 'movl sets shared_frag=1 on the original skb, but clone_packet\'s movl copies the payload without the flag — cmpl in decrypt_inplace checks shared_frag == 0 on the clone and the branch allows movl to overwrite page_data with the decrypted payload (0xDEADBEEF), silently corrupting the page cache of /usr/bin/su without touching disk',
     },
   },
+  {
+    id: 'downfall-gds',
+    name: 'DOWNFALL GATHER LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Intel gather instruction transiently forwards stale vector register data from co-resident threads, leaking AES keys and secrets via cache side-channel.',
+    explanation:
+      'Downfall / Gather Data Sampling (CVE-2022-40982 / CWE-203, CVSS 6.5 but critical practical impact) ' +
+      'exploits Intel\'s AVX2/AVX-512 gather instruction (VPGATHERDD/VPGATHERQQ), which fetches non-contiguous ' +
+      'data elements from memory using vector-index addressing. Internally, the CPU services gather loads from a ' +
+      'shared physical vector register file — and during transient execution, stale values left by prior operations ' +
+      'on the same physical core (including from different threads, processes, or VMs) are forwarded to dependent ' +
+      'instructions before the CPU verifies that the gather has correct data. The attacker uses a Flush+Reload ' +
+      'timing attack on a probe array indexed by the transiently leaked bytes to recover the secret. ' +
+      'Discovered by Daniel Moghimi at Google and disclosed at USENIX Security 2023, Downfall demonstrated ' +
+      'end-to-end theft of AES-128 and AES-256 keys from OpenSSL in under 10 seconds — an attacker process ' +
+      'running on a sibling hyperthread recovers the full key by observing gather-induced transient forwarding ' +
+      'from the victim\'s AES-NI round key schedule stored in YMM/ZMM registers. The physical register file is ' +
+      'competitively shared between sibling threads, so a gather in the attacker context transiently reads ' +
+      'values deposited by the victim\'s AESENC/AESDEC instructions. Affected processors span Intel 6th-gen ' +
+      'Skylake through 11th-gen Tiger Lake (billions of devices). Unlike Spectre (branch prediction) or ' +
+      'MDS (fill buffers), Downfall targets the vector register file itself — a previously untapped ' +
+      'microarchitectural attack surface. Intel\'s microcode fix blocks transient forwarding from gather, ' +
+      'but incurs up to 50% overhead on AVX-heavy workloads. ' +
+      'In the assembly, movl loads the victim\'s AES round key (0xCAFEBABE) and plaintext into stack slots ' +
+      'representing vector registers; the attacker\'s gather_sample reads from the same physical register file ' +
+      'offset via addl — no isolation check (no lfence or register-clear) appears between the victim\'s store ' +
+      'and the attacker\'s transient read; imull multiplies the leaked value by 256 to compute the probe array ' +
+      'cache line index for Flush+Reload recovery.',
+    code:
+`# CVE pattern: gather leaks stale vector regs — AES key theft via cache
+class VectorRegFile:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.ymm0 = 0
+        self.ymm1 = 0
+        self.ymm2 = 0
+        self.stale = 0
+
+    def victim_aesenc(self, round_key, plaintext):
+        self.ymm0 = round_key
+        self.ymm1 = plaintext
+        self.ymm2 = round_key + plaintext
+        return self.ymm2
+
+class GatherAttacker:
+    def __init__(self, probe_size):
+        self.probe_size = probe_size
+        self.leaked = 0
+        self.probe_index = 0
+        self.recovered = 0
+
+    def gather_sample(self, regfile):
+        self.leaked = regfile.ymm0
+        self.probe_index = self.leaked * 256
+        return self.probe_index
+
+    def flush_reload(self, expected):
+        if self.probe_index == expected * 256:
+            self.recovered = self.leaked
+        return self.recovered
+
+regfile = VectorRegFile(16)
+aes_key = 3405691582
+plaintext = 305419896
+regfile.victim_aesenc(aes_key, plaintext)
+attacker = GatherAttacker(4096)
+probe = attacker.gather_sample(regfile)
+stolen = attacker.flush_reload(aes_key)
+print(stolen)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull', 'addl'],
+      description: 'movl loads the victim\'s AES round key (0xCAFEBABE) into the vector register file stack slot; the attacker\'s gather_sample reads from the same offset via addl with no register isolation or lfence barrier — imull multiplies the transiently leaked value by 256 to compute the cache probe line index for Flush+Reload timing recovery of the full AES key',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
