@@ -5016,6 +5016,83 @@ print(stolen)
       description: 'movl loads the victim\'s AES round key (0xCAFEBABE) into the vector register file stack slot; the attacker\'s gather_sample reads from the same offset via addl with no register isolation or lfence barrier — imull multiplies the transiently leaked value by 256 to compute the cache probe line index for Flush+Reload timing recovery of the full AES key',
     },
   },
+  {
+    id: 'reptar-prefix',
+    name: 'REPTAR PREFIX CONFUSION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Redundant REX prefix on REP MOVSB corrupts the CPU instruction decoder, enabling privilege escalation from user-space to kernel.',
+    explanation:
+      'Reptar (CVE-2023-23583 / CWE-269, CVSS 8.8) is a hardware vulnerability in Intel processors ' +
+      'that support Fast Short Repeat Move (FSRM). When a REP MOVSB instruction is encoded with a ' +
+      'redundant REX prefix (e.g., rex.rxb rep movsb), the CPU decoder enters an undefined ' +
+      'microarchitectural state — normally redundant prefixes are silently ignored, but the FSRM ' +
+      'fast-path misinterprets the extra REX byte, corrupting the internal micro-op stream. The ' +
+      'corrupted decoder causes branches to jump to unexpected locations, breaking instruction ' +
+      'boundary alignment and creating a condition where the CPU executes attacker-controlled bytes ' +
+      'as privileged code. An unprivileged process at CPL3 (user-space ring 3) can trigger this to ' +
+      'escalate to CPL0 (kernel ring 0), gaining full control of the machine. In multi-tenant ' +
+      'cloud environments, exploitation from a guest VM can crash the host hypervisor, causing ' +
+      'denial of service to all co-resident tenants. Discovered by Google security researchers ' +
+      'Tavis Ormandy and others, Reptar was disclosed in November 2023 and affects Intel 10th-gen ' +
+      'Ice Lake through 13th-gen Raptor Lake desktop and Xeon Sapphire Rapids server processors — ' +
+      'hundreds of millions of devices. Unlike Spectre (branch prediction) or Meltdown (out-of-order ' +
+      'loads), Reptar targets the instruction decoder itself, a previously unexploited attack surface. ' +
+      'Intel released an emergency out-of-band microcode update to fix the prefix handling logic. ' +
+      'In the assembly, movl stores the redundant prefix flag and the FSRM-active flag into stack ' +
+      'slots representing decoder state; the cmpl check for conflicting prefixes is bypassed when ' +
+      'both flags are set simultaneously — the subsequent movl to cpl writes 0 (ring 0) without ' +
+      'any privilege gate, modeling how the corrupted decoder skips the CPL enforcement check.',
+    code:
+`# CVE pattern: redundant REX prefix on REP MOVSB corrupts decoder — CPL3 to CPL0
+class InsnDecoder:
+    def __init__(self, fsrm_on):
+        self.fsrm = fsrm_on
+        self.prefix_count = 0
+        self.rex_seen = 0
+        self.rep_seen = 0
+        self.cpl = 3
+        self.corrupted = 0
+
+    def add_prefix(self, is_rex):
+        self.prefix_count += 1
+        if is_rex:
+            self.rex_seen = 1
+        else:
+            self.rep_seen = 1
+        return self.prefix_count
+
+    def decode_movsb(self):
+        if self.rep_seen and self.rex_seen and self.fsrm:
+            self.corrupted = 1
+            self.cpl = 0
+        return self.corrupted
+
+class VmGuest:
+    def __init__(self, guest_id):
+        self.guest_id = guest_id
+        self.alive = 1
+        self.escaped = 0
+
+    def exploit_decoder(self, decoder):
+        if decoder.corrupted:
+            self.escaped = 1
+            self.alive = 0
+        return self.escaped
+
+decoder = InsnDecoder(1)
+decoder.add_prefix(0)
+decoder.add_prefix(1)
+result = decoder.decode_movsb()
+vm = VmGuest(42)
+escape = vm.exploit_decoder(decoder)
+print(escape)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'je'],
+      description: 'movl stores the redundant REX flag and FSRM-active flag into decoder state stack slots; cmpl checks for conflicting prefixes but the je branch is not taken when both flags are set — the subsequent movl writes 0 into the cpl slot (ring 0 privilege) with no gate check, modeling how the corrupted FSRM decoder skips CPL enforcement entirely',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
