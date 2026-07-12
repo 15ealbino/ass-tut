@@ -5093,6 +5093,79 @@ print(escape)
       description: 'movl stores the redundant REX flag and FSRM-active flag into decoder state stack slots; cmpl checks for conflicting prefixes but the je branch is not taken when both flags are set — the subsequent movl writes 0 into the cpl slot (ring 0 privilege) with no gate check, modeling how the corrupted FSRM decoder skips CPL enforcement entirely',
     },
   },
+  {
+    id: 'spec-store-bypass',
+    name: 'SPECULATIVE STORE BYPASS',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'CPU speculatively loads stale data from memory before a prior store to the same address retires, leaking overwritten secrets via cache timing side-channel.',
+    explanation:
+      'Speculative Store Bypass (SSB / Spectre Variant 4 / CVE-2018-3639 / CWE-200) exploits CPU store-to-load ' +
+      'forwarding prediction: when a store instruction writes to an address and a subsequent load reads from the ' +
+      'same address, the CPU must detect the dependency and forward the stored value. However, resolving store ' +
+      'addresses takes time, so the CPU predicts whether the load depends on the pending store. When it mispredicts ' +
+      '"no dependency," the load speculatively reads the stale (pre-store) value from the cache — which may be a ' +
+      'secret that the store was meant to sanitize. The speculative load then uses the stale secret to index a ' +
+      'probe array, creating a measurable cache-timing side-channel that persists after rollback. ' +
+      'Unlike Spectre v1 (bounds check bypass via conditional branch misprediction) and Spectre v2 (indirect branch ' +
+      'target poisoning), SSB exploits the memory disambiguation predictor — a fundamentally different CPU component. ' +
+      'The attack is devastating against sandboxed environments: a JavaScript JIT engine stores a bounds-clamped ' +
+      'value and immediately loads it back, but the CPU speculatively reads the unclamped original, bypassing the ' +
+      'sandbox\'s memory isolation. Discovered by Ken Johnson (Microsoft) and Jann Horn (Google Project Zero) in ' +
+      'May 2018, SSB affects every Intel CPU since Sandy Bridge, every AMD CPU since Bulldozer, and all ARM ' +
+      'Cortex-A cores. CVE-2019-1125 (SWAPGS) extended the attack surface by combining SSB with a SWAPGS ' +
+      'instruction timing window, leaking Windows kernel memory from user-space. CVE-2020-0543 (CROSSTALK/SRBDS) ' +
+      'demonstrated that speculative store bypass could leak data across CPU cores via the shared staging buffer. ' +
+      'Mitigation requires the SSBD (Speculative Store Bypass Disable) bit in IA32_SPEC_CTRL MSR or inserting ' +
+      'LFENCE between every store-load pair to the same address — both carry measurable performance overhead. ' +
+      'In the assembly, the first movl stores the safe value (0) into the data slot, but the second movl loads ' +
+      'from the same stack offset before the store retires — the CPU\'s memory disambiguator mispredicts "no ' +
+      'dependency" and the load reads the stale secret (0xCAFEBABE). imull multiplies the leaked value by 256 to ' +
+      'compute the cache probe line index, and no lfence serializing instruction appears between the store and ' +
+      'the dependent load.',
+    code:
+`# CVE pattern: CPU bypasses prior store — load reads stale secret
+class SandboxMem:
+    def __init__(self, secret, bound):
+        self.data = secret
+        self.bound = bound
+        self.safe_val = 0
+        self.probe_idx = 0
+
+    def clamp_and_read(self, overwrite):
+        self.data = overwrite
+        leaked = self.data
+        self.probe_idx = leaked * 256
+        return self.probe_idx
+
+    def residue(self):
+        result = self.probe_idx + self.bound
+        return result
+
+class Attacker:
+    def __init__(self, stride):
+        self.stride = stride
+        self.recovered = 0
+
+    def flush_reload(self, probe_val):
+        self.recovered = probe_val + self.stride
+        return self.recovered
+
+sandbox = SandboxMem(3405691582, 4096)
+attacker = Attacker(256)
+i = 0
+while i < 5:
+    sandbox.clamp_and_read(0)
+    i += 1
+leaked = sandbox.clamp_and_read(0)
+recovered = attacker.flush_reload(leaked)
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'the first movl stores the sanitized value (0) into the data slot on the stack, but the second movl loads from the same offset before the store retires — the CPU\'s memory disambiguator mispredicts "no dependency" and speculatively reads the stale secret (0xCAFEBABE); imull multiplies the leaked value by 256 to compute the cache probe line index, and no lfence serializing instruction appears between the store and the dependent load, leaving the speculative window open for Flush+Reload secret recovery',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
