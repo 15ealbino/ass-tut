@@ -5166,6 +5166,90 @@ print(recovered)
       description: 'the first movl stores the sanitized value (0) into the data slot on the stack, but the second movl loads from the same offset before the store retires — the CPU\'s memory disambiguator mispredicts "no dependency" and speculatively reads the stale secret (0xCAFEBABE); imull multiplies the leaked value by 256 to compute the cache probe line index, and no lfence serializing instruction appears between the store and the dependent load, leaving the speculative window open for Flush+Reload secret recovery',
     },
   },
+  {
+    id: 'inception-rsb',
+    name: 'INCEPTION RSB POISONING',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'CPU misclassifies XOR as a call instruction via phantom speculation, poisoning the Return Stack Buffer with an attacker-controlled address to leak kernel secrets.',
+    explanation:
+      'Inception (CVE-2023-20569 / CWE-200) is a transient execution attack that poisons the CPU\'s Return Stack ' +
+      'Buffer (RSB) — the microarchitectural stack that predicts return addresses. When a function executes `ret`, ' +
+      'the CPU predicts the target by popping the RSB rather than waiting for the actual stack read to complete. ' +
+      'Inception exploits Phantom speculation (CVE-2022-23825) to make the CPU misclassify a harmless XOR instruction ' +
+      'as a recursive call, pushing an attacker-controlled address onto the RSB. When a subsequent `ret` pops this ' +
+      'poisoned entry, the CPU speculatively executes at the attacker\'s chosen gadget address — typically a kernel ' +
+      'function that loads a secret into a register and uses it to index memory. The secret is encoded into the cache ' +
+      'state via a Flush+Reload probe array, surviving architectural rollback. The technique chains Training in ' +
+      'Transient Execution (TTE): the attacker trains the branch predictor inside a speculative window created by ' +
+      'Phantom, so even hardware mitigations like IBPB (Indirect Branch Prediction Barrier) and eIBRS are bypassed. ' +
+      'Demonstrated by ETH Zürich researchers at USENIX Security 2023, Inception leaks kernel memory at 39 bytes/sec ' +
+      'on all AMD Zen 1 through Zen 4 CPUs — enough to steal a 16-character password in 0.4 seconds or an RSA key ' +
+      'in 6.5 seconds. AMD issued microcode updates for Zen 3/Zen 4; full mitigation on Zen 1/Zen 2 requires flushing ' +
+      'the entire branch predictor state on context switches, imposing 93–217% overhead. ' +
+      'In the assembly, the training loop\'s addl simulates repeated XOR execution that poisons the RSB; movl loads the ' +
+      'attacker\'s gadget address into the prediction slot; after the phantom call, ret_speculate\'s addl reads from the ' +
+      'poisoned RSB entry and imull computes the cache probe index from the leaked secret — no lfence or IBPB flush ' +
+      'appears between the training and the speculative return.',
+    code:
+`# CVE pattern: phantom XOR trains RSB — speculative ret leaks secret
+class ReturnStackBuffer:
+    def __init__(self, depth):
+        self.depth = depth
+        self.entry0 = 0
+        self.entry1 = 0
+        self.top = 0
+        self.poisoned = 0
+
+    def push_call(self, ret_addr):
+        if self.top == 0:
+            self.entry0 = ret_addr
+        else:
+            self.entry1 = ret_addr
+        self.top += 1
+        return self.top
+
+    def pop_ret(self):
+        if self.top == 1:
+            result = self.entry0
+        else:
+            result = self.entry1
+        self.top -= 1
+        return result
+
+class PhantomTrainer:
+    def __init__(self, xor_addr, gadget):
+        self.xor_addr = xor_addr
+        self.gadget = gadget
+        self.train_count = 0
+        self.secret = 3405691582
+
+    def train_xor_as_call(self, rsb, rounds):
+        i = 0
+        while i < rounds:
+            rsb.push_call(self.gadget)
+            self.train_count += 1
+            i += 1
+        rsb.poisoned = 1
+        return self.train_count
+
+    def ret_speculate(self, rsb):
+        predicted = rsb.pop_ret()
+        leaked = predicted + self.secret
+        probe_idx = leaked * 256
+        return probe_idx
+
+trainer = PhantomTrainer(4196352, 3735928559)
+rsb = ReturnStackBuffer(16)
+trainer.train_xor_as_call(rsb, 6)
+leaked = trainer.ret_speculate(rsb)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'imull'],
+      description: 'addl in the training loop simulates repeated phantom XOR-as-call execution that pushes the attacker\'s gadget address (0xDEADBEEF) onto the RSB via movl; ret_speculate\'s addl reads the poisoned RSB entry and adds the kernel secret (0xCAFEBABE); imull multiplies the leaked value by 256 to compute the cache probe line index — no lfence or IBPB flush appears between the RSB poisoning and the speculative return, leaking kernel memory at 39 bytes/sec on all AMD Zen CPUs',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
