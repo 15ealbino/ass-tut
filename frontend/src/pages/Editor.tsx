@@ -7,6 +7,17 @@ import { compile, CompileMethod, CompileResponse, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
 import AsmPane, { AsmLineInfo } from '../components/AsmPane'
 
+// ─── Cost-analysis flag presentation ───────────────────────────────────────
+// Backend flags an asm-expensive Python line with one of these keys. The
+// marker is the compact glyph shown in the TRACE legend; the label is the
+// human-readable name used in tooltips.
+const FLAG_MARKER: Record<string, string> = { div: '÷', mul: '×', call: '⤳' }
+const FLAG_LABEL: Record<string, string> = {
+  div: 'integer division (idiv)',
+  mul: 'multiply (imul)',
+  call: 'function call',
+}
+
 // ─── Vulnerability catalogue ───────────────────────────────────────────────
 
 interface Vuln {
@@ -5831,11 +5842,36 @@ export default function EditorPage() {
           }}>
             TRACE::
           </span>
+          {result.cost_summary && (
+            <span
+              title="Total x86 instructions emitted by this program. Higher = more work at the CPU level."
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--cyan)',
+                background: 'var(--cyan-dim)',
+                border: '1px solid var(--cyan)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+              }}
+            >
+              COST:: {result.cost_summary.total_instructions} INSTR
+            </span>
+          )}
           {result.python_lines.map((line, i) => {
             const pyLine = i + 1
             const mapping = result.line_map[pyLine] as LineMapping | undefined
             if (!mapping) return null
             const isActive = activePyLine === pyLine
+            const flags = mapping.flags ?? []
+            const count = mapping.asm_count ?? 0
+            const flagTitle = flags.length
+              ? ` — expensive: ${flags.map(f => FLAG_LABEL[f] ?? f).join(', ')}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -5848,7 +5884,7 @@ export default function EditorPage() {
                   padding: '1px 8px',
                   fontSize: 10,
                   fontFamily: 'Fira Code, monospace',
-                  maxWidth: 180,
+                  maxWidth: 220,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
@@ -5856,9 +5892,20 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${flagTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
+                {count > 0 && (
+                  <span style={{ color: 'var(--text-muted)', marginLeft: 5 }}>·{count}</span>
+                )}
+                {flags.map(f => (
+                  <span
+                    key={f}
+                    style={{ color: 'var(--red)', marginLeft: 3, fontWeight: 700 }}
+                  >
+                    {FLAG_MARKER[f] ?? '!'}
+                  </span>
+                ))}
               </button>
             )
           })}

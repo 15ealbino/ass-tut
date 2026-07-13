@@ -64,6 +64,91 @@ def _run_gcc(c_source: str) -> str:
             return f.read()
 
 
+# ── Assembly cost analysis ─────────────────────────────────────────────────
+#
+# For each Python line we already know the exact display-asm lines it maps to.
+# This module turns that raw mapping into an educational "cost" signal: how many
+# real x86 instructions a Python line compiled to, plus flags for the few
+# mnemonics that are notably expensive relative to the shift/add/mov staples.
+#
+# The lesson this teaches (mission pillar 2 — spotting bad/inefficient asm):
+# `a * b` becomes an `imul`, `a // b` becomes an `idiv` (tens of cycles, far
+# costlier than a shift), and every helper call is `call` overhead. Seeing the
+# flag next to the Python line that caused it makes the Python→asm cost concrete.
+
+# Prefix → flag. Matched against the instruction mnemonic (first token), so a
+# single entry covers size-suffixed variants: "div" catches idivl/divl/divsd,
+# "mul" catches imull/mull/mulsd, "call" catches calll.
+_COST_FLAG_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("idiv", "div"),
+    ("div", "div"),
+    ("imul", "mul"),
+    ("mul", "mul"),
+    ("call", "call"),
+)
+
+# Ordering for a stable, meaningful flag list per line.
+_FLAG_ORDER = {"div": 0, "mul": 1, "call": 2}
+
+
+def _classify_mnemonic(mnemonic: str) -> str | None:
+    """Return the cost flag for an x86 mnemonic, or None if it is unremarkable.
+
+    `mnemonic` is the lowercased first whitespace-separated token of an
+    instruction line (e.g. "idivl", "imull", "movl", "call").
+    """
+    for prefix, flag in _COST_FLAG_PREFIXES:
+        if mnemonic.startswith(prefix):
+            return flag
+    return None
+
+
+def analyze_cost(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with ``asm_count`` and ``flags`` and
+    return a compact cost summary (``{total_instructions, hotspots}``).
+
+    ``asm_lines`` is the list of filtered assembly text lines (1-indexed by the
+    ``asm_lines`` numbers stored in each mapping). Mutates ``line_map`` in place.
+    """
+    total = 0
+    for mapping in line_map.values():
+        asm_nos = mapping.get("asm_lines", [])
+        flags: set = set()
+        for asm_no in asm_nos:
+            # asm_no is 1-indexed into the filtered display asm.
+            if 1 <= asm_no <= len(asm_lines):
+                text = asm_lines[asm_no - 1].strip()
+                mnemonic = text.split(None, 1)[0].lower() if text else ""
+                flag = _classify_mnemonic(mnemonic)
+                if flag is not None:
+                    flags.add(flag)
+        count = len(asm_nos)
+        total += count
+        mapping["asm_count"] = count
+        mapping["flags"] = sorted(flags, key=lambda f: _FLAG_ORDER.get(f, 99))
+
+    # Hotspots: Python lines ranked by instruction count (descending), then by
+    # line number for determinism. Only lines that produced instructions.
+    hotspots = [
+        {
+            "py_line": py_line,
+            "asm_count": mapping["asm_count"],
+            "flags": mapping["flags"],
+        }
+        for py_line, mapping in line_map.items()
+        if mapping["asm_count"] > 0
+    ]
+    hotspots.sort(key=lambda h: (-h["asm_count"], h["py_line"]))
+
+    return {
+        "total_instructions": total,
+        "hotspots": hotspots,
+    }
+
+
 def _parse_asm_line_map(asm_text: str) -> Tuple[Dict[int, List[int]], str]:
     """
     Parse GCC .loc directives to build c_lineno → [display_asm_lineno] mapping.
@@ -145,11 +230,16 @@ async def compile_python(python_source: str) -> dict:
     c_to_asm, filtered_asm = _parse_asm_line_map(asm_text)
     line_map = build_line_map(lines, py_to_c, c_to_asm)
 
+    asm_lines = filtered_asm.splitlines()
+    # Annotate each line_map entry with asm_count/flags and build the summary.
+    cost_summary = analyze_cost(line_map, asm_lines)
+
     return {
         "python_lines": lines,
         "c_code": c_source,
         "c_lines": c_source.splitlines(),
         "asm_code": filtered_asm,
-        "asm_lines": filtered_asm.splitlines(),
+        "asm_lines": asm_lines,
         "line_map": line_map,
+        "cost_summary": cost_summary,
     }
