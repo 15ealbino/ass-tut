@@ -5250,6 +5250,71 @@ print(leaked)
       description: 'addl in the training loop simulates repeated phantom XOR-as-call execution that pushes the attacker\'s gadget address (0xDEADBEEF) onto the RSB via movl; ret_speculate\'s addl reads the poisoned RSB entry and adds the kernel secret (0xCAFEBABE); imull multiplies the leaked value by 256 to compute the cache probe line index — no lfence or IBPB flush appears between the RSB poisoning and the speculative return, leaking kernel memory at 39 bytes/sec on all AMD Zen CPUs',
     },
   },
+  {
+    id: 'xss-injection',
+    name: 'CROSS-SITE SCRIPTING',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'User-supplied input reflected or stored in HTML output without escaping lets an attacker inject arbitrary JavaScript that executes in victims\' browsers.',
+    explanation:
+      'Cross-site scripting (CWE-79) occurs when user-supplied input is inserted into HTML output without ' +
+      'encoding or sanitization. The attacker injects a <script> tag or event handler attribute — the browser ' +
+      'cannot distinguish the injected code from legitimate application markup and executes it with the victim\'s ' +
+      'session cookies, authentication tokens, and full DOM access. Stored XSS persists in the database and fires ' +
+      'on every page load; reflected XSS arrives via a crafted URL parameter. Once executing in the victim\'s ' +
+      'browser context, the payload steals session tokens, rewrites page content, redirects to phishing pages, or ' +
+      'chains into admin-level actions for full account takeover. ' +
+      'CVE-2024-42009 (Roundcube Webmail, CVSS 9.3) allowed stored XSS that siphoned email credentials from ' +
+      'government and military targets — a single crafted email executed JavaScript when opened, exfiltrating ' +
+      'the victim\'s IMAP password without any click required. CVE-2025-67906 (MISP, CVSS 9.0) achieved stored ' +
+      'XSS through the workflow engine\'s doT.js template injection, executing with admin session privileges on ' +
+      'every page load and enabling full data exfiltration until the malicious workflow was explicitly deleted. ' +
+      'Over 8,000 XSS CVEs were published in 2025 alone; CWE-79 has ranked in the CWE Top 25 every year since ' +
+      'the list\'s inception and OWASP classifies it under A03:2021 (Injection). ' +
+      'In the assembly, `addl` concatenates the attacker-supplied script payload directly into the page_output ' +
+      'buffer with no intervening sanitization — no `cmpl` guard checks for dangerous characters (&, <, >, \') ' +
+      'between the user input load and the output construction, so the injected payload flows into the rendered ' +
+      'page and executes in the victim\'s browser session context.',
+    code:
+`# CVE pattern: user input reflected in HTML output — executes as script
+class PageRenderer:
+    def __init__(self, base_html):
+        self.base_html = base_html
+        self.page_output = 0
+        self.rendered = 0
+
+    def render_input(self, user_input):
+        self.page_output = self.base_html + user_input
+        self.rendered += 1
+        return self.page_output
+
+    def send_response(self):
+        result = self.page_output
+        return result
+
+class SessionStore:
+    def __init__(self, cookie, csrf_token):
+        self.cookie = cookie
+        self.csrf_token = csrf_token
+        self.stolen = 0
+
+    def steal_token(self, script_output):
+        self.stolen = script_output + self.cookie
+        return self.stolen
+
+renderer = PageRenderer(1000)
+script_payload = 1094795585
+page = renderer.render_input(script_payload)
+response = renderer.send_response()
+session = SessionStore(3735928559, 305419896)
+exfiltrated = session.steal_token(response)
+print(exfiltrated)
+`,
+    badAsm: {
+      patterns: ['addl', 'movl'],
+      description: 'addl concatenates the attacker-supplied script payload (0x41414141) directly into page_output with no sanitization; movl loads the combined output into the response slot — no cmpl guard checks for dangerous characters between the user input and output construction, so the injected script payload reaches the browser and executes with the victim\'s session cookies and authentication tokens',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
