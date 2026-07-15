@@ -5315,6 +5315,77 @@ print(exfiltrated)
       description: 'addl concatenates the attacker-supplied script payload (0x41414141) directly into page_output with no sanitization; movl loads the combined output into the response slot — no cmpl guard checks for dangerous characters between the user input and output construction, so the injected script payload reaches the browser and executes with the victim\'s session cookies and authentication tokens',
     },
   },
+  {
+    id: 'pkt-ring-race',
+    name: 'PACKET RING RACE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Race condition during ring buffer reconfiguration frees a page vector while another thread still references it, yielding arbitrary kernel memory access.',
+    explanation:
+      'The AF_PACKET ring buffer race (CWE-362 / CWE-416) arises when packet_set_ring() temporarily ' +
+      'releases a spinlock to swap ring buffers, opening a window for a concurrent packet_notifier() on ' +
+      'another CPU to access the old pg_vec page vector after it has been freed. An attacker wins the ' +
+      'race by rapidly toggling the network interface while reconfiguring the ring, causing the freed ' +
+      'pg_vec slot to be reclaimed by a new allocation under attacker control. Reading through the ' +
+      'dangling pointer now returns attacker-supplied bytes, and a subsequent mmap() maps attacker-chosen ' +
+      'kernel pages into userspace — yielding arbitrary kernel read/write and full privilege escalation. ' +
+      'CVE-2025-38617 (Linux kernel through 6.15, CVSS 7.4) exploited this exact race in the packet socket ' +
+      'subsystem, defeating modern mitigations including CONFIG_RANDOM_KMALLOC_CACHES and CONFIG_SLAB_VIRTUAL ' +
+      'to achieve container escape from an unprivileged user holding only CAP_NET_RAW. The earlier ' +
+      'CVE-2016-8655 (Linux through 4.8.12, CVSS 7.8) exploited the same class of race in packet_set_ring\'s ' +
+      'TPACKET_V3 path to gain root — the bug persisted for over a decade before discovery. ' +
+      'In the assembly, the movl stores zero into the ring slot (simulating free) while a concurrent ' +
+      'path\'s movl still loads from the same offset — the stale load returns attacker-controlled data ' +
+      'placed in the reclaimed slot, and no cmpl fence guards the access window between release and reuse.',
+    code:
+`# CVE pattern: ring buffer freed while concurrent reader still holds reference
+class RingBuffer:
+    def __init__(self, pages):
+        self.pages = pages
+        self.pg_vec = pages * 4096
+        self.ref_count = 1
+        self.active = 1
+
+    def release(self):
+        self.ref_count -= 1
+        if self.ref_count <= 0:
+            self.pg_vec = 0
+            self.active = 0
+        return self.pg_vec
+
+    def read_page(self):
+        result = self.pg_vec + self.pages
+        return result
+
+class PacketSocket:
+    def __init__(self, ring_pages):
+        self.ring = RingBuffer(ring_pages)
+        self.lock_held = 1
+        self.reconfigured = 0
+
+    def set_ring(self, new_pages):
+        self.lock_held = 0
+        stale_vec = self.ring.pg_vec
+        self.ring.release()
+        self.ring = RingBuffer(new_pages)
+        self.lock_held = 1
+        self.reconfigured += 1
+        return stale_vec
+
+    def notify_read(self):
+        leaked = self.ring.read_page()
+        return leaked
+
+sock = PacketSocket(8)
+old = sock.set_ring(16)
+attacker_read = sock.notify_read()
+print(attacker_read)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl zeroes the pg_vec slot (free) then another movl loads from the same offset on a concurrent path — the stale read returns attacker-controlled bytes from the reclaimed slot; no cmpl memory fence guards the window between release and reuse',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
