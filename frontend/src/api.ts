@@ -30,7 +30,19 @@ export function login(email: string, password: string) {
   return request<AuthResponse>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })
 }
 
-export interface LineMapping { c_lines: number[]; asm_lines: number[]; color: string }
+export interface LineMapping {
+  c_lines: number[]
+  asm_lines: number[]
+  color: string
+  // Cost analysis (transpile pipeline). Number of real x86 instructions this
+  // Python line compiled to, plus flags for expensive mnemonics.
+  asm_count?: number
+  flags?: string[]
+}
+
+export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
+
+export interface CostSummary { total_instructions: number; hotspots: Hotspot[] }
 
 export interface CompileResponse {
   python_lines: string[]
@@ -39,6 +51,8 @@ export interface CompileResponse {
   asm_code: string
   asm_lines: string[]
   line_map: Record<number, LineMapping>
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  cost_summary?: CostSummary | null
 }
 
 export type CompileMethod = 'transpile' | 'pyghidra'
