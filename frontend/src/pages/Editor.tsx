@@ -5386,6 +5386,93 @@ print(attacker_read)
       description: 'movl zeroes the pg_vec slot (free) then another movl loads from the same offset on a concurrent path — the stale read returns attacker-controlled bytes from the reclaimed slot; no cmpl memory fence guards the window between release and reuse',
     },
   },
+  {
+    id: 'sandbox-escape-ipc',
+    name: 'SANDBOX ESCAPE VIA IPC',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Compromised sandboxed process exploits a flaw in the IPC broker to execute privileged operations in the unsandboxed parent, escaping the sandbox entirely.',
+    explanation:
+      'Sandbox escape via IPC (CWE-269 / CWE-20) occurs when a sandboxed renderer or worker process sends crafted ' +
+      'inter-process communication messages to the privileged broker (browser process, system daemon), exploiting ' +
+      'insufficient validation of message contents or handle types. The broker trusts that IPC messages conform to ' +
+      'the expected schema, but the compromised sandbox process sends a message containing an out-of-range enum, a ' +
+      'forged Mojo handle, or a serialized object that triggers a use-after-free or type confusion in the broker\'s ' +
+      'message dispatcher. Because the broker runs with full OS privileges — file system access, process creation, ' +
+      'network sockets — the attacker achieves arbitrary code execution outside the sandbox. ' +
+      'CVE-2025-2783 (Chromium Mojo IPC, CVSS 8.3) was actively exploited in the wild in March 2025 as part of ' +
+      'Operation ForumTroll, a targeted espionage campaign against Russian government and media organizations. The ' +
+      'flaw was a logic error in Mojo IPC handle validation on Windows: when crossing a security boundary between ' +
+      'the sandboxed renderer and the broker process, Mojo failed to verify that an IPC-transferred handle had the ' +
+      'correct access rights, allowing the renderer to trick the broker into treating an attacker-controlled object ' +
+      'as a privileged resource — a full sandbox escape requiring only that the victim visit a malicious URL. ' +
+      'CVE-2024-7971 (V8 type confusion + CVE-2024-38106 Windows kernel sandbox escape) was chained by Citrine Sleet ' +
+      '(North Korea) for cryptocurrency theft: the V8 bug provided renderer RCE, then a crafted IPC message exploited ' +
+      'a kernel race condition to escape the Chrome sandbox entirely. CVE-2024-5274 (V8) was similarly chained with ' +
+      'a Mojo IPC sandbox escape for in-the-wild exploitation. The Mojo IPC layer has been the source of over 30 ' +
+      'Chrome sandbox escape CVEs since 2019, making it the single most targeted attack surface for browser exploitation. ' +
+      'In the assembly, movl loads the crafted IPC message fields (forged_handle, malicious_type) into stack slots ' +
+      'representing the message buffer; the broker\'s cmpl validates msg_type against expected values but the else ' +
+      'branch falls through to dispatch without rejecting unknown types — addl in execute combines the forged handle ' +
+      'with the payload, and the broker executes the privileged operation using attacker-supplied arguments.',
+    code:
+`# CVE pattern: crafted IPC message escapes sandbox via broker trust
+class IPCMessage:
+    def __init__(self, msg_type, handle, payload):
+        self.msg_type = msg_type
+        self.handle = handle
+        self.payload = payload
+        self.validated = 0
+
+    def serialize(self):
+        result = self.msg_type * 65536 + self.handle
+        return result
+
+class Broker:
+    def __init__(self, max_type):
+        self.max_type = max_type
+        self.dispatched = 0
+        self.result = 0
+
+    def validate_and_dispatch(self, msg):
+        if msg.msg_type == 1:
+            self.result = msg.handle
+        elif msg.msg_type == 2:
+            self.result = msg.handle * 2
+        else:
+            self.result = msg.payload
+        self.dispatched += 1
+        return self.result
+
+    def execute(self, handle, payload):
+        result = handle + payload
+        return result
+
+class Sandbox:
+    def __init__(self, pid):
+        self.pid = pid
+        self.escaped = 0
+        self.priv_result = 0
+
+    def craft_escape(self, forged_handle, shell_payload):
+        msg = IPCMessage(99, forged_handle, shell_payload)
+        return msg
+
+sandbox = Sandbox(1234)
+forged = 4196352
+payload = 3735928559
+msg = sandbox.craft_escape(forged, payload)
+broker = Broker(2)
+dispatched = broker.validate_and_dispatch(msg)
+hijacked = broker.execute(dispatched, forged)
+sandbox.escaped = 1
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'movl loads the crafted IPC message fields (forged_handle, malicious msg_type 99) into stack slots; cmpl in validate_and_dispatch checks msg_type against known values (1, 2) but the else branch falls through without rejecting the unknown type — movl passes the attacker\'s payload directly to execute, where addl combines the forged handle with the shell payload for privileged code execution outside the sandbox',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
