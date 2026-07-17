@@ -5484,6 +5484,91 @@ print(hijacked)
       description: 'movl loads the crafted IPC message fields (forged_handle, malicious msg_type 99) into stack slots; cmpl in validate_and_dispatch checks msg_type against known values (1, 2) but the else branch falls through without rejecting the unknown type — movl passes the attacker\'s payload directly to execute, where addl combines the forged handle with the shell payload for privileged code execution outside the sandbox',
     },
   },
+  {
+    id: 'jit-type-guard-bypass',
+    name: 'JIT TYPE GUARD BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'JIT compiler removes runtime type checks based on speculative profiling, allowing type confusion and heap corruption when the attacker violates the assumed type.',
+    explanation:
+      'JIT type guard bypass (CWE-843) exploits speculative optimizations in just-in-time compilers such as ' +
+      'V8\'s TurboFan, SpiderMonkey\'s IonMonkey, and JavaScriptCore\'s DFG/FTL. During interpretation, the ' +
+      'engine records type feedback — "this variable has always been an integer" or "this array has always held ' +
+      'doubles." The optimizing compiler then generates highly specialized machine code that omits type guards ' +
+      'and bounds checks for the profiled types, replacing slow generic operations with fast, type-specific ' +
+      'assembly. If an attacker can trigger the profiled fast path with data of a different type — for example, ' +
+      'passing an object array where the JIT expects a double array — the generated code operates on memory with ' +
+      'the wrong layout assumptions, reading object pointers as IEEE 754 doubles or vice versa, achieving ' +
+      'arbitrary read/write within the process heap. ' +
+      'CVE-2025-2135 (V8 TurboFan, CVSS 8.8, used to pwn V8CTF as a zero-day) exploited a flaw in TurboFan\'s ' +
+      'InferMapsUnsafe() function that failed to handle aliasing when processing TransitionElementsKindOrCheckMap ' +
+      'nodes, enabling type confusion between object arrays and double arrays for arbitrary memory read/write ' +
+      'within the V8 sandbox. CVE-2024-7971 (V8, CVSS 8.8, actively exploited by North Korean Citrine Sleet ' +
+      'group) was a type confusion in Maglev\'s speculative optimization chained with CVE-2024-38106 (Windows ' +
+      'kernel sandbox escape) for full RCE in cryptocurrency theft campaigns. CVE-2024-4947 (V8, CVSS 9.6) was ' +
+      'another JIT type confusion actively exploited in the wild. ' +
+      'In the assembly, movl loads profiled type values (integers) into stack slots during the training phase; ' +
+      'after JIT compilation, the cmpl type guard is eliminated by the optimizer — when the attacker passes a ' +
+      'value of a different type, imull and addl operate directly on the mistyped data without any check, ' +
+      'producing a corrupted result that represents an out-of-bounds offset into the heap.',
+    code:
+`# CVE pattern: JIT removes type guards after profiling — type confusion
+class TypeFeedback:
+    def __init__(self):
+        self.seen_type = 0
+        self.call_count = 0
+        self.optimized = 0
+
+    def record(self, value):
+        self.seen_type = 1
+        self.call_count += 1
+        return value
+
+    def should_optimize(self, threshold):
+        if self.call_count > threshold:
+            self.optimized = 1
+            return 1
+        return 0
+
+class JITCompiler:
+    def __init__(self, guard_enabled):
+        self.guard_enabled = guard_enabled
+        self.compiled_result = 0
+        self.corrupted = 0
+
+    def specialize_int(self, value, scale):
+        result = value * scale + 42
+        return result
+
+    def compile_and_run(self, feedback, value, scale):
+        if feedback.optimized == 0:
+            if self.guard_enabled == 1:
+                result = self.specialize_int(value, scale)
+                self.compiled_result = result
+                return result
+        result = value * scale + 42
+        self.compiled_result = result
+        return result
+
+fb = TypeFeedback()
+jit = JITCompiler(1)
+i = 0
+while i < 8:
+    fb.record(100)
+    jit.compile_and_run(fb, 100, 4)
+    i += 1
+fb.should_optimize(5)
+jit.guard_enabled = 0
+poison = 3735928559
+corrupted = jit.compile_and_run(fb, poison, 4)
+jit.corrupted = 1
+print(corrupted)
+`,
+    badAsm: {
+      patterns: ['imull', 'cmpl', 'movl'],
+      description: 'movl loads profiled integer values into stack slots during the training loop; after call_count exceeds the optimization threshold, cmpl guard_enabled check is bypassed (guard_enabled set to 0) — imull then multiplies the attacker\'s poison value (0xDEADBEEF) by the scale factor without any type validation, producing a corrupted heap offset that grants arbitrary read/write within the JIT process memory',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
