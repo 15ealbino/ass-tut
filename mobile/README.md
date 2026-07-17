@@ -107,8 +107,10 @@ https://assembly-tutorial.com/app/
 - **`mobile/Dockerfile.web`** — builds `npx expo export --platform web` and
   serves the static output with nginx. The export uses `expo.experiments.baseUrl
   = "/app"` (in `app.json`) so every asset is referenced under `/app/...`.
-- **`mobileweb` service** in `docker-compose.yml` — the nginx container above
-  (internal only; no host port).
+- **`mobileweb` service** — the nginx container above (internal only; no host
+  port). In the **prod/http** stacks it runs a **prebuilt image pulled from
+  GHCR** (built by CI, see below) rather than building on the VM; the base
+  `docker-compose.yml` keeps a `build:` section only for local dev.
 - **`Caddyfile` / `Caddyfile.http`** — route `/app/*` → `mobileweb`, everything
   else (including `/api`) → the main `frontend` container.
 - **Same-origin API** — on the web build, `src/config.ts` points the API at a
@@ -118,15 +120,36 @@ https://assembly-tutorial.com/app/
   keychain isn't available in a browser). Not encrypted at rest; fine for this
   app's JWT.
 
+### The image is built by CI, not on the VM
+
+The production VM is a small (~1 GB RAM) box, and building the Expo/Metro bundle
+on it once **OOM-killed the whole stack**. So the image is built off-VM by
+GitHub Actions and the VM only pulls it:
+
+- **`.github/workflows/mobileweb.yml`** — on any push to `master` that touches
+  `mobile/**`, it builds `mobile/Dockerfile.web` and pushes
+  `ghcr.io/15ealbino/ass-tut-mobileweb:latest` (plus a `:<sha>` tag) to GHCR,
+  with layer caching. No secrets needed — it uses the built-in `GITHUB_TOKEN`.
+- **prod/http compose overlays** set `image: ghcr.io/…/ass-tut-mobileweb:latest`
+  + `pull_policy: always` and reset `build`, so `make prod` **pulls** the image
+  instead of compiling on the VM.
+
+**One-time setup:** after the first workflow run, make the GHCR package
+**public** so the VM can pull it without credentials —
+`github.com/users/15ealbino/packages/container/ass-tut-mobileweb/settings` →
+*Change visibility* → *Public*. (The image is just a static web bundle + nginx,
+no secrets.) If you'd rather keep it private, instead run
+`echo <PAT> | docker login ghcr.io -u 15ealbino --password-stdin` on the VM once,
+using a PAT with `read:packages`.
+
 ### Deploy it
 
-It ships with the normal production release — no extra steps:
-
 ```bash
-# on the VM (or via the `deployer` agent)
+# 1. Push your change; wait for the "Build mobileweb image" Action to go green.
+# 2. On the VM (or via the `deployer` agent):
 cd ~/ass-tut
 git pull --rebase origin master
-make prod            # rebuilds all services incl. mobileweb, reloads Caddy
+make prod            # pulls latest mobileweb image, rebuilds frontend, reloads Caddy
 ```
 
 Verify:
@@ -135,14 +158,16 @@ Verify:
 curl -fsSI https://assembly-tutorial.com/app/ | head -3   # expect HTTP/2 200
 ```
 
-> First `make prod` after adding this pulls Node + runs `npm ci` inside the
-> `mobileweb` image build, so it takes a few minutes; later builds are cached.
+> Order matters: deploy **after** CI has published the new image, otherwise the
+> VM pulls the previous `latest`. `make prod` no longer builds the bundle on the
+> VM, so it's fast and can't OOM the box.
 
 ### Update it
 
-Any change under `mobile/src/` (or its config) is picked up by rebuilding the
-image on the next deploy — commit, push, then `git pull && make prod` on the VM.
-There is no separate step; the web build is regenerated from source each deploy.
+Change anything under `mobile/src/` (or its config), commit, and push to
+`master`. CI rebuilds and republishes the image automatically; then deploy
+(`git pull && make prod`) to pull it onto the VM. To roll back, redeploy with the
+service pinned to a known-good `:<sha>` tag instead of `:latest`.
 
 ### Serve it somewhere else instead
 

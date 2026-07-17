@@ -9,6 +9,13 @@ services:
     expose:
       - "80"
 
+  # Use the CI-built image from GHCR instead of building the heavy Expo bundle
+  # on the memory-limited VM. `pull_policy: always` fetches the latest push.
+  mobileweb:
+    build: !reset null
+    image: ghcr.io/15ealbino/ass-tut-mobileweb:latest
+    pull_policy: always
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
