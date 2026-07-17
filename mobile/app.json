@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "CYBER//ASM",
+    "slug": "cyber-asm-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "cyberasm",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#050a0e",
+    "newArchEnabled": true,
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#050a0e"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.cyberasm.mobile"
+    },
+    "android": {
+      "package": "com.cyberasm.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#050a0e"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "extra": {
+      "apiBaseUrl": "https://assembly-tutorial.com/api",
+      "eas": {
+        "projectId": ""
+      }
+    },
+    "updates": {
+      "fallbackToCacheTimeout": 0
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}
