@@ -1,12 +1,13 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react'
-import * as SecureStore from 'expo-secure-store'
 import { setToken as setApiToken } from '../api'
+import { getItem, setItem, deleteItem } from '../storage'
 
 /**
- * Holds the JWT for the session. Unlike the web app (which keeps the token in
- * JS memory only and drops it on refresh), a mobile app is expected to stay
- * signed in across cold starts, so we persist the token in the platform
- * keychain / keystore via expo-secure-store.
+ * Holds the JWT for the session. Unlike the browser build of the original web
+ * app (which keeps the token in JS memory only and drops it on refresh), the
+ * app persists the token so a session survives cold starts — in the platform
+ * keychain/keystore on native, and in localStorage on the web build (see
+ * ../storage).
  */
 
 const TOKEN_KEY = 'cyberasm.jwt'
@@ -27,7 +28,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     ;(async () => {
       try {
-        const saved = await SecureStore.getItemAsync(TOKEN_KEY)
+        const saved = await getItem(TOKEN_KEY)
         if (saved) {
           setApiToken(saved)
           setTokenState(saved)
@@ -41,13 +42,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signIn = useCallback(async (t: string) => {
     setApiToken(t)
     setTokenState(t)
-    await SecureStore.setItemAsync(TOKEN_KEY, t)
+    await setItem(TOKEN_KEY, t)
   }, [])
 
   const signOut = useCallback(async () => {
     setApiToken(null)
     setTokenState(null)
-    await SecureStore.deleteItemAsync(TOKEN_KEY)
+    await deleteItem(TOKEN_KEY)
   }, [])
 
   return (

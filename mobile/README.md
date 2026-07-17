@@ -91,6 +91,74 @@ against a backend on your laptop:
 
 ---
 
+## Host the web build on the VM (browser access for anyone)
+
+The same codebase also runs in a **browser** via `react-native-web`, so you can
+serve it as a static site from the existing Oracle VM production stack — anyone
+opens a URL, no app install, no Expo Go. It's wired into the repo's
+docker-compose + Caddy setup and served at:
+
+```
+https://assembly-tutorial.com/app/
+```
+
+### How it's wired
+
+- **`mobile/Dockerfile.web`** — builds `npx expo export --platform web` and
+  serves the static output with nginx. The export uses `expo.experiments.baseUrl
+  = "/app"` (in `app.json`) so every asset is referenced under `/app/...`.
+- **`mobileweb` service** in `docker-compose.yml` — the nginx container above
+  (internal only; no host port).
+- **`Caddyfile` / `Caddyfile.http`** — route `/app/*` → `mobileweb`, everything
+  else (including `/api`) → the main `frontend` container.
+- **Same-origin API** — on the web build, `src/config.ts` points the API at a
+  relative `/api`, which the main frontend nginx already proxies to the backend.
+  Because it's the same origin, there are **no CORS changes** to the backend.
+- **Auth token** — `src/storage.ts` uses `localStorage` on web (the native
+  keychain isn't available in a browser). Not encrypted at rest; fine for this
+  app's JWT.
+
+### Deploy it
+
+It ships with the normal production release — no extra steps:
+
+```bash
+# on the VM (or via the `deployer` agent)
+cd ~/ass-tut
+git pull --rebase origin master
+make prod            # rebuilds all services incl. mobileweb, reloads Caddy
+```
+
+Verify:
+
+```bash
+curl -fsSI https://assembly-tutorial.com/app/ | head -3   # expect HTTP/2 200
+```
+
+> First `make prod` after adding this pulls Node + runs `npm ci` inside the
+> `mobileweb` image build, so it takes a few minutes; later builds are cached.
+
+### Update it
+
+Any change under `mobile/src/` (or its config) is picked up by rebuilding the
+image on the next deploy — commit, push, then `git pull && make prod` on the VM.
+There is no separate step; the web build is regenerated from source each deploy.
+
+### Serve it somewhere else instead
+
+- **Different path/subdomain**: change `expo.experiments.baseUrl` in `app.json`
+  to match (e.g. `"/"` for a dedicated subdomain), rebuild, and adjust the Caddy
+  route. For a subdomain like `app.assembly-tutorial.com` you'd add a Cloudflare
+  DNS record → the VM IP and a matching Caddy site block; Caddy auto-issues the
+  cert.
+- **Static host (Netlify / Vercel / S3 / GitHub Pages)**: run
+  `npx expo export --platform web` and upload `dist/`. Set `baseUrl` to match the
+  host's path, and set `expo.extra.apiBaseUrl` (or the in-app Server field) to an
+  absolute backend URL — a static host has no `/api` proxy, and the backend's
+  CORS allow-list would then need that origin added.
+
+---
+
 ## Deploy the mobile app
 
 "Deploying" a mobile app means two different things, and this project supports

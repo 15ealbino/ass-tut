@@ -1,3 +1,4 @@
+import { Platform } from 'react-native'
 import Constants from 'expo-constants'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 
@@ -7,14 +8,17 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
  * Order of precedence:
  *   1. A URL the user saved in-app (Settings sheet on the login screen).
  *   2. `expo.extra.apiBaseUrl` from app.json (baked into each build).
- *   3. The production fallback below.
+ *   3. A platform default.
  *
- * The web app talks to a same-origin `/api`; the mobile app has no origin,
- * so it needs an absolute URL. Point this at your deployed backend.
+ * On the **web build** the app is served from the same origin as the backend
+ * proxy (nginx forwards `/api/*` → backend), so a relative `/api` avoids CORS
+ * entirely. **Native** builds have no origin and need an absolute URL.
  */
 const DEFAULT_API_BASE_URL =
-  (Constants.expoConfig?.extra?.apiBaseUrl as string | undefined) ??
-  'https://assembly-tutorial.com/api'
+  Platform.OS === 'web'
+    ? '/api'
+    : (Constants.expoConfig?.extra?.apiBaseUrl as string | undefined) ??
+      'https://assembly-tutorial.com/api'
 
 const OVERRIDE_KEY = 'cyberasm.apiBaseUrl'
 

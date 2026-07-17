@@ -26,7 +26,11 @@
       }
     },
     "web": {
-      "bundler": "metro"
+      "bundler": "metro",
+      "output": "single"
+    },
+    "experiments": {
+      "baseUrl": "/app"
     },
     "extra": {
       "apiBaseUrl": "https://assembly-tutorial.com/api",

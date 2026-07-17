@@ -36,5 +36,14 @@ services:
     depends_on:
       - backend
 
+  # Expo web export of the mobile app, served by nginx under /app/.
+  # Internal-only; Caddy routes /app/* here in the prod/http stacks.
+  mobileweb:
+    build:
+      context: ./mobile
+      dockerfile: Dockerfile.web
+    expose:
+      - "80"
+
 volumes:
   pgdata:

@@ -1,0 +1,15 @@
+# Build the Expo web export (react-native-web) and serve the static output with
+# nginx under /app/. Fronted by Caddy in the production stack; the app itself
+# calls the backend via same-origin /api (proxied by the main frontend nginx).
+FROM node:20-alpine AS build
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npx expo export --platform web
+
+FROM nginx:alpine
+# The export is built with baseUrl "/app", so its assets reference /app/...
+# Serve the files from that same path prefix on disk.
+COPY --from=build /build/dist /usr/share/nginx/html/app
+COPY nginx.web.conf /etc/nginx/conf.d/default.conf
