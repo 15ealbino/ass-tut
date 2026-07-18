@@ -5569,6 +5569,87 @@ print(corrupted)
       description: 'movl loads profiled integer values into stack slots during the training loop; after call_count exceeds the optimization threshold, cmpl guard_enabled check is bypassed (guard_enabled set to 0) — imull then multiplies the attacker\'s poison value (0xDEADBEEF) by the scale factor without any type validation, producing a corrupted heap offset that grants arbitrary read/write within the JIT process memory',
     },
   },
+  {
+    id: 'toctou-race',
+    name: 'TOCTOU FILE RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Time gap between checking a file\'s properties and using it lets an attacker swap the file with a symlink, redirecting privileged operations to sensitive targets.',
+    explanation:
+      'Time-of-Check to Time-of-Use (TOCTOU / CWE-367) is a file-based race condition where a program checks a ' +
+      'resource\'s state (permissions, type, existence) and later operates on it, assuming nothing changed between ' +
+      'the check and the use. An attacker exploits the race window to swap the checked file with a symlink to a ' +
+      'sensitive target — so the privileged operation (write, chmod, chown) lands on /etc/shadow or a setuid binary ' +
+      'instead of the intended temporary file. Unlike in-memory double-fetch races that require CPU-level timing, ' +
+      'file-based TOCTOU exploits the filesystem namespace and can be widened arbitrarily by exhausting I/O bandwidth. ' +
+      'CVE-2025-22224 (VMware ESXi, CVSS 9.3, CISA KEV) exploited a TOCTOU race in the VMCI interface: the hypervisor ' +
+      'checked a VM file\'s state then used it without re-validation, allowing a guest admin to execute code as the ' +
+      'VMX process on the host — a full VM escape actively exploited in the wild before disclosure. CVE-2024-50379 ' +
+      '(Apache Tomcat, CVSS 9.8) exploited TOCTOU in JSP compilation on case-insensitive filesystems: the check saw ' +
+      'a safe filename, but the attacker swapped it before compilation, achieving unauthenticated RCE. CVE-2025-23359 ' +
+      '(NVIDIA Container Toolkit, CVSS 8.3) let an attacker escape containers via a TOCTOU race in GPU device file ' +
+      'handling, compromising the host. Mitigations include O_NOFOLLOW, openat() with directory file descriptors, and ' +
+      'fstat() on the opened fd rather than stat() on the path. ' +
+      'In the assembly, cmpl in check_file compares the owner field against the expected value — the check passes; ' +
+      'attacker_swap\'s movl then overwrites the file\'s inode and owner fields during the race window; do_operation\'s ' +
+      'addl uses the now-swapped file data without re-checking, applying the privileged write to /etc/shadow instead ' +
+      'of the original temporary file.',
+    code:
+`# CVE pattern: check-then-use race — attacker swaps file in the gap
+class FileEntry:
+    def __init__(self, inode, owner, data):
+        self.inode = inode
+        self.owner = owner
+        self.data = data
+        self.swapped = 0
+
+    def stat_check(self, expected_owner):
+        if self.owner == expected_owner:
+            return 1
+        return 0
+
+class PrivService:
+    def __init__(self, uid):
+        self.uid = uid
+        self.checked = 0
+        self.result = 0
+
+    def check_file(self, entry):
+        self.checked = entry.stat_check(self.uid)
+        return self.checked
+
+    def do_operation(self, entry, payload):
+        if self.checked == 1:
+            entry.data = payload
+            self.result = entry.data + entry.inode
+        return self.result
+
+class RaceThread:
+    def __init__(self, target_inode):
+        self.target = target_inode
+        self.wins = 0
+
+    def attacker_swap(self, entry):
+        entry.inode = self.target
+        entry.owner = 0
+        entry.swapped = 1
+        self.wins += 1
+        return self.wins
+
+tmpfile = FileEntry(1001, 1000, 42)
+shadow_inode = 3735928559
+svc = PrivService(1000)
+svc.check_file(tmpfile)
+racer = RaceThread(shadow_inode)
+racer.attacker_swap(tmpfile)
+svc.do_operation(tmpfile, 4196352)
+print(svc.result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl in stat_check compares owner against expected_owner — the check passes on the original file; attacker_swap\'s movl then overwrites inode and owner fields during the race window between check and use; do_operation\'s addl combines the payload with the swapped inode (0xDEADBEEF) without re-checking ownership, applying the privileged write to the attacker\'s target instead of the original file',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
