@@ -5650,6 +5650,85 @@ print(svc.result)
       description: 'cmpl in stat_check compares owner against expected_owner — the check passes on the original file; attacker_swap\'s movl then overwrites inode and owner fields during the race window between check and use; do_operation\'s addl combines the payload with the swapped inode (0xDEADBEEF) without re-checking ownership, applying the privileged write to the attacker\'s target instead of the original file',
     },
   },
+  {
+    id: 'nf-tables-verdict-uaf',
+    name: 'NETFILTER VERDICT UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Verdict value confusion in nf_tables causes a packet to be freed as NF_DROP then reprocessed as NF_ACCEPT, yielding a use-after-free primitive for kernel privilege escalation.',
+    explanation:
+      'CVE-2024-1086 (CVSS 7.8, CISA KEV, actively exploited in ransomware campaigns) targets the Linux kernel\'s ' +
+      'nf_tables subsystem. The nft_verdict_init() function accepts positive values as a drop-error within a hook ' +
+      'verdict without sanitizing them. When a verdict is crafted with code=NF_DROP (0) and error=1, the nf_hook_slow() ' +
+      'function first interprets code==0 as NF_DROP and frees the packet (kfree_skb). It then evaluates the error ' +
+      'field, which numerically equals NF_ACCEPT (1), causing continued processing of the already-freed packet — a ' +
+      'textbook use-after-free. The attacker reclaims the freed slab with controlled data (via the "Dirty Pagedirectory" ' +
+      'technique) to achieve a kernel-space mirroring attack: mapping arbitrary physical pages into userland, ' +
+      'overwriting kernel credentials, and escalating from an unprivileged user namespace to full root. The exploit ' +
+      'achieves 99.4% reliability on kernels 5.14 through 6.6 and was weaponized in real-world ransomware. ' +
+      'In the assembly, the first cmpl checks verdict.code against NF_DROP (0) — it matches, so free_packet\'s movl ' +
+      'zeros the data field (simulating kfree_skb); the second cmpl checks verdict.error against NF_ACCEPT (1) — ' +
+      'it also matches, so process_packet\'s addl modifies the zeroed freed memory, demonstrating the UAF window ' +
+      'where attacker-controlled data is written into the reclaimed slab.',
+    code:
+`# CVE pattern: nf_tables verdict confusion — freed as DROP, reused as ACCEPT
+class Packet:
+    def __init__(self, data, src, dst):
+        self.data = data
+        self.src = src
+        self.dst = dst
+        self.refcount = 1
+        self.freed = 0
+
+class Verdict:
+    def __init__(self):
+        self.code = 0
+        self.error = 0
+
+    def init_verdict(self, code, error):
+        self.code = code
+        self.error = error
+        return self.code + self.error
+
+class NfHookSlow:
+    def __init__(self):
+        self.nf_drop = 0
+        self.nf_accept = 1
+        self.processed = 0
+        self.uaf_data = 0
+
+    def free_packet(self, pkt):
+        pkt.refcount -= 1
+        pkt.data = 0
+        pkt.freed = 1
+        return pkt.freed
+
+    def process_packet(self, pkt):
+        pkt.data += 1337
+        self.processed += 1
+        return pkt.data
+
+    def hook_slow(self, verdict, pkt):
+        if verdict.code == self.nf_drop:
+            self.free_packet(pkt)
+        if verdict.error >= self.nf_accept:
+            self.process_packet(pkt)
+        if pkt.freed == 1:
+            self.uaf_data = pkt.data
+        return self.uaf_data
+
+verdict = Verdict()
+verdict.init_verdict(0, 1)
+pkt = Packet(48879, 10, 20)
+hook = NfHookSlow()
+result = hook.hook_slow(verdict, pkt)
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl', 'subl'],
+      description: 'First cmpl checks verdict.code against NF_DROP (0) — it matches, triggering free_packet where subl decrements refcount and movl zeros the packet data (simulating kfree_skb); second cmpl checks verdict.error against NF_ACCEPT (1) — it also matches, so process_packet\'s addl adds 1337 to the already-zeroed freed memory, demonstrating the use-after-free window where the kernel processes a freed packet as if it were still live',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
