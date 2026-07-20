@@ -5729,6 +5729,77 @@ print(result)
       description: 'First cmpl checks verdict.code against NF_DROP (0) — it matches, triggering free_packet where subl decrements refcount and movl zeros the packet data (simulating kfree_skb); second cmpl checks verdict.error against NF_ACCEPT (1) — it also matches, so process_packet\'s addl adds 1337 to the already-zeroed freed memory, demonstrating the use-after-free window where the kernel processes a freed packet as if it were still live',
     },
   },
+  {
+    id: 'unsafe-unlink',
+    name: 'UNSAFE UNLINK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted heap chunk forward/backward pointers grant an arbitrary write primitive during free-list consolidation.',
+    explanation:
+      'The unsafe unlink attack targets glibc\'s ptmalloc2 heap allocator, which manages free chunks in doubly-linked ' +
+      'lists. When adjacent free chunks are consolidated during free(), the allocator unlinks a chunk by executing: ' +
+      'FD = P->fd; BK = P->bk; FD->bk = BK; BK->fd = FD. If an attacker overflows from one heap chunk into the ' +
+      'metadata of the next — corrupting its fd and bk pointers — the unlink operation writes an attacker-controlled ' +
+      'value to an attacker-chosen address, yielding a write-what-where primitive. This technique was foundational to ' +
+      'early heap exploitation (CVE-2001-0144 in OpenSSH, CVE-2003-0201 in Samba\'s call_trans2open). Modern glibc ' +
+      'added safe unlinking checks (fd->bk == P && bk->fd == P), but the "unsafe unlink" variant bypasses them by ' +
+      'setting fd and bk to point back into a known global pointer table (e.g., an array of chunk pointers at a fixed ' +
+      'address), so the integrity check passes while still achieving a controlled relative overwrite. The attacker then ' +
+      'leverages this to corrupt a GOT entry or __free_hook, redirecting execution to shellcode or a one-gadget. ' +
+      'CVE-2024-2961 in glibc\'s iconv() demonstrated that even a 1–3 byte heap overflow can corrupt tcache fd pointers ' +
+      'for a similar arbitrary-write chain leading to RCE. In the assembly, corrupt_metadata\'s movl overwrites the ' +
+      'chunk\'s fd/bk fields with attacker-supplied values (GOT address and shellcode pointer); unsafe_unlink\'s movl ' +
+      'then performs the unlink dereference — writing the corrupted bk value (0xDEADBEEF) into the GOT entry slot, ' +
+      'the arbitrary write that redirects the next library call to attacker-controlled code.',
+    code:
+`# CVE pattern: heap unlink corruption — arbitrary write via fd/bk pointer overwrite
+class FreeChunk:
+    def __init__(self, idx, size):
+        self.idx = idx
+        self.size = size
+        self.fd = 0
+        self.bk = 0
+        self.freed = 0
+
+class HeapAllocator:
+    def __init__(self):
+        self.bins = 0
+        self.got_entry = 12345
+        self.write_target = 0
+
+    def link_free(self, chunk, next_chunk):
+        chunk.fd = next_chunk.idx
+        next_chunk.bk = chunk.idx
+        chunk.freed = 1
+        return chunk.fd
+
+    def unsafe_unlink(self, chunk):
+        fd_val = chunk.fd
+        bk_val = chunk.bk
+        self.write_target = bk_val
+        self.got_entry = fd_val
+        return self.write_target
+
+    def corrupt_metadata(self, chunk, fake_fd, fake_bk):
+        chunk.fd = fake_fd
+        chunk.bk = fake_bk
+        return chunk.fd + chunk.bk
+
+chunk_a = FreeChunk(1, 128)
+chunk_b = FreeChunk(2, 128)
+alloc = HeapAllocator()
+alloc.link_free(chunk_a, chunk_b)
+got_addr = 134520832
+shellcode_addr = 3735928559
+alloc.corrupt_metadata(chunk_b, got_addr, shellcode_addr)
+result = alloc.unsafe_unlink(chunk_b)
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'corrupt_metadata\'s movl overwrites chunk fd/bk fields with attacker-controlled GOT address (134520832) and shellcode pointer (0xDEADBEEF); unsafe_unlink\'s movl then dereferences the corrupted pointers, writing the fake bk value into got_entry — the arbitrary write primitive that redirects the next library call to attacker shellcode',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
