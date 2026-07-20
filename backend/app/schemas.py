@@ -23,6 +23,10 @@ class LineMapping(BaseModel):
     # pipeline — which does not compute per-line cost — still validates.
     asm_count: int = 0
     flags: List[str] = Field(default_factory=list)
+    # Instruction mix: how this line's asm splits across categories
+    # (mem / compute / branch / call / stack / other). Zero categories are
+    # omitted. Empty for the pyghidra pipeline, which computes no per-line mix.
+    category_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class Hotspot(BaseModel):
@@ -34,6 +38,8 @@ class Hotspot(BaseModel):
 class CostSummary(BaseModel):
     total_instructions: int
     hotspots: List[Hotspot]
+    # Program-wide instruction mix, same categories as LineMapping.category_counts.
+    category_totals: Dict[str, int] = Field(default_factory=dict)
 
 # Compile backend selectors:
 #   transpile — the AST→C→gcc pipeline (default; supports per-line mapping)

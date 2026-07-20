@@ -91,6 +91,82 @@ _COST_FLAG_PREFIXES: Tuple[Tuple[str, str], ...] = (
 _FLAG_ORDER = {"div": 0, "mul": 1, "call": 2}
 
 
+# ── Instruction-mix classification ──────────────────────────────────────────
+#
+# Where the cost flags above single out the *few* expensive mnemonics, the mix
+# answers a different question: what KIND of work is each Python line's assembly?
+# Every mapped instruction is sorted into exactly one of six categories so a
+# learner can read the *shape* of a line, not just its instruction count.
+#
+# The lesson this teaches (mission pillar 2 — spotting bad/inefficient asm):
+# at gcc -O0 every variable is spilled to the stack, so a line that reads as one
+# arithmetic step in Python explodes into a pile of `mem` moves. Seeing "6 mem,
+# 1 compute" next to a line makes that memory-traffic cost concrete, and trains
+# the eye to notice when the *composition* — not just the count — looks wrong.
+#
+#   mem      data movement / memory traffic (mov, lea, movzx, x87 fld/fst, cltd)
+#   compute  arithmetic + logic (add/sub/imul/idiv, and/or/xor, shifts, float ops)
+#   branch   control flow: jumps, plus the cmp/test/setcc that drive them
+#   call     call / return overhead (call, ret, leave)
+#   stack    explicit stack management (push, pop, enter)
+#   other    anything unrecognised (e.g. nop) — never silently miscounted
+#
+# Matched by mnemonic prefix (first match wins), so size-suffixed variants are
+# covered by one entry: "mov" catches movl/movzbl/movsbl, "j" catches every
+# conditional jump. Entries are ordered so no prefix shadows a more specific one.
+_CATEGORY_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    # stack management
+    ("push", "stack"), ("pop", "stack"), ("enter", "stack"),
+    # call / return overhead
+    ("call", "call"), ("leave", "call"), ("ret", "call"),
+    # control flow — jumps, and the compares/setcc that feed a branch
+    ("jmp", "branch"), ("loop", "branch"), ("cmp", "branch"),
+    ("test", "branch"), ("set", "branch"), ("fcom", "branch"), ("fucom", "branch"),
+    ("j", "branch"),                       # every remaining conditional jump je/jne/jl/…
+    # arithmetic / logic — listed before "mem" so imul/idiv beat any mov match
+    ("imul", "compute"), ("mul", "compute"), ("idiv", "compute"), ("div", "compute"),
+    ("add", "compute"), ("sub", "compute"), ("adc", "compute"), ("sbb", "compute"),
+    ("inc", "compute"), ("dec", "compute"), ("neg", "compute"), ("not", "compute"),
+    ("and", "compute"), ("or", "compute"), ("xor", "compute"),
+    ("sal", "compute"), ("sar", "compute"), ("shl", "compute"), ("shr", "compute"),
+    ("rol", "compute"), ("ror", "compute"),
+    ("fadd", "compute"), ("fsub", "compute"), ("fmul", "compute"), ("fdiv", "compute"),
+    ("fabs", "compute"), ("fchs", "compute"), ("fsqrt", "compute"),
+    # data movement / memory traffic
+    ("mov", "mem"), ("lea", "mem"), ("xchg", "mem"), ("cmov", "mem"),
+    ("clt", "mem"), ("cdq", "mem"), ("cwde", "mem"), ("cbw", "mem"),
+    ("fld", "mem"), ("fst", "mem"), ("fild", "mem"), ("fist", "mem"), ("fxch", "mem"),
+)
+
+# Stable display/serialisation order for category maps.
+_CATEGORY_ORDER = {"mem": 0, "compute": 1, "branch": 2, "call": 3, "stack": 4, "other": 5}
+
+
+def classify_category(mnemonic: str) -> str:
+    """Sort an x86 mnemonic into one of the six instruction-mix categories.
+
+    `mnemonic` is the lowercased first whitespace-separated token of an
+    instruction line (e.g. "movl", "idivl", "jne", "call"). Unlike
+    `_classify_mnemonic`, this is total: an unrecognised or empty mnemonic
+    returns "other" rather than None, so every counted instruction lands in
+    exactly one bucket and the per-line counts always sum to the line's
+    instruction total.
+    """
+    for prefix, category in _CATEGORY_PREFIXES:
+        if mnemonic.startswith(prefix):
+            return category
+    return "other"
+
+
+def _ordered_category_map(counts: Dict[str, int]) -> Dict[str, int]:
+    """Return `counts` with zero entries dropped and keys in display order."""
+    return {
+        cat: counts[cat]
+        for cat in sorted(counts, key=lambda c: _CATEGORY_ORDER.get(c, 99))
+        if counts[cat] > 0
+    }
+
+
 def _classify_mnemonic(mnemonic: str) -> str | None:
     """Return the cost flag for an x86 mnemonic, or None if it is unremarkable.
 
@@ -112,11 +188,17 @@ def analyze_cost(
 
     ``asm_lines`` is the list of filtered assembly text lines (1-indexed by the
     ``asm_lines`` numbers stored in each mapping). Mutates ``line_map`` in place.
+
+    Alongside the existing ``asm_count`` / ``flags``, each entry also gains a
+    ``category_counts`` map (instruction mix, zero categories omitted) and the
+    returned summary carries a program-wide ``category_totals``.
     """
     total = 0
+    category_totals: Dict[str, int] = {cat: 0 for cat in _CATEGORY_ORDER}
     for mapping in line_map.values():
         asm_nos = mapping.get("asm_lines", [])
         flags: set = set()
+        categories: Dict[str, int] = {cat: 0 for cat in _CATEGORY_ORDER}
         for asm_no in asm_nos:
             # asm_no is 1-indexed into the filtered display asm.
             if 1 <= asm_no <= len(asm_lines):
@@ -125,10 +207,14 @@ def analyze_cost(
                 flag = _classify_mnemonic(mnemonic)
                 if flag is not None:
                     flags.add(flag)
+                category = classify_category(mnemonic)
+                categories[category] += 1
+                category_totals[category] += 1
         count = len(asm_nos)
         total += count
         mapping["asm_count"] = count
         mapping["flags"] = sorted(flags, key=lambda f: _FLAG_ORDER.get(f, 99))
+        mapping["category_counts"] = _ordered_category_map(categories)
 
     # Hotspots: Python lines ranked by instruction count (descending), then by
     # line number for determinism. Only lines that produced instructions.
@@ -146,6 +232,7 @@ def analyze_cost(
     return {
         "total_instructions": total,
         "hotspots": hotspots,
+        "category_totals": _ordered_category_map(category_totals),
     }
 
 

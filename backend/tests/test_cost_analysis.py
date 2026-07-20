@@ -134,7 +134,8 @@ def test_analyze_cost_ignores_out_of_range_asm_lines():
 
 def test_analyze_cost_empty_line_map():
     summary = analyze_cost({}, [])
-    assert summary == {"total_instructions": 0, "hotspots": []}
+    # category_totals was added by the instruction-mix feature; empty here.
+    assert summary == {"total_instructions": 0, "hotspots": [], "category_totals": {}}
 
 
 # ─── End-to-end: /compile carries the cost signal ────────────────────────────
