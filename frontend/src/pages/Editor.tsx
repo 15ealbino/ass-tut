@@ -5800,6 +5800,91 @@ print(result)
       description: 'corrupt_metadata\'s movl overwrites chunk fd/bk fields with attacker-controlled GOT address (134520832) and shellcode pointer (0xDEADBEEF); unsafe_unlink\'s movl then dereferences the corrupted pointers, writing the fake bk value into got_entry — the arbitrary write primitive that redirects the next library call to attacker shellcode',
     },
   },
+  {
+    id: 'dirty-pagetable',
+    name: 'DIRTY PAGETABLE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Freed page reclaimed as a page table entry lets the attacker map arbitrary kernel physical memory into userspace with read/write, achieving full privilege escalation.',
+    explanation:
+      'Dirty Pagetable is a data-only exploitation technique that weaponizes double-free or use-after-free ' +
+      'vulnerabilities in the Linux kernel by reclaiming a freed memory page as a page table entry (PTE) page. ' +
+      'The attack proceeds in four stages: (1) trigger a double-free or UAF to return a victim page to the buddy ' +
+      'allocator\'s free list; (2) drain the per-CPU page (PCP) allocator so the kernel pulls from the buddy free ' +
+      'list when allocating page tables; (3) trigger a userspace mmap() or page fault that causes the kernel to ' +
+      'allocate a new PTE page — which reuses the freed victim page; (4) write crafted PTE values through the ' +
+      'dangling reference, mapping arbitrary physical addresses (including kernel text, credential structures, or ' +
+      'DMA regions) into attacker-controlled userspace with read/write permissions. Because PTEs are pure data ' +
+      'interpreted by the MMU hardware, this bypasses every software mitigation: KASLR, SMEP/SMAP, kCFI, shadow ' +
+      'stacks, and W^X — the CPU\'s page walker simply follows the corrupted entries. The attacker then patches ' +
+      'kernel text (e.g. overwriting setresuid() to skip permission checks) or directly modifies the current ' +
+      'task\'s cred structure to set uid/gid to 0, achieving root. CVE-2024-0582 in io_uring\'s fixed buffer ' +
+      'registration was exploited via Dirty Pagetable on kernels 5.14 through 6.6, and CVE-2024-50264 — which ' +
+      'won the 2025 Pwnie Award for Best Privilege Escalation — combined this technique with BPF JIT spraying ' +
+      'for a devastating exploit chain. In the assembly, free_page\'s movl zeros the refcount (simulating the ' +
+      'buddy allocator return), but install_pte\'s movl reuses the same stack region as a PTE page; the final ' +
+      'movl writes the kernel text physical address (0x1000000) into the PTE slot, and read_mapped\'s addl + ret ' +
+      'returns the mapped value — the MMU is now serving kernel memory to userspace.',
+    code:
+`# CVE pattern: freed page reused as PTE — maps kernel memory to userspace
+class PageFrame:
+    def __init__(self, pfn, order):
+        self.pfn = pfn
+        self.order = order
+        self.refcount = 1
+        self.freed = 0
+
+class BuddyAllocator:
+    def __init__(self):
+        self.free_head = 0
+        self.alloc_count = 0
+
+    def alloc_page(self):
+        self.alloc_count += 1
+        page = PageFrame(self.alloc_count, 0)
+        return page
+
+    def free_page(self, page):
+        page.refcount -= 1
+        page.freed = 1
+        self.free_head = page.pfn
+        return page.pfn
+
+class PageTable:
+    def __init__(self):
+        self.pte_phys = 0
+        self.present = 0
+        self.rw = 0
+        self.user = 0
+
+    def install_pte(self, phys_addr, writable):
+        self.pte_phys = phys_addr
+        self.present = 1
+        self.rw = writable
+        self.user = 1
+        return self.pte_phys
+
+    def read_mapped(self):
+        if self.present == 1:
+            return self.pte_phys + self.rw
+        return 0
+
+alloc = BuddyAllocator()
+victim_page = alloc.alloc_page()
+alloc.free_page(victim_page)
+pte = PageTable()
+pte.install_pte(victim_page.pfn, 1)
+kernel_text_phys = 16777216
+pte.pte_phys = kernel_text_phys
+pte.rw = 1
+leaked = pte.read_mapped()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'free_page\'s movl zeros the refcount and marks the page freed, returning it to the buddy allocator; install_pte\'s movl reuses the same freed page as a PTE, setting present=1 and rw=1; the final movl overwrites pte_phys with 0x1000000 (kernel text physical address) — read_mapped\'s addl confirms the MMU now maps kernel memory to userspace with write permission',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
