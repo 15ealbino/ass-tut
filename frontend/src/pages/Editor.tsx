@@ -5885,6 +5885,67 @@ print(leaked)
       description: 'free_page\'s movl zeros the refcount and marks the page freed, returning it to the buddy allocator; install_pte\'s movl reuses the same freed page as a PTE, setting present=1 and rw=1; the final movl overwrites pte_phys with 0x1000000 (kernel text physical address) — read_mapped\'s addl confirms the MMU now maps kernel memory to userspace with write permission',
     },
   },
+  {
+    id: 'house-of-force',
+    name: 'HOUSE OF FORCE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Overwriting the wilderness (top) chunk size to -1 lets a crafted malloc wrap the heap pointer to any target address.',
+    explanation:
+      'House of Force targets glibc\'s wilderness (top) chunk — the large unsplit remainder at the end of ' +
+      'the heap that services requests when no freed chunk fits. The attacker overflows into the top chunk\'s ' +
+      'size field and sets it to -1 (0xFFFFFFFF on 32-bit, 0xFFFFFFFFFFFFFFFF on 64-bit), making the ' +
+      'allocator believe it has nearly unlimited heap space. A subsequent malloc() with a calculated size ' +
+      '(target_address - top_chunk_address - header_overhead) advances the internal top pointer past the ' +
+      'target. The next normal-sized allocation returns a chunk overlapping the target — typically ' +
+      '__malloc_hook, __free_hook, or a GOT entry — giving the attacker an arbitrary write primitive. ' +
+      'Writing a one_gadget or system() address into __malloc_hook achieves code execution on the next ' +
+      'malloc() call. The technique was introduced by Phantasmal Phantasmagoria in "The Malloc Maleficarum" ' +
+      '(2005) and remained viable until glibc 2.29 added a top chunk size sanity check (size <= arena ' +
+      'system_mem). It is still relevant for embedded systems and older distributions. ' +
+      'In the assembly, overflow_top\'s `movl` writes -1 into the top_size stack slot via the `0 - 1` ' +
+      'expression; force_malloc\'s `addl` advances top_base by the attacker-controlled distance, wrapping ' +
+      'the pointer past the heap into the target region; overwrite_hook\'s `movl` then plants 0xDEADBEEF ' +
+      '(a shellcode address) into the hook slot at the target, and the final `movl` into result confirms ' +
+      'the write landed.',
+    code:
+`# CVE pattern: wilderness size → -1, crafted malloc wraps top to __malloc_hook
+class Arena:
+    def __init__(self):
+        self.top_base = 134217728
+        self.top_size = 131072
+        self.alloc_count = 0
+        self.hook_value = 0
+
+    def overflow_top(self):
+        self.top_size = 0 - 1
+        return self.top_size
+
+    def force_malloc(self, distance):
+        self.top_base += distance
+        self.top_size -= distance
+        self.alloc_count += 1
+        return self.top_base
+
+    def overwrite_hook(self, addr):
+        self.hook_value = addr
+        return self.hook_value
+
+arena = Arena()
+arena.overflow_top()
+target = 134520832
+evil_distance = target - arena.top_base
+arena.force_malloc(evil_distance)
+hook_ptr = arena.force_malloc(32)
+arena.overwrite_hook(3735928559)
+result = arena.hook_value
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'subl'],
+      description: 'overflow_top\'s movl writes -1 (0xFFFFFFFF) into the top_size stack slot, making the allocator believe it has unlimited heap; force_malloc\'s addl advances top_base by the attacker-controlled distance, wrapping past the heap boundary to the target address; overwrite_hook\'s movl plants 0xDEADBEEF (shellcode) at the overlapping allocation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
