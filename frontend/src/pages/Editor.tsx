@@ -5946,6 +5946,89 @@ print(result)
       description: 'overflow_top\'s movl writes -1 (0xFFFFFFFF) into the top_size stack slot, making the allocator believe it has unlimited heap; force_malloc\'s addl advances top_base by the attacker-controlled distance, wrapping past the heap boundary to the target address; overwrite_hook\'s movl plants 0xDEADBEEF (shellcode) at the overlapping allocation',
     },
   },
+  {
+    id: 'poison-null-byte',
+    name: 'POISON NULL BYTE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'A single null-byte overflow into an adjacent heap chunk\'s size field clears the PREV_INUSE flag, causing the allocator to merge chunks incorrectly and create overlapping allocations.',
+    explanation:
+      'The poison null byte exploits glibc malloc\'s chunk metadata layout: every heap chunk stores its ' +
+      'size and a PREV_INUSE bit in the lowest bit of the size field. When a buffer overflow writes exactly ' +
+      'one null byte (0x00) past its allocation boundary — typically from a missing string terminator or an ' +
+      'off-by-one in length calculation — it zeroes the least significant byte of the next chunk\'s size ' +
+      'field. This simultaneously shrinks the apparent chunk size and clears the PREV_INUSE flag. When that ' +
+      'chunk is later freed, malloc\'s consolidation logic reads the prev_size field (normally ignored when ' +
+      'PREV_INUSE is set) and merges backwards into what it believes is a free predecessor chunk. Because the ' +
+      'size was corrupted, the merged free region extends past the original chunk boundaries and overlaps with ' +
+      'a third chunk still in use. The next malloc() from this region returns a pointer that aliases the ' +
+      'victim chunk, giving the attacker simultaneous read/write access — leaking heap pointers and libc ' +
+      'addresses, or overwriting function pointers for code execution. ' +
+      'The technique was documented by Google Project Zero in 2014 and remains viable across glibc versions; ' +
+      'the how2heap project demonstrates it through glibc 2.35. CVE-2018-6789 (Exim mail server, CVSS 9.8) ' +
+      'exploited a single-byte heap overflow in base64 decoding to achieve pre-authentication remote code ' +
+      'execution on over 400,000 servers — the attacker corrupted an adjacent chunk\'s size to create ' +
+      'overlapping allocations and hijack Exim\'s ACL control structures. The House of Einherjar variant ' +
+      'extends this primitive by crafting a precise prev_size value to target a specific consolidation merge ' +
+      'distance, and CVE-2023-6246 (glibc __fortify_fail heap overflow) demonstrated a similar single-byte ' +
+      'corruption path to privilege escalation. ' +
+      'In the assembly, write_data\'s `movl` stores attacker input into each chunk\'s data slot; the ' +
+      'null-byte overflow appears as `movl` writing 512 into b\'s size (down from 528, modeling 0x210→0x200) ' +
+      'and `movl` zeroing b\'s prev_inuse flag; consolidate_back\'s `addl` merges the corrupted chunk size ' +
+      'into the predecessor\'s size field, extending the free region to overlap chunk C; the final `movl` ' +
+      'plants 0xDEADBEEF into c\'s prev_size through the overlapping allocation, confirming attacker-' +
+      'controlled access to adjacent heap memory.',
+    code:
+`# CVE pattern: null-byte off-by-one into next chunk size → overlapping alloc
+class HeapChunk:
+    def __init__(self, size, prev_inuse):
+        self.size = size
+        self.prev_inuse = prev_inuse
+        self.prev_size = 0
+        self.data = 0
+        self.freed = 0
+
+    def write_data(self, val):
+        self.data = val
+        return self.data
+
+class MallocState:
+    def __init__(self):
+        self.free_count = 0
+        self.overlap = 0
+
+    def free_chunk(self, chunk):
+        chunk.freed = 1
+        self.free_count += 1
+        return self.free_count
+
+    def consolidate_back(self, freed, prev):
+        prev.size += freed.size
+        self.overlap = 1
+        return prev.size
+
+a = HeapChunk(256, 1)
+b = HeapChunk(528, 1)
+c = HeapChunk(256, 1)
+a.write_data(1094795585)
+b.write_data(1111638594)
+c.write_data(3735928559)
+b.size = 512
+b.prev_inuse = 0
+b.prev_size = 256
+state = MallocState()
+state.free_chunk(b)
+state.consolidate_back(b, a)
+c.data = 0
+c.prev_size = 3735928559
+leaked = c.prev_size
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'write_data\'s movl stores attacker input into each chunk\'s data slot; the null-byte overflow appears as movl writing 512 into b\'s size (corrupted from 528, modeling 0x210→0x200) and movl zeroing b\'s prev_inuse; consolidate_back\'s addl merges the corrupted size into the predecessor, extending the free region past chunk C\'s boundary; the final movl plants 0xDEADBEEF into c\'s prev_size through the overlap',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
