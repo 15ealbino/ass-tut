@@ -6029,6 +6029,85 @@ print(leaked)
       description: 'write_data\'s movl stores attacker input into each chunk\'s data slot; the null-byte overflow appears as movl writing 512 into b\'s size (corrupted from 528, modeling 0x210→0x200) and movl zeroing b\'s prev_inuse; consolidate_back\'s addl merges the corrupted size into the predecessor, extending the free region past chunk C\'s boundary; the final movl plants 0xDEADBEEF into c\'s prev_size through the overlap',
     },
   },
+  {
+    id: 'clfs-log-corruption',
+    name: 'CLFS LOG FILE CORRUPTION',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Crafted CLFS log file base-block metadata triggers a use-after-free in the Windows kernel driver, granting SYSTEM privileges to any local user.',
+    explanation:
+      'The Windows Common Log File System (CLFS) driver — clfs.sys — parses on-disk Base Log File (BLF) ' +
+      'metadata structures in kernel mode. A crafted BLF file with corrupted container context or client ' +
+      'context offsets tricks the driver into freeing a kernel object while retaining an internal pointer ' +
+      'to it. When the freed memory is reclaimed via heap spraying (typically NtQuerySystemInformation ' +
+      'pool spray), the dangling pointer dereferences attacker-controlled data, granting an arbitrary ' +
+      'read/write primitive in kernel space. The attacker then walks the EPROCESS linked list to locate ' +
+      'the SYSTEM token and copies it to their own process, achieving full privilege escalation. ' +
+      'CLFS has been the single most exploited Windows kernel attack surface since 2022, with at least ' +
+      'six zero-day exploits captured in the wild: CVE-2022-24521 (reported by NSA and CrowdStrike), ' +
+      'CVE-2022-37969, CVE-2023-23376, CVE-2023-28252 (used by Nokoyawa ransomware to deploy payloads ' +
+      'on Windows servers), CVE-2024-49138 (exploited in the wild before December 2024 patch), and ' +
+      'CVE-2025-29824 (exploited against IT, financial, and retail targets in the US, Venezuela, Spain, ' +
+      'and Saudi Arabia — Microsoft warned of widespread ransomware deployment). All share the same root ' +
+      'cause: the CLFS driver trusts on-disk metadata offsets without sufficient bounds validation, and ' +
+      'corrupted log files can be created by any unprivileged user via the CreateLogFile API. ' +
+      'In the assembly, `movl` stores the original kernel object fields (handler, pool_tag) into stack ' +
+      'slots during allocate; release_ctx zeroes them but the dangling pointer in ClfsContext persists — ' +
+      '`movl` writes attacker-sprayed values (0xDEADBEEF) into the freed slots and `addl` in deref_stale ' +
+      'reads through the same offsets, providing the kernel read/write primitive that enables token theft.',
+    code:
+`# CVE pattern: CLFS BLF metadata corruption — UAF to SYSTEM token theft
+class KernelPool:
+    def __init__(self, tag, size):
+        self.tag = tag
+        self.size = size
+        self.handler = 0
+        self.pool_tag = 0
+        self.freed = 0
+
+    def allocate(self, handler, pool_tag):
+        self.handler = handler
+        self.pool_tag = pool_tag
+        return self.handler
+
+    def release(self):
+        self.handler = 0
+        self.pool_tag = 0
+        self.freed = 1
+        return self.freed
+
+class ClfsContext:
+    def __init__(self, base_offset):
+        self.base_offset = base_offset
+        self.container_ctx = 0
+        self.stale_ref = 0
+        self.corrupted = 0
+
+    def parse_blf(self, pool):
+        self.container_ctx = pool.handler
+        self.stale_ref = pool.pool_tag
+        return self.container_ctx
+
+    def deref_stale(self):
+        result = self.container_ctx + self.stale_ref
+        self.corrupted = 1
+        return result
+
+pool = KernelPool(1129270867, 192)
+pool.allocate(4196352, 1129270867)
+ctx = ClfsContext(4096)
+ctx.parse_blf(pool)
+pool.release()
+pool.handler = 3735928559
+pool.pool_tag = 4196608
+leaked = ctx.deref_stale()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the kernel object handler and pool_tag into stack slots during allocate; release zeroes them but ClfsContext retains the stale reference — movl writes attacker-sprayed values (0xDEADBEEF) into the freed slots and addl in deref_stale reads through the same dangling offsets, providing the kernel read/write primitive used to steal the SYSTEM token from the EPROCESS list',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
