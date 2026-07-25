@@ -38,11 +38,19 @@ export interface LineMapping {
   // Python line compiled to, plus flags for expensive mnemonics.
   asm_count?: number
   flags?: string[]
+  // Instruction mix: how this line's asm splits across categories
+  // (mem / compute / branch / call / stack / other). Zero categories omitted.
+  category_counts?: Record<string, number>
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
 
-export interface CostSummary { total_instructions: number; hotspots: Hotspot[] }
+export interface CostSummary {
+  total_instructions: number
+  hotspots: Hotspot[]
+  // Program-wide instruction mix (same categories as LineMapping.category_counts).
+  category_totals?: Record<string, number>
+}
 
 export interface CompileResponse {
   python_lines: string[]

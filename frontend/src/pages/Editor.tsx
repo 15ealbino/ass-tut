@@ -18,6 +18,30 @@ const FLAG_LABEL: Record<string, string> = {
   call: 'function call',
 }
 
+// ─── Instruction-mix presentation ──────────────────────────────────────────
+// Backend sorts every mapped x86 instruction into one of these categories so a
+// learner can read the *shape* of a line, not just its instruction count. The
+// order here is the order they are shown in tooltips and the MIX summary chip.
+const CATEGORY_ORDER = ['mem', 'compute', 'branch', 'call', 'stack', 'other'] as const
+const CATEGORY_LABEL: Record<string, string> = {
+  mem: 'memory',
+  compute: 'compute',
+  branch: 'branch',
+  call: 'call',
+  stack: 'stack',
+  other: 'other',
+}
+
+// Render a category-count map as a compact "mem 6 · compute 1" string in the
+// stable CATEGORY_ORDER, skipping categories the backend already omitted.
+function formatMix(counts?: Record<string, number>): string {
+  if (!counts) return ''
+  return CATEGORY_ORDER
+    .filter(cat => (counts[cat] ?? 0) > 0)
+    .map(cat => `${CATEGORY_LABEL[cat] ?? cat} ${counts[cat]}`)
+    .join(' · ')
+}
+
 // ─── Vulnerability catalogue ───────────────────────────────────────────────
 
 interface Vuln {
@@ -6709,6 +6733,25 @@ export default function EditorPage() {
               COST:: {result.cost_summary.total_instructions} INSTR
             </span>
           )}
+          {result.cost_summary?.category_totals && formatMix(result.cost_summary.category_totals) && (
+            <span
+              title={`Instruction mix — how the program's x86 splits across categories: ${formatMix(result.cost_summary.category_totals)}. At -O0, a high 'memory' share reflects stack spilling.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+              }}
+            >
+              MIX:: {formatMix(result.cost_summary.category_totals)}
+            </span>
+          )}
           {result.python_lines.map((line, i) => {
             const pyLine = i + 1
             const mapping = result.line_map[pyLine] as LineMapping | undefined
@@ -6718,6 +6761,9 @@ export default function EditorPage() {
             const count = mapping.asm_count ?? 0
             const flagTitle = flags.length
               ? ` — expensive: ${flags.map(f => FLAG_LABEL[f] ?? f).join(', ')}`
+              : ''
+            const mixTitle = formatMix(mapping.category_counts)
+              ? ` — mix: ${formatMix(mapping.category_counts)}`
               : ''
             return (
               <button
@@ -6739,7 +6785,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${flagTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${flagTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
