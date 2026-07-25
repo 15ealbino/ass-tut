@@ -6132,6 +6132,73 @@ print(leaked)
       description: 'movl stores the kernel object handler and pool_tag into stack slots during allocate; release zeroes them but ClfsContext retains the stale reference — movl writes attacker-sprayed values (0xDEADBEEF) into the freed slots and addl in deref_stale reads through the same dangling offsets, providing the kernel read/write primitive used to steal the SYSTEM token from the EPROCESS list',
     },
   },
+  {
+    id: 'partial-overwrite',
+    name: 'PARTIAL POINTER OVERWRITE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Single-byte overflow corrupts only the LSB of an adjacent pointer, redirecting it to a nearby attacker-controlled address while bypassing ASLR.',
+    explanation:
+      'Partial pointer overwrite (CWE-787 / CWE-122 adjacent) exploits x86 little-endian byte ordering to turn ' +
+      'a minimal one-byte overflow into a full control-flow hijack without defeating ASLR. On a 64-bit system, ' +
+      'ASLR randomizes the upper bytes of code and heap addresses, but the lower 12 bits (page offset) are always ' +
+      'deterministic. A single-byte heap or stack overflow spills into the least significant byte of an adjacent ' +
+      'pointer — changing only its low 8 bits (256 possible offsets) while leaving the ASLR-randomized upper bytes ' +
+      'intact. The attacker heap-grooms a shellcode payload at a known offset within the same 256-byte window as the ' +
+      'original target, so the one-byte corruption lands the redirected pointer squarely on their payload. ' +
+      'CVE-2021-3156 (sudo Baron Samedit, CVSS 7.8) is the textbook real-world example: an off-by-one heap overflow ' +
+      'in sudoedit\'s backslash-escape parsing corrupted the LSB of an adjacent service_user struct pointer. Qualys ' +
+      'demonstrated that this single-byte corruption was sufficient to redirect sudo\'s nss_load_library() to an ' +
+      'attacker-controlled shared object, achieving root on Ubuntu, Debian, Fedora, and every major Linux distribution ' +
+      'without brute-forcing ASLR. The vulnerability existed since July 2011 (sudo 1.8.2). CVE-2018-16865 (systemd-journald, ' +
+      'CVSS 7.8) used an alloca-based stack overflow that partially overwrote a return-address byte, redirecting execution ' +
+      'within the same code page — Qualys achieved a local root shell in 10 minutes on i386. CVE-2023-6246 (glibc ' +
+      '__vsyslog_internal) was also noted as exploitable via partial heap pointer overwrite. ' +
+      'In the assembly, movl stores the original fd_ptr into a stack slot; addl in overflow_lsb adds the attacker\'s ' +
+      'byte offset (128) to the base pointer, redirecting it within the same page — the upper ASLR-randomized bytes ' +
+      'from bk_ptr survive untouched. imull in follow_fd then multiplies the corrupted pointer value as an operand, ' +
+      'effectively dereferencing the redirected address into the attacker\'s nearby payload.',
+    code:
+`# CVE pattern: 1-byte heap overflow corrupts pointer LSB — ASLR bypass
+class HeapChunk:
+    def __init__(self, size, fd_ptr):
+        self.size = size
+        self.fd_ptr = fd_ptr
+        self.bk_ptr = fd_ptr
+        self.written = 0
+
+    def overflow_lsb(self, new_lsb):
+        self.fd_ptr = self.bk_ptr + new_lsb
+        self.written = 1
+        return self.fd_ptr
+
+    def follow_fd(self):
+        result = self.fd_ptr * 2
+        return result
+
+class Payload:
+    def __init__(self, base, shellcode):
+        self.base = base
+        self.shellcode = shellcode
+        self.executed = 0
+
+    def trigger(self, redirected):
+        result = redirected + self.shellcode
+        self.executed = 1
+        return result
+
+chunk = HeapChunk(64, 4196352)
+payload = Payload(4196480, 3735928559)
+chunk.overflow_lsb(128)
+target = chunk.follow_fd()
+hijacked = payload.trigger(target)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['addl', 'imull'],
+      description: 'addl in overflow_lsb adds the attacker\'s byte (128) to the base pointer stored in bk_ptr, corrupting only the LSB of fd_ptr while the upper ASLR-randomized bytes survive — imull in follow_fd multiplies the corrupted pointer as an operand, dereferencing the redirected address into attacker-controlled memory at +128 offset without requiring any ASLR information leak',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
