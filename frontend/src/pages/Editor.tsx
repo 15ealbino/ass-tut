@@ -6199,6 +6199,73 @@ print(hijacked)
       description: 'addl in overflow_lsb adds the attacker\'s byte (128) to the base pointer stored in bk_ptr, corrupting only the LSB of fd_ptr while the upper ASLR-randomized bytes survive — imull in follow_fd multiplies the corrupted pointer as an operand, dereferencing the redirected address into attacker-controlled memory at +128 offset without requiring any ASLR information leak',
     },
   },
+  {
+    id: 'ret2dlresolve',
+    name: 'RET2DLRESOLVE',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker forges fake ELF relocation, symbol, and string table entries to trick the dynamic linker into resolving an arbitrary function — bypassing ASLR without any memory leak.',
+    explanation:
+      'ret2dlresolve abuses the ELF lazy binding mechanism to resolve attacker-chosen functions (e.g. system()) ' +
+      'without knowing libc\'s base address, completely bypassing ASLR. On Linux, the dynamic linker defers symbol ' +
+      'resolution until a function is first called — the PLT stub pushes a relocation index onto the stack and ' +
+      'jumps to _dl_runtime_resolve. The resolver walks three ELF sections: .rel.plt (Elf64_Rela) to find the ' +
+      'relocation entry, .dynsym (Elf64_Sym) to find the symbol, and .dynstr to read the function name string. ' +
+      'The attacker overwrites the stack to return into the PLT stub with a crafted relocation index that points ' +
+      'past the real .rel.plt into attacker-controlled memory. There, fake Elf64_Rela, Elf64_Sym, and string ' +
+      'table entries are staged so that the .dynstr lookup yields "system" instead of the original function name. ' +
+      'The resolver dutifully resolves system(), writes its address into the GOT slot, and jumps to it with ' +
+      'attacker-supplied arguments (e.g. "/bin/sh"). The technique was first described in Nergal\'s 2001 Phrack ' +
+      'paper "Advanced return-into-lib(c)" and is now automated by pwntools\' Ret2dlresolvePayload. It only works ' +
+      'under No RELRO or Partial RELRO — Full RELRO marks the GOT read-only at startup. Related dynamic-linker ' +
+      'CVEs include CVE-2023-4911 (Looney Tunables — ld.so buffer overflow in GLIBC_TUNABLES parsing, CVSS 7.8) ' +
+      'and CVE-2025-4802 (dlopen LD_LIBRARY_PATH bypass in static setuid binaries). ' +
+      'In the assembly, the fake relocation index is loaded via movl and added to the section base; the resolver\'s ' +
+      'addl computes the symbol name pointer from dynstr_base + name_off, and a second movl writes the resolved ' +
+      'address into the GOT slot — from that point every subsequent PLT call jumps to the attacker\'s chosen function.',
+    code:
+`# CVE pattern: ret2dlresolve — forge ELF entries to hijack lazy binding
+class FakeReloc:
+    def __init__(self, got_off, sym_idx):
+        self.got_off = got_off
+        self.sym_idx = sym_idx
+        self.r_type = 7
+        self.resolved = 0
+
+class FakeSym:
+    def __init__(self, name_off):
+        self.name_off = name_off
+        self.value = 0
+        self.bound = 0
+
+def plt_stub(reloc_idx):
+    result = reloc_idx + 0
+    return result
+
+def dl_fixup(reloc, sym, dynstr_base):
+    name_addr = dynstr_base + sym.name_off
+    sym.value = name_addr
+    sym.bound = 1
+    reloc.resolved = sym.value
+    return reloc.resolved
+
+plt_base = 4198448
+got_slot = 6295552
+dynstr = 4196352
+
+fake_r = FakeReloc(got_slot, 42)
+fake_s = FakeSym(128)
+
+idx = plt_stub(fake_r.sym_idx)
+resolved = dl_fixup(fake_r, fake_s, dynstr)
+got_val = fake_r.got_off + resolved
+print(got_val)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads the crafted relocation index (sym_idx 42) from the stack — this index points past the real .rel.plt into attacker-controlled memory containing a fake Elf64_Rela and Elf64_Sym chain; addl in dl_fixup computes the name pointer (dynstr_base + name_off) which resolves to "system" instead of the original function, and a final movl writes the resolved libc address into the GOT slot so all subsequent PLT calls jump to the attacker\'s chosen function',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
