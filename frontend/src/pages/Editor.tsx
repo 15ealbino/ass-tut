@@ -6266,6 +6266,77 @@ print(got_val)
       description: 'movl loads the crafted relocation index (sym_idx 42) from the stack — this index points past the real .rel.plt into attacker-controlled memory containing a fake Elf64_Rela and Elf64_Sym chain; addl in dl_fixup computes the name pointer (dynstr_base + name_off) which resolves to "system" instead of the original function, and a final movl writes the resolved libc address into the GOT slot so all subsequent PLT calls jump to the attacker\'s chosen function',
     },
   },
+  {
+    id: 'http-request-smuggling',
+    name: 'HTTP REQUEST SMUGGLING',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'Conflicting Content-Length and Transfer-Encoding headers cause front-end and back-end servers to disagree on request boundaries, letting an attacker inject a hidden second request.',
+    explanation:
+      'HTTP request smuggling (CWE-444) exploits ambiguity in how layered HTTP processors — reverse proxies, ' +
+      'load balancers, and origin servers — determine where one request ends and the next begins. The HTTP/1.1 ' +
+      'spec provides two framing mechanisms: Content-Length (CL) specifies the body size in bytes, and ' +
+      'Transfer-Encoding: chunked (TE) uses size-prefixed chunks terminated by a zero-length chunk. When a ' +
+      'message contains both headers, compliant servers must prefer TE — but many implementations disagree, ' +
+      'creating a desync. In a CL.TE attack, the front-end proxy uses Content-Length and forwards the full ' +
+      'body, but the back-end uses Transfer-Encoding and stops reading at the first zero chunk, treating the ' +
+      'remaining bytes as the start of a NEW request. This smuggled request bypasses all front-end security — ' +
+      'WAF rules, authentication checks, and access controls — because the proxy never sees it as a separate ' +
+      'request. CVE-2023-25690 (Apache httpd mod_proxy, CVSS 9.8) allowed request smuggling via crafted ' +
+      'request URIs sent through mod_rewrite and mod_proxy, enabling full request and response manipulation. ' +
+      'CVE-2024-1135 (Gunicorn, CVSS 7.5) failed to validate conflicting Transfer-Encoding headers, allowing ' +
+      'request desynchronization, cache poisoning, and session hijacking. CVE-2024-34350 (Next.js, CVSS 7.5) ' +
+      'caused response queue poisoning through inconsistent HTTP request interpretation when rewrites were ' +
+      'enabled. ' +
+      'In the assembly, the two parsers produce different boundary values via independent movl instructions — ' +
+      'cmpl then compares these endpoints, and the subl in the smuggle-length calculation reveals the exact ' +
+      'number of bytes that slip past the front-end\'s view into the back-end\'s request queue.',
+    code:
+`# CVE pattern: HTTP request smuggling — CL.TE desync hides a second request
+class HttpMessage:
+    def __init__(self, cl_hdr, te_chunk, total):
+        self.cl_hdr = cl_hdr
+        self.te_chunk = te_chunk
+        self.total = total
+        self.smuggled = 0
+
+class ProxyParser:
+    def __init__(self):
+        self.boundary = 0
+        self.forwarded = 0
+
+    def parse_cl(self, msg):
+        self.boundary = msg.cl_hdr
+        self.forwarded = self.boundary
+        return self.forwarded
+
+class OriginParser:
+    def __init__(self):
+        self.boundary = 0
+        self.consumed = 0
+
+    def parse_te(self, msg):
+        self.boundary = msg.te_chunk
+        self.consumed = self.boundary
+        return self.consumed
+
+msg = HttpMessage(128, 64, 200)
+proxy = ProxyParser()
+origin = OriginParser()
+
+front_end = proxy.parse_cl(msg)
+back_end = origin.parse_te(msg)
+
+if front_end > back_end:
+    msg.smuggled = front_end - back_end
+
+print(msg.smuggled)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'subl'],
+      description: 'movl loads the Content-Length boundary (128) into the proxy parser and the Transfer-Encoding chunk size (64) into the origin parser — these independent stores produce the desync; cmpl compares the two endpoints, confirming the proxy forwarded more bytes than the origin consumed; subl computes the smuggled byte count (128 - 64 = 64), representing the hidden second request that bypasses all front-end security controls',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
