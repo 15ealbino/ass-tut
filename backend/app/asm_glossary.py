@@ -74,7 +74,7 @@ _GLOSSARY_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("fld1",  "push the constant 1.0 onto the x87 register stack"),
     ("fild",  "load an integer and push it onto the x87 stack as a float"),
     ("fld",   "push a floating-point value onto the x87 register stack"),
-    ("fistp", "convert the top x87 float to an integer, store it, and pop"),
+    ("fist", "convert the top x87 float to an integer and store it (fistp also pops)"),
     ("fst",   "store the top x87 float (fstp also pops it off the stack)"),
     ("fadd",  "floating-point addition (x87)"),
     ("fsub",  "floating-point subtraction (x87)"),
