@@ -32,6 +32,10 @@ _GLOSSARY_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("call",  "call a function: push the return address, then jump to it"),
     ("ret",   "return to the caller using the pushed return address"),
     # ── data movement (widening variants before the generic 'mov') ────────
+    # "movz"/"movs" here match gcc's zero/sign-extend moves (movzbl, movswl, …).
+    # x86 also has a bare `movs` string-move with an unrelated meaning, but the
+    # transpiler's supported subset emits no string/array copies, so gcc never
+    # produces it; revisit this entry if such constructs are ever added.
     ("movz",  "move with zero-extension: widen an unsigned value into a larger register"),
     ("movs",  "move with sign-extension: widen a signed value, preserving its sign"),
     ("mov",   "copy data between registers, memory, and immediates (no arithmetic)"),
