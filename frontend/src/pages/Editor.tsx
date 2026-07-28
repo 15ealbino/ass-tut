@@ -6337,6 +6337,76 @@ print(msg.smuggled)
       description: 'movl loads the Content-Length boundary (128) into the proxy parser and the Transfer-Encoding chunk size (64) into the origin parser — these independent stores produce the desync; cmpl compares the two endpoints, confirming the proxy forwarded more bytes than the origin consumed; subl computes the smuggled byte count (128 - 64 = 64), representing the hidden second request that bypasses all front-end security controls',
     },
   },
+  {
+    id: 'jop-chain',
+    name: 'JUMP-ORIENTED PROGRAMMING',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Chains indirect-jump gadgets through a dispatcher loop to execute arbitrary code without using return instructions, bypassing shadow-stack and return-address signing defenses.',
+    explanation:
+      'Jump-Oriented Programming (JOP) is a code-reuse attack that chains short instruction sequences (gadgets) ' +
+      'ending in indirect jumps (jmp *%rax, jmp *(%rbx)) instead of the RET instructions used by ROP. A central ' +
+      '"dispatcher" gadget acts as a trampoline: it loads the next gadget address from an attacker-controlled ' +
+      'dispatch table, jumps to it, and each functional gadget jumps back to the dispatcher after performing ' +
+      'its operation. Because no RET instruction is ever executed, JOP completely defeats return-address ' +
+      'protections including Intel CET shadow stacks, ARM Pointer Authentication (PAC) on LR, and compiler-based ' +
+      'Return Address Protection (RAP). The technique was formalized by Bletsch et al. (ASIACCS 2011), who proved ' +
+      'Turing-complete computation using only indirect jumps on x86. In practice, JOP-style forward-edge gadget ' +
+      'chains have become essential on platforms where hardware return-address signing blocks traditional ROP: ' +
+      'Operation Triangulation (Kaspersky, 2023), a zero-click iOS exploit chain leveraging CVE-2023-32434 ' +
+      '(XNU kernel integer overflow), required PAC-aware code-reuse techniques on Apple A-series chips because ' +
+      'hardware return-address signing rendered classic ROP infeasible. Modern mitigations like Intel CET Indirect ' +
+      'Branch Tracking (IBT) and ARM Branch Target Identification (BTI) attempt to limit JOP by requiring ' +
+      'ENDBR64/BTI landing-pad instructions at valid jump targets, but incomplete compiler coverage and gadgets ' +
+      'that naturally start with these bytes keep JOP viable on all major architectures. ' +
+      'In the assembly, the dispatch loop generates movl (loading the next gadget index from the table), addl ' +
+      '(advancing the payload accumulator), and jmp (indirect transfer to the selected gadget) — the complete ' +
+      'absence of call/ret pairs is the hallmark distinguishing JOP from traditional ROP.',
+    code:
+`# CVE pattern: JOP — dispatcher chains jump gadgets without return instructions
+class DispatchTable:
+    def __init__(self, size):
+        self.size = size
+        self.index = 0
+        self.target = 0
+        self.payload = 0
+
+class Gadget:
+    def __init__(self, addr, effect):
+        self.addr = addr
+        self.effect = effect
+        self.executed = 0
+
+    def run(self, table):
+        self.executed = 1
+        table.payload = table.payload + self.effect
+        table.index = table.index + 1
+        return table.index
+
+table = DispatchTable(4)
+g0 = Gadget(4096, 10)
+g1 = Gadget(4128, 20)
+g2 = Gadget(4160, 30)
+g3 = Gadget(4192, 40)
+
+while table.index < table.size:
+    target = table.index
+    if target == 0:
+        table.index = g0.run(table)
+    elif target == 1:
+        table.index = g1.run(table)
+    elif target == 2:
+        table.index = g2.run(table)
+    else:
+        table.index = g3.run(table)
+
+print(table.payload)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'jmp'],
+      description: 'movl loads the next gadget index from the dispatch table into a register — this is the dispatcher reading the attacker-controlled jump target; addl advances the payload accumulator inside each gadget, simulating the side-effect of each functional gadget in the chain; jmp performs the indirect control-flow transfer to the selected gadget without touching the return stack — the complete absence of call/ret pairs is the hallmark of JOP and the reason shadow-stack defenses like Intel CET cannot detect the hijacked control flow',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
