@@ -6407,6 +6407,74 @@ print(table.payload)
       description: 'movl loads the next gadget index from the dispatch table into a register — this is the dispatcher reading the attacker-controlled jump target; addl advances the payload accumulator inside each gadget, simulating the side-effect of each functional gadget in the chain; jmp performs the indirect control-flow transfer to the selected gadget without touching the return stack — the complete absence of call/ret pairs is the hallmark of JOP and the reason shadow-stack defenses like Intel CET cannot detect the hijacked control flow',
     },
   },
+  {
+    id: 'cachewarp-invd',
+    name: 'CACHEWARP FAULT INJECTION',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Malicious hypervisor selectively drops dirty cache lines via INVD, reverting security-critical stores and bypassing authentication in encrypted VMs.',
+    explanation:
+      'CacheWarp (CVE-2023-20592) is a software-based fault injection attack against AMD SEV-ES and SEV-SNP ' +
+      'encrypted virtual machines, presented at USENIX Security 2024 by researchers from CISPA Helmholtz Center ' +
+      'and Graz University of Technology. The malicious hypervisor issues the x86 INVD instruction to invalidate ' +
+      'a CPU cache line without writing it back to memory — silently dropping the VM\'s most recent store to that ' +
+      'address on single-store granularity. When the VM reads the variable again, it sees the old (stale) value ' +
+      'instead of the value it just wrote. Two primitives enable the attack: "timewarp" resets the return address ' +
+      'to re-execute prior code, and "dropforge" reverts a security-critical write to its pre-store value. ' +
+      'Researchers demonstrated three attacks: bypassing OpenSSH authentication by dropping the "auth failed" ' +
+      'return-value store so the caller sees a stale "success" value; escalating to root by reverting a sudo ' +
+      'permission-check flag; and extracting RSA private keys from OpenSSL by dropping a single multiplication ' +
+      'step in modular exponentiation. The attack affects AMD EPYC 1st-gen Naples through 3rd-gen Milan; AMD ' +
+      'patched Milan via microcode but confirmed Naples and Rome have no fix. 4th-gen Genoa (Zen 4) is not affected. ' +
+      'In the assembly, verify\'s movl stores result = 0 (auth failed) into a stack slot, but invd_revert\'s movl ' +
+      'overwrites it with the stale pre-write value (1); escalate\'s imull then multiplies the reverted result ' +
+      'by 9999 to compute priv_level — root access is granted because the critical "fail" store was silently dropped.',
+    code:
+`# CVE pattern: INVD drops auth-fail store — stale value bypasses login
+class AuthState:
+    def __init__(self, default_result):
+        self.result = default_result
+        self.password_ok = 0
+        self.priv_level = 0
+        self.session_id = 0
+
+    def verify(self, provided, expected):
+        if provided == expected:
+            self.password_ok = 1
+            self.result = 1
+        else:
+            self.password_ok = 0
+            self.result = 0
+        return self.result
+
+    def escalate(self):
+        self.priv_level = self.result * 9999
+        self.session_id = self.priv_level + 1337
+        return self.session_id
+
+class FaultInjector:
+    def __init__(self):
+        self.faults = 0
+        self.target_offset = 0
+
+    def invd_revert(self, state, stale_val):
+        state.result = stale_val
+        self.faults += 1
+        self.target_offset += 1
+        return self.faults
+
+state = AuthState(1)
+injector = FaultInjector()
+state.verify(42, 1337)
+injector.invd_revert(state, 1)
+hijacked = state.escalate()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'verify\'s movl stores result = 0 (auth failed) into the stack slot, but invd_revert\'s movl overwrites it with the stale value 1 — escalate\'s imull multiplies the reverted result by 9999 to compute priv_level, granting root access because the hypervisor\'s INVD instruction silently dropped the authentication-failure store',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
