@@ -6475,6 +6475,68 @@ print(hijacked)
       description: 'verify\'s movl stores result = 0 (auth failed) into the stack slot, but invd_revert\'s movl overwrites it with the stale value 1 — escalate\'s imull multiplies the reverted result by 9999 to compute priv_level, granting root access because the hypervisor\'s INVD instruction silently dropped the authentication-failure store',
     },
   },
+  {
+    id: 'ghostwrite-phys',
+    name: 'GHOSTWRITE PHYS BYPASS',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Faulty RISC-V vector store instructions bypass virtual memory translation entirely, writing directly to physical addresses and breaking all OS isolation.',
+    explanation:
+      'GhostWrite (CVE-2024-44067) is a direct CPU bug in the T-Head XuanTie C910 and C920 RISC-V processors, ' +
+      'discovered by CISPA Helmholtz Center researchers via differential fuzz-testing in August 2024. Unlike ' +
+      'side-channel or transient-execution attacks, GhostWrite is a straightforward hardware flaw: the non-standard ' +
+      'high-order vector store instructions (vse128.v through vse1024.v) illegally use physical addresses instead of ' +
+      'virtual addresses as the store target. This means an unprivileged user-space process can write arbitrary data ' +
+      'to any physical memory location, completely bypassing the MMU, page tables, and all OS-enforced process ' +
+      'isolation. The attacker can overwrite kernel code, other processes\' memory, or MMIO registers to control ' +
+      'hardware peripherals such as network cards. The bug is invisible to performance counters because the faulty ' +
+      'store bypasses caches entirely. Mitigation requires disabling the entire vector extension, sacrificing roughly ' +
+      '77% of the CPU\'s throughput — effectively crippling the chip. The vulnerability cannot be patched in software ' +
+      'without this devastating performance cost. In the assembly, safe_store\'s addl computes a translated virtual ' +
+      'address and the conditional movl is blocked when permission is zero, but phys_store\'s movl writes directly ' +
+      'to the kernel_secret stack slot without any address translation or permission check — modeling how the faulty ' +
+      'RISC-V vector store bypasses the MMU to reach raw physical memory.',
+    code:
+`# CVE pattern: vector store bypasses MMU — raw physical write
+class PhysicalMemory:
+    def __init__(self):
+        self.kernel_secret = 0
+        self.user_data = 0
+        self.page_table_base = 0
+        self.mmio_region = 0
+
+    def translate(self, virt_addr, perm):
+        if perm == 0:
+            return 0
+        return virt_addr + self.page_table_base
+
+    def safe_store(self, virt_addr, value, perm):
+        phys = self.translate(virt_addr, perm)
+        if phys == 0:
+            return 0
+        self.user_data = value
+        return 1
+
+    def phys_store(self, phys_addr, value):
+        self.kernel_secret = value
+        self.mmio_region = phys_addr
+        return 1
+
+mem = PhysicalMemory()
+mem.page_table_base = 4096
+mem.kernel_secret = 31337
+
+blocked = mem.safe_store(8192, 42, 0)
+print(blocked)
+
+written = mem.phys_store(16, 57005)
+print(mem.kernel_secret)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'safe_store\'s addl computes a translated virtual address and movl is blocked when permission is 0, but phys_store\'s movl writes directly to the kernel_secret stack slot without any address translation or permission check — modeling how the faulty RISC-V vector store (vse128.v) bypasses the MMU entirely',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
