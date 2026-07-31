@@ -6537,6 +6537,73 @@ print(mem.kernel_secret)
       description: 'safe_store\'s addl computes a translated virtual address and movl is blocked when permission is 0, but phys_store\'s movl writes directly to the kernel_secret stack slot without any address translation or permission check — modeling how the faulty RISC-V vector store (vse128.v) bypasses the MMU entirely',
     },
   },
+  {
+    id: 'pac-forgery',
+    name: 'PAC FORGERY',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Speculative execution oracle brute-forces pointer authentication codes, bypassing ARM control-flow integrity to hijack signed pointers.',
+    explanation:
+      'ARM Pointer Authentication (PA) adds a cryptographic signature — the Pointer Authentication Code — to the ' +
+      'upper bits of every code and data pointer, blocking control-flow hijacking even when an attacker has an ' +
+      'arbitrary write. The PACMAN attack (MIT CSAIL, ISCA 2022, demonstrated on Apple M1) defeats this by building ' +
+      'a speculative PAC oracle: the attacker speculatively authenticates a pointer with a guessed PAC via an AUT ' +
+      'instruction, then dereferences it. A correct guess loads a TLB entry observable through a cache timing side ' +
+      'channel; an incorrect guess faults silently in the speculative window and leaves no trace. Because the PAC ' +
+      'field is only 7–16 bits wide, the full keyspace can be exhausted in seconds without crashing the victim. ' +
+      'Once the correct PAC is known, the attacker forges a signed pointer to a ROP gadget or shellcode, converting ' +
+      'a memory corruption bug into full control-flow hijack on hardware that was supposed to prevent exactly that. ' +
+      'The attack works across privilege boundaries — user-to-kernel forgery was demonstrated — and is unfixable ' +
+      'without hardware changes (FEAT_FPAC) because it exploits the fundamental interaction between speculative ' +
+      'execution and the TLB. In the assembly, sign_ptr\'s addl and movl compute and embed a PAC into the pointer, ' +
+      'but speculative_oracle\'s loop iteratively guesses PAC values via cmpl and conditionally dereferences via ' +
+      'movl — modeling the timing oracle that leaks whether each guess matched.',
+    code:
+`# CVE pattern: speculative PAC oracle brute-forces pointer signature
+class PointerAuth:
+    def __init__(self):
+        self.secret_key = 48879
+        self.target_addr = 256
+        self.signed_ptr = 0
+        self.cache_state = 0
+
+    def sign_ptr(self, addr, ctx):
+        pac = (addr * 31 + ctx) % 256
+        self.signed_ptr = addr + pac * 256
+        return self.signed_ptr
+
+    def auth_ptr(self, ptr, ctx):
+        addr = ptr % 256
+        pac = ptr / 256
+        expected = (addr * 31 + ctx) % 256
+        if pac == expected:
+            return addr
+        return 0
+
+    def speculative_oracle(self, addr, ctx):
+        guess = 0
+        found = 0
+        while guess < 256:
+            forged = addr + guess * 256
+            result = self.auth_ptr(forged, ctx)
+            if result > 0:
+                self.cache_state = result
+                found = guess
+            guess += 1
+        return found
+
+pa = PointerAuth()
+signed = pa.sign_ptr(16, 7)
+print(signed)
+
+forged_pac = pa.speculative_oracle(16, 7)
+print(forged_pac)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'sign_ptr\'s addl and movl embed a real PAC into the pointer, but speculative_oracle\'s cmpl loop iterates 256 guesses and its conditional movl dereferences the forged pointer on a match — modeling the speculative TLB oracle that leaks the correct PAC without crashing, bypassing ARM Pointer Authentication entirely',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
