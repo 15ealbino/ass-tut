@@ -6604,6 +6604,64 @@ print(forged_pac)
       description: 'sign_ptr\'s addl and movl embed a real PAC into the pointer, but speculative_oracle\'s cmpl loop iterates 256 guesses and its conditional movl dereferences the forged pointer on a match — modeling the speculative TLB oracle that leaks the correct PAC without crashing, bypassing ARM Pointer Authentication entirely',
     },
   },
+  {
+    id: 'kaslr-bypass',
+    name: 'KASLR BYPASS',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Leaked kernel pointer reveals the randomized base address, defeating address-space layout randomization and enabling precise code-reuse attacks.',
+    explanation:
+      'Kernel Address Space Layout Randomization (KASLR) shifts the kernel text, modules, and heap to a ' +
+      'random base on every boot, forcing attackers to guess addresses. A single leaked kernel pointer — from ' +
+      'an uninitialized struct field copied to userspace, a /proc info leak, or a prefetch-timing side channel — ' +
+      'shatters this defense: the attacker subtracts the known symbol offset from the leaked value to recover ' +
+      'the randomized base, then resolves every kernel symbol at a fixed offset. CVE-2017-18344 leaked kernel ' +
+      'stack data via timer_create, and CVE-2022-4543 (EntryBleed) used prefetch timing to locate the kernel ' +
+      'text from unprivileged userspace — both yielding the KASLR base as a first step toward privilege ' +
+      'escalation. Once the base is known, the attacker builds a precise ROP chain targeting ' +
+      'commit_creds(prepare_kernel_cred(0)) to gain root. In the assembly, the subl that recovers the base ' +
+      'from the leaked pointer and the addl instructions that compute target addresses are the critical ' +
+      'operations — they transform a single disclosure into full kernel symbol resolution.',
+    code:
+`# CVE pattern: uncleared struct field leaks kernel pointer, breaks KASLR
+class KernelSyms:
+    def __init__(self, base):
+        self.text_base = base
+        self.commit_creds = base + 1024
+        self.prep_cred = base + 2048
+        self.pop_rdi_ret = base + 512
+        self.leak_marker = 0
+
+    def resolve(self, offset):
+        addr = self.text_base + offset
+        return addr
+
+def leak_via_struct():
+    real_base = 16384 + 49152
+    leaked_field = real_base + 1024
+    known_sym_offset = 1024
+    recovered_base = leaked_field - known_sym_offset
+    return recovered_base
+
+def build_payload(base):
+    syms = KernelSyms(base)
+    pop_rdi = syms.pop_rdi_ret
+    null_arg = 0
+    prep = syms.prep_cred
+    commit = syms.commit_creds
+    chain = pop_rdi + null_arg + prep + commit
+    return chain
+
+base = leak_via_struct()
+print(base)
+payload = build_payload(base)
+print(payload)
+`,
+    badAsm: {
+      patterns: ['subl', 'addl'],
+      description: 'subl recovers the randomized kernel base by subtracting a known offset from the leaked pointer; addl resolves commit_creds, prepare_kernel_cred, and gadget addresses at fixed offsets — transforming one leaked pointer into a complete ROP chain with precise kernel targets',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
