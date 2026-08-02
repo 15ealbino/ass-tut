@@ -6662,6 +6662,69 @@ print(payload)
       description: 'subl recovers the randomized kernel base by subtracting a known offset from the leaked pointer; addl resolves commit_creds, prepare_kernel_cred, and gadget addresses at fixed offsets — transforming one leaked pointer into a complete ROP chain with precise kernel targets',
     },
   },
+  {
+    id: 'modprobe-path',
+    name: 'MODPROBE PATH OVERWRITE',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Arbitrary write overwrites the kernel modprobe_path string so executing an unknown binary format triggers attacker code as root.',
+    explanation:
+      'The Linux kernel stores the path to the module-loading binary in a writable global variable ' +
+      'modprobe_path (default "/sbin/modprobe"). When a user executes a file with an unrecognized binary ' +
+      'format (magic bytes like 0xFFFFFFFF), the kernel calls search_binary_handler() which invokes ' +
+      'request_module() then call_usermodehelper_exec() — executing whatever path is stored in ' +
+      'modprobe_path as a child of the kernel workqueue with full root capabilities. An attacker who ' +
+      'gains any arbitrary-write primitive — from a heap overflow, use-after-free, or type confusion — ' +
+      'overwrites modprobe_path to point to a malicious shell script (e.g. "/tmp/pwn.sh"), then triggers ' +
+      'execution of a dummy file with unknown magic bytes. The kernel runs the attacker\'s script as root. ' +
+      'CVE-2022-0185 (Linux fs_context heap overflow) used modprobe_path overwrite for container escape ' +
+      'to root. CVE-2022-34918 (nf_tables type confusion) and CVE-2024-1086 (netfilter double-free, ' +
+      'actively exploited in ransomware campaigns by RansomHub and Akira) both chained into modprobe_path ' +
+      'for local privilege escalation. CVE-2025-0927 (HFS+ OOB write) used the same technique. ' +
+      'In the assembly, movl writes the attacker-controlled path value into the modprobe_path slot; ' +
+      'addl in trigger_exec combines the overwritten path with the exec flag — no integrity check guards ' +
+      'the global, so the kernel blindly executes the attacker\'s script with UID 0.',
+    code:
+`# CVE pattern: overwrite modprobe_path — kernel execs attacker script as root
+class KernelGlobal:
+    def __init__(self, modprobe, core_pattern):
+        self.modprobe = modprobe
+        self.core_pattern = core_pattern
+        self.overwritten = 0
+
+    def arb_write(self, new_path):
+        self.modprobe = new_path
+        self.overwritten = 1
+        return self.overwritten
+
+class UserModeHelper:
+    def __init__(self, uid):
+        self.uid = uid
+        self.exec_count = 0
+        self.last_path = 0
+
+    def trigger_exec(self, kglob):
+        self.last_path = kglob.modprobe + self.uid
+        self.exec_count += 1
+        return self.last_path
+
+    def check_result(self):
+        result = self.last_path + self.exec_count
+        return result
+
+kern = KernelGlobal(4214784, 4214848)
+attacker_script = 3735928559
+kern.arb_write(attacker_script)
+helper = UserModeHelper(0)
+helper.trigger_exec(kern)
+pwned = helper.check_result()
+print(pwned)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl writes the attacker-controlled script path (0xDEADBEEF) into the modprobe_path slot on the stack — no integrity check guards the write; addl in trigger_exec combines the hijacked path with uid 0, and the kernel blindly executes it via call_usermodehelper_exec with full root capabilities',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
