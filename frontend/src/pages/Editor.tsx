@@ -6725,6 +6725,71 @@ print(pwned)
       description: 'movl writes the attacker-controlled script path (0xDEADBEEF) into the modprobe_path slot on the stack — no integrity check guards the write; addl in trigger_exec combines the hijacked path with uid 0, and the kernel blindly executes it via call_usermodehelper_exec with full root capabilities',
     },
   },
+  {
+    id: 'epoll-close-race',
+    name: 'EPOLL FD CLOSE RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Concurrent close of two linked epoll file descriptors races the cleanup path, freeing a struct file while another thread still dereferences it — use-after-free to kernel code execution.',
+    explanation:
+      'Epoll FD close races (CWE-362 / CWE-416) exploit a lifecycle mismatch in the Linux kernel\'s epoll ' +
+      'subsystem: when one eventpoll file descriptor monitors another and both are closed concurrently, the ' +
+      'ep_remove() cleanup path clears the target\'s f_ep pointer under f_lock, but a second thread\'s __fput() ' +
+      'observes the NULL value through a lockless fast-path check in eventpoll_release(), skipping cleanup and ' +
+      'immediately freeing both the eventpoll struct and the file object — while the first thread still holds ' +
+      'the spinlock and operates on the now-freed memory. ' +
+      'CVE-2026-46242 ("Bad Epoll") is the defining example: hlist_del_rcu() in ep_remove writes through a ' +
+      'dangling pointer into the freed eventpoll at offset 160, and a subsequent is_file_epoll() check reads ' +
+      'from the freed file struct\'s SLAB_TYPESAFE_BY_RCU cache slot — the invalid free into the wrong slab ' +
+      'cache (kmalloc-192 instead of the proper file cache) gives the attacker a cross-cache corruption primitive. ' +
+      'CVE-2021-0920 (AF_UNIX SCM_RIGHTS) exploited a similar FD lifecycle race: the garbage collector treated ' +
+      'an in-flight socket as a garbage candidate while recvmsg(MSG_PEEK) incremented its reference count, ' +
+      'producing a use-after-free on sk_buff that was weaponized by the Wintego surveillance vendor to remotely ' +
+      'root Samsung devices. CVE-2021-4083 (fs/file.c close_fd race) allowed concurrent close() and fget() to ' +
+      'race on the same fd slot, freeing the struct file while another thread still held a pointer. ' +
+      'In the assembly, movl stores the epoll target reference into the waiter\'s monitored_ref slot; release\'s ' +
+      'movl zeroes the target (simulating __fput free) but concurrent_remove\'s addl still reads from the same ' +
+      'stack offset — no lock or atomic operation guards the gap between the NULL check and the dereference.',
+    code:
+`# CVE pattern: concurrent epoll fd close races cleanup — struct file UAF
+class EpollFile:
+    def __init__(self, fd, handler):
+        self.fd = fd
+        self.handler = handler
+        self.f_ep = 0
+        self.freed = 0
+
+    def release(self):
+        self.handler = 0
+        self.f_ep = 0
+        self.freed = 1
+        return self.freed
+
+class EpollWaiter:
+    def __init__(self, fd, target):
+        self.fd = fd
+        self.monitored_ref = target
+        self.removed = 0
+        self.result = 0
+
+    def concurrent_remove(self):
+        self.result = self.monitored_ref + self.fd
+        self.removed = 1
+        return self.result
+
+ep_target = EpollFile(3, 4196352)
+ep_target.f_ep = 1
+ep_waiter = EpollWaiter(4, ep_target.handler)
+ep_target.release()
+ep_target.handler = 3735928559
+dangling = ep_waiter.concurrent_remove()
+print(dangling)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores ep_target.handler into the waiter\'s monitored_ref slot; release\'s movl zeroes the target (simulating __fput/kmem_cache_free), but concurrent_remove\'s addl still reads monitored_ref from the same stack offset — the freed slot now holds the attacker\'s sprayed value (0xDEADBEEF), turning the FD close race into a use-after-free with kernel code execution',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
