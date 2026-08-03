@@ -101,6 +101,11 @@ the cost/mix pass annotates each entry with `asm_count` / `flags` /
    - `idiv*` / `div*` (integer division) → implicit `%eax`, `%edx`.
    - `cltd` / `cdq` / `cwd` / `cqto` (sign-extend the accumulator into the data
      register) → implicit `%eax`, `%edx`.
+   - `push*` / `pop*` → implicit `%esp`; `call*` / `ret*` → implicit `%esp` and
+     `%eip`; `enter` / `leave` → implicit `%ebp` and `%esp`. These mutate the
+     stack/frame/instruction pointers on every occurrence with no explicit
+     operand, so at `-O0` they are the most frequent implicit touch in the
+     program — every prologue, epilogue, and call site.
    - The one-operand `mul`/`imul` also use `%edx:%eax`, but gcc `-O0` emits the
      two/three-operand `imul` form for `a * b` (no `%edx`), so multiply is left
      to its explicit operands — no false `%edx` claim.
@@ -146,10 +151,11 @@ The test file has two layers:
 - **Unit tests** for `canonical_register` (every family, sub-register folding,
   64-bit spellings, x87 stack, case-insensitivity, unknown-token pass-through)
   and for `analyze_registers` (explicit operands, sub-register folding, the
-  implicit `%edx:%eax` on `idiv`/`cltd`, the SSE-divide exclusion, the
-  two-operand `imul` no-false-`%edx` guard, zero-touch lines, out-of-range
-  defensiveness, canonical ordering, and a regression check that the existing
-  cost/mix fields are untouched). These need no toolchain.
+  implicit `%edx:%eax` on `idiv`/`cltd`, the implicit `%esp`/`%eip`/`%ebp` on
+  `push`/`pop`/`call`/`ret`/`leave`, the SSE-divide exclusion, the two-operand
+  `imul` no-false-`%edx` guard, zero-touch lines, out-of-range defensiveness,
+  canonical ordering, and a regression check that the existing cost/mix fields
+  are untouched). These need no toolchain.
 - **End-to-end `/compile` tests** that run the real transpiler + gcc pipeline and
   assert the footprint reaches the API response (division touches `%edx`
   implicitly, `%ebp` dominates the totals, and the canonical ordering holds).

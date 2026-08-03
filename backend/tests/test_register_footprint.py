@@ -145,6 +145,37 @@ def test_analyze_registers_two_operand_imul_has_no_implicit_edx():
     assert line_map[1]["registers"] == ["eax", "edx"]
 
 
+def test_analyze_registers_implicit_esp_on_push_pop():
+    # push/pop mutate %esp on every occurrence, but AT&T names no %esp operand —
+    # the footprint must report the stack-pointer traffic alongside the explicit
+    # register being pushed/popped.
+    asm_lines = ["pushl %ebp", "popl %ebp"]
+    line_map = {1: {"c_lines": [1], "asm_lines": [1, 2], "color": "#000"}}
+    summary = analyze_registers(line_map, asm_lines)
+    assert line_map[1]["registers"] == ["ebp", "esp"]
+    # Both instructions touch %ebp (explicit) and %esp (implicit).
+    assert summary["register_totals"] == {"ebp": 2, "esp": 2}
+
+
+def test_analyze_registers_implicit_esp_eip_on_call_and_ret():
+    # call/ret carry no explicit register operand, yet both push/pop the return
+    # address: they mutate %esp (stack) and %eip (instruction pointer).
+    asm_lines = ["call helper", "ret"]
+    line_map = {1: {"c_lines": [1], "asm_lines": [1, 2], "color": "#000"}}
+    summary = analyze_registers(line_map, asm_lines)
+    assert line_map[1]["registers"] == ["esp", "eip"]
+    assert summary["register_totals"] == {"esp": 2, "eip": 2}
+
+
+def test_analyze_registers_leave_touches_ebp_and_esp():
+    # `leave` == `mov %ebp, %esp; pop %ebp` — it rewrites both the frame pointer
+    # and the stack pointer with no explicit operand.
+    asm_lines = ["leave"]
+    line_map = {1: {"c_lines": [1], "asm_lines": [1], "color": "#000"}}
+    analyze_registers(line_map, asm_lines)
+    assert line_map[1]["registers"] == ["ebp", "esp"]
+
+
 def test_analyze_registers_zero_touch_line_is_empty_list():
     # A line whose only asm is a label / directive touches no registers.
     asm_lines = [".L2:", "nop"]
@@ -197,8 +228,9 @@ def test_analyze_registers_does_not_disturb_cost_fields():
     assert line_map[1]["flags"] == ["mul", "call"]
     assert line_map[1]["category_counts"] == {"compute": 1, "call": 1}
     assert cost["total_instructions"] == 2
-    # And the new field is present alongside the old ones.
-    assert line_map[1]["registers"] == ["eax", "edx"]
+    # And the new field is present alongside the old ones. imull is two-operand
+    # (eax, edx explicit, no implicit); `call helper` adds implicit esp + eip.
+    assert line_map[1]["registers"] == ["eax", "edx", "esp", "eip"]
 
 
 # ─── End-to-end: /compile carries the register footprint ─────────────────────

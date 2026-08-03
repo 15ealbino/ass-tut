@@ -178,12 +178,14 @@ def _ordered_category_map(counts: Dict[str, int]) -> Dict[str, int]:
 #   * Pillar 1 (make the mapping concrete): at gcc -O0 every value flows through
 #     a handful of registers and %ebp-relative stack slots. Seeing %eax appear
 #     on nearly every line makes the accumulator-centric shape of the code real.
-#   * Pillar 2 (spot non-obvious asm behaviour): integer division and the sign
-#     extend that sets it up implicitly use the %edx:%eax pair. `q = a // b`
-#     touches %edx even though %edx is nowhere in the operand text — exactly the
+#   * Pillar 2 (spot non-obvious asm behaviour): many instructions touch
+#     registers that never appear in the operand text. `q = a // b` compiles to
+#     cltd + idivl, whose dividend is the %edx:%eax pair, so the line touches
+#     %edx even though %edx is nowhere in the source; `push`/`pop`/`call`/`ret`
+#     silently mutate %esp on every call site and stack-frame op. Exactly the
 #     kind of hidden hardware behaviour that trips up someone reading a
 #     disassembly. The footprint surfaces those implicit registers next to the
-#     explicit ones.
+#     explicit ones (see `_implicit_registers`).
 
 # Sub-register spelling → canonical 32-bit register family. Covers the 8/16-bit
 # spellings gcc emits under -m32 (`movb %al, ...`, `movw %dx, ...`) plus the
@@ -234,15 +236,24 @@ def _implicit_registers(mnemonic: str) -> Tuple[str, ...]:
     never appear in the operand text but are read/written by the hardware.
 
     Deliberately conservative so the footprint never over-claims: only the
-    always-correct cases are listed. Integer division (``idiv``/``div``, always
-    one-operand, dividend in ``%edx:%eax``) and the sign-extends that fill its
-    high half (``cltd``/``cdq``/``cwd``/``cqto``) implicitly use the
-    ``%edx:%eax`` pair. The one-operand ``mul``/``imul`` also use ``%edx:%eax``,
-    but gcc -O0 emits the two/three-operand ``imul`` form (no ``%edx``) for
-    ``a * b``, so multiply is left to its explicit operands to avoid a false
-    ``%edx`` claim. SSE division (``divss``/``divsd``) is excluded by the
-    integer-suffix check, since it touches ``%xmm`` registers, not
-    ``%edx:%eax``.
+    always-correct cases are listed.
+
+    * Integer division (``idiv``/``div``, always one-operand, dividend in
+      ``%edx:%eax``) and the sign-extends that fill its high half
+      (``cltd``/``cdq``/``cwd``/``cqto``) implicitly use the ``%edx:%eax`` pair.
+      The one-operand ``mul``/``imul`` also use ``%edx:%eax``, but gcc -O0 emits
+      the two/three-operand ``imul`` form (no ``%edx``) for ``a * b``, so
+      multiply is left to its explicit operands to avoid a false ``%edx`` claim.
+      SSE division (``divss``/``divsd``) is excluded by the integer-suffix check,
+      since it touches ``%xmm`` registers, not ``%edx:%eax``.
+    * Stack traffic: ``push``/``pop`` and the ``call``/``ret`` family mutate the
+      stack pointer ``%esp`` on every occurrence, yet AT&T carries no explicit
+      ``%esp`` operand (``pushl %eax``, ``call f``, ``ret``). At -O0 this is the
+      most frequent implicit touch in the program — every prologue, epilogue,
+      and call site. ``call``/``ret`` additionally load/store the instruction
+      pointer ``%eip`` through the stack, and ``enter``/``leave`` rewrite the
+      frame pointer ``%ebp``. All are unconditional, so they meet the same
+      always-correct bar as the division cases above.
     """
     if mnemonic.startswith("idiv"):
         return ("eax", "edx") if mnemonic[4:] in ("", "b", "w", "l", "q") else ()
@@ -250,6 +261,15 @@ def _implicit_registers(mnemonic: str) -> Tuple[str, ...]:
         return ("eax", "edx") if mnemonic[3:] in ("", "b", "w", "l", "q") else ()
     if mnemonic in ("cltd", "cdq", "cwd", "cqto", "cqo"):
         return ("eax", "edx")
+    # Stack-pointer / frame-pointer / instruction-pointer traffic with no
+    # explicit operand (see docstring). Checked after the div family, which
+    # shares no prefix with these mnemonics.
+    if mnemonic.startswith("push") or mnemonic.startswith("pop"):
+        return ("esp",)
+    if mnemonic.startswith("call") or mnemonic.startswith("ret"):
+        return ("esp", "eip")
+    if mnemonic.startswith("enter") or mnemonic.startswith("leave"):
+        return ("ebp", "esp")
     return ()
 
 
