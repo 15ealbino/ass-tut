@@ -41,6 +41,9 @@ export interface LineMapping {
   // Instruction mix: how this line's asm splits across categories
   // (mem / compute / branch / call / stack / other). Zero categories omitted.
   category_counts?: Record<string, number>
+  // Register footprint: canonical 32-bit x86 registers this line's asm touches,
+  // in stable display order (includes implicit regs like edx:eax on division).
+  registers?: string[]
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
@@ -52,6 +55,12 @@ export interface CostSummary {
   category_totals?: Record<string, number>
 }
 
+export interface RegisterSummary {
+  // Program-wide register footprint: each canonical register mapped to the
+  // number of instructions that reference it, in stable display order.
+  register_totals: Record<string, number>
+}
+
 export interface CompileResponse {
   python_lines: string[]
   c_code: string
@@ -61,6 +70,8 @@ export interface CompileResponse {
   line_map: Record<number, LineMapping>
   // Present for the transpile pipeline; absent/null for pyghidra.
   cost_summary?: CostSummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  register_summary?: RegisterSummary | null
 }
 
 export type CompileMethod = 'transpile' | 'pyghidra'
