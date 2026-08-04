@@ -6790,6 +6790,94 @@ print(dangling)
       description: 'movl stores ep_target.handler into the waiter\'s monitored_ref slot; release\'s movl zeroes the target (simulating __fput/kmem_cache_free), but concurrent_remove\'s addl still reads monitored_ref from the same stack offset — the freed slot now holds the attacker\'s sprayed value (0xDEADBEEF), turning the FD close race into a use-after-free with kernel code execution',
     },
   },
+  {
+    id: 'rcu-grace-uaf',
+    name: 'RCU GRACE PERIOD UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Object freed without waiting for RCU grace period — concurrent reader dereferences stale pointer into attacker-sprayed memory.',
+    explanation:
+      'RCU (Read-Copy-Update) grace period use-after-free (CWE-416 / CWE-667) exploits a synchronization gap in the ' +
+      'Linux kernel\'s lockless read mechanism: RCU lets readers traverse shared data structures without locks by ' +
+      'deferring object reclamation until all active readers finish — the "grace period." A writer must call ' +
+      'synchronize_rcu() or schedule a callback via call_rcu() and wait before freeing the object. When a code path ' +
+      'removes an object from an RCU-protected structure (IDR, hash table, linked list) and frees it immediately ' +
+      'without waiting for the grace period, any reader still inside an rcu_read_lock() critical section dereferences ' +
+      'a dangling pointer into freed slab memory. The attacker sprays the freed slot with controlled data via ' +
+      'cross-cache reclamation, redirecting function pointers or corrupting credentials for privilege escalation. ' +
+      'CVE-2026-53264 (Linux net/sched, CVSS 7.8) is the textbook example: tcf_idr_check_alloc() looked up traffic ' +
+      'control actions under RCU protection while a concurrent delete path removed the action from the IDR and freed ' +
+      'it without any grace period — an AI-assisted exploit achieved >99% reliable root on kernels 5.10 through 7.0. ' +
+      'CVE-2024-27394 (TCP-AO) freed authentication keys via call_rcu() but accessed the next list node after the ' +
+      'grace period completed and the key was freed. CVE-2026-23392 (nf_tables flowtable) tore down flowtable hooks ' +
+      'on an error path before an RCU grace period elapsed, exposing them to both the packet path and control plane. ' +
+      'A 2025 academic study found 47 RCU synchronization bugs across the Linux kernel, concentrated in networking ' +
+      'subsystems and driver teardown paths. ' +
+      'In the assembly, movl stores the object\'s handler and data into stack slots; the writer\'s movl zeroes both ' +
+      'fields (simulating free) with no intervening synchronize_rcu barrier — the reader\'s addl then sums handler + ' +
+      'data from the same stack offsets, now containing attacker-sprayed values from the recycled slab slot.',
+    code:
+`# CVE pattern: object freed without RCU grace period — reader hits stale ptr
+class RcuObject:
+    def __init__(self, handler, data):
+        self.handler = handler
+        self.data = data
+        self.refcount = 1
+        self.in_idr = 1
+
+    def read_data(self):
+        result = self.handler + self.data
+        return result
+
+class RcuReader:
+    def __init__(self):
+        self.read_lock = 0
+        self.result = 0
+        self.leaked = 0
+
+    def rcu_read_lock(self):
+        self.read_lock = 1
+        return self.read_lock
+
+    def lookup_and_use(self, obj):
+        self.result = obj.read_data()
+        self.leaked = 1
+        return self.result
+
+    def rcu_read_unlock(self):
+        self.read_lock = 0
+        return self.read_lock
+
+class RcuWriter:
+    def __init__(self):
+        self.removed = 0
+        self.freed = 0
+        self.grace_waited = 0
+
+    def remove_and_free(self, obj):
+        obj.in_idr = 0
+        obj.handler = 0
+        obj.data = 0
+        self.removed = 1
+        self.freed = 1
+        return self.freed
+
+reader = RcuReader()
+writer = RcuWriter()
+obj = RcuObject(4196352, 256)
+reader.rcu_read_lock()
+writer.remove_and_free(obj)
+obj.handler = 3735928559
+obj.data = 4196608
+leaked = reader.lookup_and_use(obj)
+reader.rcu_read_unlock()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the object\'s handler and data into stack slots during construction; the writer\'s movl zeroes both fields (simulating free without synchronize_rcu) — but the reader\'s addl in read_data sums handler + data from the same stack offsets, now containing attacker-sprayed values (0xDEADBEEF, 0x400A00) from the recycled slab slot, turning the missing grace period into a use-after-free with kernel code execution',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
