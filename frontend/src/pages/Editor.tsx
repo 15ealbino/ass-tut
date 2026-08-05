@@ -6878,6 +6878,93 @@ print(leaked)
       description: 'movl stores the object\'s handler and data into stack slots during construction; the writer\'s movl zeroes both fields (simulating free without synchronize_rcu) — but the reader\'s addl in read_data sums handler + data from the same stack offsets, now containing attacker-sprayed values (0xDEADBEEF, 0x400A00) from the recycled slab slot, turning the missing grace period into a use-after-free with kernel code execution',
     },
   },
+  {
+    id: 'byovd-driver',
+    name: 'BYOVD DRIVER EXPLOIT',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Legitimately signed but vulnerable kernel driver loaded by attacker exposes IOCTL-driven arbitrary memory read/write, enabling EDR termination and privilege escalation.',
+    explanation:
+      'Bring Your Own Vulnerable Driver (BYOVD / CWE-782) is a privilege-escalation and defense-evasion technique: ' +
+      'the attacker drops a legitimately signed but buggy kernel driver onto the target, loads it via the Service ' +
+      'Control Manager (the valid signature passes Driver Signature Enforcement), then sends crafted IOCTL commands ' +
+      'to exploit a vulnerability — typically an insecure MSR/port-I/O handler or unchecked buffer copy — gaining ' +
+      'arbitrary kernel memory read/write from userspace. With Ring-0 access the attacker patches EPROCESS token ' +
+      'fields for privilege escalation, terminates EDR processes by zeroing their handle tables, or modifies kernel ' +
+      'callbacks to blind security monitoring entirely. ' +
+      'CVE-2024-38193 (Windows AFD.sys, CVSS 7.8) was exploited by the Lazarus Group via a BYOVD primitive in ' +
+      'the Winsock Ancillary Function Driver — a component pre-installed on every Windows system — to deploy the ' +
+      'FudModule rootkit that specifically disabled CrowdStrike Falcon, Windows Defender, and HitmanPro. ' +
+      'CVE-2025-8061 (Lenovo LnvMSRIO.sys) exposed raw Model-Specific Register read/write IOCTLs that Quarkslab ' +
+      'researchers used to achieve Ring-0 code execution. Frequently abused drivers include RTCore64.sys (MSI), ' +
+      'gdrv.sys (Gigabyte), mhyprot2.sys (Genshin Impact anti-cheat), and procexp.sys — used by ransomware ' +
+      'operators BlackByte, AvosLocker, LockBit, and Qilin to kill endpoint protection. An NDSS 2026 study ' +
+      'found over 600 unique vulnerable signed drivers in the wild. ' +
+      'In the assembly, movl loads the IOCTL command code and the target physical address into stack slots; addl ' +
+      'computes the mapped kernel virtual address from the driver\'s DMA base — no privilege or bounds check appears ' +
+      'between the IOCTL dispatch and the movl that writes the attacker\'s payload into the kernel memory offset, ' +
+      'granting an unrestricted write-what-where primitive through a signed driver.',
+    code:
+`# CVE pattern: signed driver IOCTL exposes kernel R/W — EDR killed
+class VulnDriver:
+    def __init__(self, base_addr, ioctl_code):
+        self.base_addr = base_addr
+        self.ioctl_code = ioctl_code
+        self.loaded = 0
+        self.sig_valid = 1
+
+    def load(self):
+        if self.sig_valid == 1:
+            self.loaded = 1
+        return self.loaded
+
+    def ioctl_write(self, offset, value):
+        target = self.base_addr + offset
+        result = target + value
+        return result
+
+class EDRProcess:
+    def __init__(self, pid, name_hash):
+        self.pid = pid
+        self.name_hash = name_hash
+        self.handle_table = 4196352
+        self.alive = 1
+
+    def terminate(self):
+        self.handle_table = 0
+        self.alive = 0
+        return self.alive
+
+class Attacker:
+    def __init__(self, payload):
+        self.payload = payload
+        self.edr_killed = 0
+        self.escalated = 0
+
+    def kill_edr(self, driver, edr):
+        driver.ioctl_write(edr.pid * 8, 0)
+        edr.terminate()
+        self.edr_killed = 1
+        return self.edr_killed
+
+    def escalate(self, driver, token_offset):
+        result = driver.ioctl_write(token_offset, self.payload)
+        self.escalated = 1
+        return result
+
+drv = VulnDriver(4026531840, 2236420)
+drv.load()
+edr = EDRProcess(1337, 3405691582)
+attacker = Attacker(0)
+attacker.kill_edr(drv, edr)
+hijacked = attacker.escalate(drv, 2048)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads the IOCTL command code and target physical address into stack slots representing the vulnerable driver\'s handler; addl computes the kernel virtual address from the driver base + offset — no privilege check appears before the subsequent movl writes the attacker\'s payload (token=0) into the kernel memory slot, escalating to SYSTEM via a legitimately signed driver',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
