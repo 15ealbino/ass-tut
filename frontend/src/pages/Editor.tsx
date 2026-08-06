@@ -6965,6 +6965,78 @@ print(hijacked)
       description: 'movl loads the IOCTL command code and target physical address into stack slots representing the vulnerable driver\'s handler; addl computes the kernel virtual address from the driver base + offset — no privilege check appears before the subsequent movl writes the attacker\'s payload (token=0) into the kernel memory slot, escalating to SYSTEM via a legitimately signed driver',
     },
   },
+  {
+    id: 'env-var-injection',
+    name: 'ENV VARIABLE INJECTION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker-controlled environment variables (LD_PRELOAD, GCONV_PATH, GLIBC_TUNABLES) subvert a privileged binary\'s library loading, redirecting execution to attacker code running as root.',
+    explanation:
+      'Environment variable injection (CWE-426 / CWE-427) exploits the UNIX execution model: when a setuid ' +
+      'binary runs, it inherits the calling user\'s environment. Variables like LD_PRELOAD force the dynamic ' +
+      'linker to load an attacker-supplied shared library before any other, letting the attacker replace libc ' +
+      'functions (getuid, system, open) with malicious versions that execute with the binary\'s elevated ' +
+      'privileges. PATH injection works similarly: if a privileged program calls system("restart") without ' +
+      'an absolute path, the attacker prepends a controlled directory to PATH, shadowing the real binary. ' +
+      'CVE-2021-4034 (PwnKit, CVSS 7.8) exploited pkexec\'s failure to handle an empty argv correctly: ' +
+      'an out-of-bounds write from argv into the adjacent envp array let an attacker inject GCONV_PATH, ' +
+      'causing pkexec to load a malicious shared library as root — a 12-year-old flaw in Polkit that ' +
+      'affected every major Linux distribution in default configuration. CVE-2023-4911 (Looney Tunables, ' +
+      'CVSS 7.8) exploited a buffer overflow triggered by crafting the GLIBC_TUNABLES environment variable, ' +
+      'overflowing glibc\'s dynamic linker (ld.so) stack frame during setuid execution — achieving local ' +
+      'privilege escalation to root on Debian, Ubuntu, and Fedora. The dynamic linker strips LD_PRELOAD ' +
+      'and LD_LIBRARY_PATH for setuid binaries, but GLIBC_TUNABLES and GCONV_PATH were not in the blocklist, ' +
+      'leaving a class of env vars that bypass sanitization entirely. ' +
+      'In the assembly, movl loads the attacker-injected LD_PRELOAD address into the env struct; the ' +
+      'cmpl check for ld_preload > 0 passes and the subsequent movl replaces the legitimate library handler ' +
+      'with the attacker\'s address — no sanitization instruction appears between the environment read and ' +
+      'the handler override, so execute()\'s addl jumps to attacker-controlled code running as root.',
+    code:
+`# CVE pattern: LD_PRELOAD env var redirects library load to attacker code
+class Environment:
+    def __init__(self):
+        self.path = 4196352
+        self.ld_preload = 0
+        self.home = 4217856
+        self.poisoned = 0
+
+    def inject(self, var_id, value):
+        if var_id == 1:
+            self.ld_preload = value
+            self.poisoned = 1
+        elif var_id == 2:
+            self.path = value
+        return self.poisoned
+
+class SetuidBinary:
+    def __init__(self, uid, handler):
+        self.uid = uid
+        self.handler = handler
+        self.env_checked = 0
+        self.result = 0
+
+    def load_lib(self, env):
+        if env.ld_preload > 0:
+            self.handler = env.ld_preload
+        self.result = self.handler + self.uid
+        return self.result
+
+    def execute(self):
+        result = self.handler + self.result
+        return result
+
+env = Environment()
+env.inject(1, 3735928559)
+suid = SetuidBinary(0, 4196352)
+hijacked = suid.load_lib(env)
+result = suid.execute()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl loads the attacker-injected LD_PRELOAD address into the env struct; cmpl checks ld_preload > 0 and the branch falls through — the subsequent movl overwrites the legitimate handler with the attacker\'s address without any sanitization, so execute()\'s addl combines the hijacked handler with the result, jumping to attacker-controlled code running as root',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
