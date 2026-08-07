@@ -7037,6 +7037,90 @@ print(result)
       description: 'movl loads the attacker-injected LD_PRELOAD address into the env struct; cmpl checks ld_preload > 0 and the branch falls through — the subsequent movl overwrites the legitimate handler with the attacker\'s address without any sanitization, so execute()\'s addl combines the hijacked handler with the result, jumping to attacker-controlled code running as root',
     },
   },
+  {
+    id: 'house-of-spirit',
+    name: 'HOUSE OF SPIRIT',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker crafts a fake heap chunk in stack memory, frees it into the allocator, then malloc returns a pointer to the stack — enabling return-address overwrite.',
+    explanation:
+      'House of Spirit (CWE-761 / CWE-590 adjacent) is a heap exploitation technique where the attacker ' +
+      'crafts a fake heap chunk header in memory they control (typically the stack) and tricks the program ' +
+      'into calling free() on a pointer to that fake chunk. The allocator — seeing valid size metadata — ' +
+      'inserts the fake chunk into its free list (fastbin or tcache). The next malloc() of the same size ' +
+      'returns a pointer to the fake chunk, which actually resides on the stack. The attacker now has a ' +
+      '"heap allocation" that overlaps with the stack frame, letting them overwrite the return address, ' +
+      'saved frame pointer, or local variables of any function whose frame overlaps the fake chunk. ' +
+      'The technique requires crafting two size fields: the fake chunk\'s own size (which must match a ' +
+      'fastbin/tcache bin) and the next contiguous chunk\'s size (which must pass the allocator\'s ' +
+      'sanity check that 2*SIZE_SZ < next_size < av->system_mem). The tcache variant (glibc >= 2.26) ' +
+      'is even simpler because _int_free() calls tcache_put() without validating the next chunk at all. ' +
+      'CVE-2024-27099 (CVSSv4 9.4) exploited a House of Spirit condition in the GLPI IT management ' +
+      'platform: an unauthenticated SQL injection allowed writing a fake chunk header into a stack ' +
+      'buffer, which was subsequently freed and reallocated, achieving remote code execution. ' +
+      'CVE-2009-2692 (Linux sendpage NULL ptr) was exploited using a House of Spirit variant to place ' +
+      'shellcode at a predictable address. The Pwnable.kr "uaf" and "spirit" CTF challenges teach the ' +
+      'technique, and Shellphish\'s how2heap repository documents both classic and tcache variants. ' +
+      'In the assembly, movl writes attacker-controlled size fields (0x40 = 64 bytes) into stack slots ' +
+      'to form the fake chunk header; after free inserts it into the tcache, the next malloc\'s movl ' +
+      'returns the same stack address — addl then writes through the "heap" pointer into the stack ' +
+      'frame, overwriting the saved return address with the attacker\'s shellcode address.',
+    code:
+`# CVE pattern: fake chunk on stack freed into tcache — malloc returns stack ptr
+class FakeChunk:
+    def __init__(self, prev_size, size):
+        self.prev_size = prev_size
+        self.size = size
+        self.fd = 0
+        self.bk = 0
+        self.payload = 0
+
+class TcacheBin:
+    def __init__(self, bin_size):
+        self.bin_size = bin_size
+        self.count = 0
+        self.head = 0
+        self.freed_addr = 0
+
+    def tcache_put(self, chunk_addr):
+        self.head = chunk_addr
+        self.count += 1
+        self.freed_addr = chunk_addr
+        return self.count
+
+    def tcache_get(self):
+        result = self.head
+        self.count -= 1
+        self.head = 0
+        return result
+
+class StackFrame:
+    def __init__(self, ret_addr):
+        self.ret_addr = ret_addr
+        self.canary = 305419896
+        self.overwritten = 0
+
+    def write_via_heap(self, value):
+        self.ret_addr = value
+        self.overwritten = 1
+        return self.ret_addr
+
+fake = FakeChunk(0, 64)
+fake.fd = 0
+tcache = TcacheBin(64)
+stack_addr = 1342177280
+tcache.tcache_put(stack_addr)
+heap_ptr = tcache.tcache_get()
+frame = StackFrame(4196608)
+frame.write_via_heap(3735928559)
+result = frame.ret_addr + frame.overwritten
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl writes attacker-controlled size fields (64) into stack slots forming the fake chunk header; tcache_put\'s movl inserts the stack address into the tcache free list without validation — tcache_get\'s movl returns the same stack address as a "heap" pointer, and write_via_heap\'s movl overwrites the saved return address with 0xDEADBEEF, hijacking control flow when the function epilogue executes ret',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
