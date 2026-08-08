@@ -7121,6 +7121,87 @@ print(result)
       description: 'movl writes attacker-controlled size fields (64) into stack slots forming the fake chunk header; tcache_put\'s movl inserts the stack address into the tcache free list without validation — tcache_get\'s movl returns the same stack address as a "heap" pointer, and write_via_heap\'s movl overwrites the saved return address with 0xDEADBEEF, hijacking control flow when the function epilogue executes ret',
     },
   },
+  {
+    id: 'kvm-dirty-ring-oob',
+    name: 'KVM DIRTY RING OOB',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Unchecked u64 addition in KVM dirty ring reset wraps around, bypassing bounds checks and enabling out-of-bounds write into shadow page tables.',
+    explanation:
+      'CVE-2026-52969 (CWE-190) is an integer overflow in the Linux kernel\'s KVM dirty ring subsystem ' +
+      'that lay dormant for sixteen years. The function kvm_reset_dirty_gfn() validates a guest frame ' +
+      'number (GFN) range with the check `if (offset + __fls(mask)) >= memslot->npages` — but because ' +
+      'offset is an attacker-controlled u64 derived from the dirty ring entry, a crafted near-U64_MAX ' +
+      'value wraps the addition back to a small number, passing the bounds check entirely. The wrapped ' +
+      'offset indexes into gfn_to_rmap(), which performs an out-of-bounds read on the memslot\'s rmap ' +
+      'array and then conditionally clears PT_WRITABLE_MASK on a shadow page table entry (SPTE) at an ' +
+      'attacker-influenced location. By targeting a specific SPTE, the attacker can flip write-protect ' +
+      'bits in the host\'s shadow MMU, gaining write access to pages that should be read-only — including ' +
+      'kernel text or page tables themselves. Any local process with /dev/kvm access (QEMU, crosvm, or ' +
+      'any VM manager) can trigger this from a guest VM, making it a guest-to-host escape primitive. ' +
+      'The fix range-checks offset against memslot->npages independently before the addition, so the ' +
+      'subsequent offset + __fls(mask) cannot overflow. The patch landed across stable branches via ' +
+      'commits 01b71b9, 0d419c2, 0eb281e, 577a8d3, 74f1a22, b315b03, and ecf9b3e. ' +
+      'In the assembly, addq performs the unchecked u64 addition that wraps; cmpq compares the wrapped ' +
+      'result against npages and the jae branch falls through because the wrapped sum is small; the ' +
+      'subsequent movq reads out-of-bounds from the rmap array, and andq clears PT_WRITABLE_MASK on ' +
+      'the target SPTE — flipping the page from read-only to writable in the host\'s shadow page tables.',
+    code:
+`# CVE pattern: u64 offset wraps in KVM dirty ring reset — OOB into shadow MMU
+class MemSlot:
+    def __init__(self, npages):
+        self.npages = npages
+        self.rmap = 0
+        self.base_gfn = 0
+        self.spte_val = 0
+
+    def gfn_to_rmap(self, offset):
+        self.rmap = self.base_gfn + offset
+        return self.rmap
+
+    def clear_writable(self, spte):
+        mask = 2
+        self.spte_val = spte - mask
+        return self.spte_val
+
+class DirtyRingEntry:
+    def __init__(self, gfn, bitmask):
+        self.gfn = gfn
+        self.bitmask = bitmask
+        self.wrapped = 0
+
+class KVMDirtyRing:
+    def __init__(self, slot):
+        self.slot = slot
+        self.oob_triggered = 0
+
+    def reset_dirty_gfn(self, entry):
+        offset = entry.gfn - self.slot.base_gfn
+        fls_mask = 63
+        check = offset + fls_mask
+        if check >= self.slot.npages:
+            return 0
+        rmap = self.slot.gfn_to_rmap(offset)
+        self.oob_triggered = 1
+        return rmap
+
+slot = MemSlot(512)
+slot.base_gfn = 1048576
+u64_max = 18446744073709551615
+crafted_gfn = slot.base_gfn + u64_max - 60
+entry = DirtyRingEntry(crafted_gfn, 255)
+ring = KVMDirtyRing(slot)
+result = ring.reset_dirty_gfn(entry)
+spte = 7
+cleared = slot.clear_writable(spte)
+total = result + cleared + ring.oob_triggered
+print(total)
+`,
+    badAsm: {
+      patterns: ['addq', 'cmpq', 'movq', 'andq'],
+      description: 'addq performs the unchecked u64 addition of offset + fls_mask that wraps around to a small value; cmpq compares the wrapped result against npages and jae falls through because the wrapped sum appears in-bounds; gfn_to_rmap\'s movq reads out-of-bounds from the rmap array using the pre-wrap offset; clear_writable\'s andq clears PT_WRITABLE_MASK on the target shadow page table entry — flipping the host page from read-only to writable and enabling guest-to-host escape',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
