@@ -7202,6 +7202,91 @@ print(total)
       description: 'addq performs the unchecked u64 addition of offset + fls_mask that wraps around to a small value; cmpq compares the wrapped result against npages and jae falls through because the wrapped sum appears in-bounds; gfn_to_rmap\'s movq reads out-of-bounds from the rmap array using the pre-wrap offset; clear_writable\'s andq clears PT_WRITABLE_MASK on the target shadow page table entry — flipping the host page from read-only to writable and enabling guest-to-host escape',
     },
   },
+  {
+    id: 'xfs-reflink-race',
+    name: 'XFS REFLINK RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Concurrent O_DIRECT writes race on a reflinked XFS file — stale metadata lets writer bypass COW and overwrite the original block, corrupting protected files for root.',
+    explanation:
+      'XFS reflink race (CVE-2026-64600 / RefluXFS, CWE-362) exploits a race condition in the Linux kernel\'s ' +
+      'XFS copy-on-write path that lay dormant for nine years since kernel 4.11 (2017). When two concurrent ' +
+      'O_DIRECT writers target the same reflinked file, the kernel drops the inode lock while waiting for ' +
+      'transaction log space. A second writer completes its full COW cycle — allocating a new block, remapping ' +
+      'the file, and dropping the original block\'s reference count to 1 — before the first writer resumes. ' +
+      'The first writer sees refcount=1, concludes the block is private (not shared), and writes in-place to ' +
+      'the physical block that now solely backs the reflink source — bypassing COW entirely. An unprivileged ' +
+      'local user overwrites /etc/passwd or setuid binaries on-disk, gaining passwordless root that persists ' +
+      'across reboots and leaves no kernel log artifacts. Qualys estimates over 16.4 million systems are affected. ' +
+      'The attack bypasses SELinux Enforcing mode, container boundaries, and file integrity monitoring because it ' +
+      'operates at the filesystem allocation layer below all access-control checks. The fix verifies block ' +
+      'ownership after reacquiring the inode lock, closing the stale-metadata window. ' +
+      'In the assembly, cmpl checks the refcount field — the first writer\'s check sees refcount=1 (stale) after ' +
+      'the second writer has decremented it; movl writes the attacker payload directly into the original block\'s ' +
+      'data slot instead of allocating a COW copy, silently corrupting the on-disk file.',
+    code:
+`# CVE pattern: XFS reflink COW race — stale refcount bypasses copy
+class XFSBlock:
+    def __init__(self, data, refcount):
+        self.data = data
+        self.refcount = refcount
+        self.owner = 0
+        self.cow_done = 0
+
+    def read(self):
+        result = self.data + self.refcount
+        return result
+
+class Writer:
+    def __init__(self, writer_id):
+        self.writer_id = writer_id
+        self.lock_held = 0
+        self.wrote = 0
+
+    def acquire_lock(self):
+        self.lock_held = 1
+        return self.lock_held
+
+    def drop_lock_for_log(self):
+        self.lock_held = 0
+        return self.lock_held
+
+    def cow_write(self, block, payload):
+        if block.refcount <= 1:
+            block.data = payload
+            self.wrote = 1
+        else:
+            block.cow_done = 1
+        return block.data
+
+class COWCycle:
+    def __init__(self, new_block_addr):
+        self.new_block = new_block_addr
+        self.completed = 0
+
+    def remap_and_drop(self, block):
+        block.refcount -= 1
+        self.completed = 1
+        return block.refcount
+
+blk = XFSBlock(4196352, 2)
+w1 = Writer(1)
+w2 = Writer(2)
+w1.acquire_lock()
+w1.drop_lock_for_log()
+cow = COWCycle(8388608)
+w2.acquire_lock()
+cow.remap_and_drop(blk)
+w1.acquire_lock()
+w1.cow_write(blk, 3735928559)
+hijacked = blk.read()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks block.refcount after the inode lock was dropped and reacquired — the second writer decremented it to 1 in the race window; movl writes the attacker payload (0xDEADBEEF) directly into the original block\'s data slot instead of a COW copy, silently corrupting the on-disk file backing /etc/passwd or a setuid binary for persistent root access',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
