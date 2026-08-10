@@ -9,7 +9,7 @@ import re
 import subprocess
 import tempfile
 from functools import partial
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 from app.asm_glossary import build_asm_glossary
 from app.transpiler import TranspileError, build_line_map, transpile
@@ -168,6 +168,158 @@ def _ordered_category_map(counts: Dict[str, int]) -> Dict[str, int]:
     }
 
 
+# ── Register footprint analysis ─────────────────────────────────────────────
+#
+# The cost flags say *how expensive* a Python line's assembly is; the
+# instruction mix says *what kind* of work it does. The register footprint says
+# *where* the work happens: which x86 registers each Python line's assembly
+# actually touches.
+#
+# The lessons this teaches:
+#   * Pillar 1 (make the mapping concrete): at gcc -O0 every value flows through
+#     a handful of registers and %ebp-relative stack slots. Seeing %eax appear
+#     on nearly every line makes the accumulator-centric shape of the code real.
+#   * Pillar 2 (spot non-obvious asm behaviour): many instructions touch
+#     registers that never appear in the operand text. `q = a // b` compiles to
+#     cltd + idivl, whose dividend is the %edx:%eax pair, so the line touches
+#     %edx even though %edx is nowhere in the source; `push`/`pop`/`call`/`ret`
+#     silently mutate %esp on every call site and stack-frame op. Exactly the
+#     kind of hidden hardware behaviour that trips up someone reading a
+#     disassembly. The footprint surfaces those implicit registers next to the
+#     explicit ones (see `_implicit_registers`).
+
+# Sub-register spelling → canonical 32-bit register family. Covers the 8/16-bit
+# spellings gcc emits under -m32 (`movb %al, ...`, `movw %dx, ...`) plus the
+# 64-bit spellings, so the analyzer stays correct if ever pointed at non -m32
+# output.
+_REGISTER_FAMILY: Dict[str, str] = {
+    "eax": "eax", "ax": "eax", "ah": "eax", "al": "eax", "rax": "eax",
+    "ebx": "ebx", "bx": "ebx", "bh": "ebx", "bl": "ebx", "rbx": "ebx",
+    "ecx": "ecx", "cx": "ecx", "ch": "ecx", "cl": "ecx", "rcx": "ecx",
+    "edx": "edx", "dx": "edx", "dh": "edx", "dl": "edx", "rdx": "edx",
+    "esi": "esi", "si": "esi", "sil": "esi", "rsi": "esi",
+    "edi": "edi", "di": "edi", "dil": "edi", "rdi": "edi",
+    "ebp": "ebp", "bp": "ebp", "bpl": "ebp", "rbp": "ebp",
+    "esp": "esp", "sp": "esp", "spl": "esp", "rsp": "esp",
+    "eip": "eip", "ip": "eip", "rip": "eip",
+}
+
+# Stable display / serialisation order for the register maps.
+_REGISTER_ORDER = {
+    "eax": 0, "ebx": 1, "ecx": 2, "edx": 3, "esi": 4, "edi": 5,
+    "ebp": 6, "esp": 7, "eip": 8, "st": 9,
+}
+
+# Register operands in AT&T syntax are `%name`; x87 stack registers are
+# `%st(0)`.."%st(7)". The alternation captures the parenthesised x87 form before
+# the bare-word form so `%st(0)` is not truncated to `st`.
+_REG_TOKEN_RE = re.compile(r"%(st\(\d+\)|\w+)")
+
+
+def canonical_register(token: str) -> str:
+    """Fold an x86 register spelling to its canonical 32-bit family name.
+
+    ``token`` is a register name *without* the leading ``%`` (e.g. ``"eax"``,
+    ``"al"``, ``"dx"``, ``"st(0)"``). Sub-registers fold to their family
+    (``"al"``/``"ax"`` → ``"eax"``); x87 stack registers (``"st"``,
+    ``"st(0)"``..``"st(7)"``) fold to ``"st"``. An unrecognised token is
+    returned lowercased and unchanged so it is still counted, never silently
+    dropped.
+    """
+    name = token.lower()
+    if name.startswith("st"):      # st, st(0)..st(7)
+        return "st"
+    return _REGISTER_FAMILY.get(name, name)
+
+
+def _implicit_registers(mnemonic: str) -> Tuple[str, ...]:
+    """Canonical registers a mnemonic touches *implicitly* — registers that
+    never appear in the operand text but are read/written by the hardware.
+
+    Deliberately conservative so the footprint never over-claims: only the
+    always-correct cases are listed.
+
+    * Integer division (``idiv``/``div``, always one-operand, dividend in
+      ``%edx:%eax``) and the sign-extends that fill its high half
+      (``cltd``/``cdq``/``cwd``/``cqto``) implicitly use the ``%edx:%eax`` pair.
+      The one-operand ``mul``/``imul`` also use ``%edx:%eax``, but gcc -O0 emits
+      the two/three-operand ``imul`` form (no ``%edx``) for ``a * b``, so
+      multiply is left to its explicit operands to avoid a false ``%edx`` claim.
+      SSE division (``divss``/``divsd``) is excluded by the integer-suffix check,
+      since it touches ``%xmm`` registers, not ``%edx:%eax``.
+    * Stack traffic: ``push``/``pop`` and the ``call``/``ret`` family mutate the
+      stack pointer ``%esp`` on every occurrence, yet AT&T carries no explicit
+      ``%esp`` operand (``pushl %eax``, ``call f``, ``ret``). At -O0 this is the
+      most frequent implicit touch in the program — every prologue, epilogue,
+      and call site. ``call``/``ret`` additionally load/store the instruction
+      pointer ``%eip`` through the stack, and ``enter``/``leave`` rewrite the
+      frame pointer ``%ebp``. All are unconditional, so they meet the same
+      always-correct bar as the division cases above.
+    """
+    if mnemonic.startswith("idiv"):
+        return ("eax", "edx") if mnemonic[4:] in ("", "b", "w", "l", "q") else ()
+    if mnemonic.startswith("div"):
+        return ("eax", "edx") if mnemonic[3:] in ("", "b", "w", "l", "q") else ()
+    if mnemonic in ("cltd", "cdq", "cwd", "cqto", "cqo"):
+        return ("eax", "edx")
+    # Stack-pointer / frame-pointer / instruction-pointer traffic with no
+    # explicit operand (see docstring). Checked after the div family, which
+    # shares no prefix with these mnemonics.
+    if mnemonic.startswith("push") or mnemonic.startswith("pop"):
+        return ("esp",)
+    if mnemonic.startswith("call") or mnemonic.startswith("ret"):
+        return ("esp", "eip")
+    if mnemonic.startswith("enter") or mnemonic.startswith("leave"):
+        return ("ebp", "esp")
+    return ()
+
+
+def _registers_in_instruction(text: str) -> Set[str]:
+    """Canonical registers referenced by one assembly instruction line —
+    explicit operands plus any implicit hardware registers."""
+    regs: Set[str] = {canonical_register(m) for m in _REG_TOKEN_RE.findall(text)}
+    stripped = text.strip()
+    mnemonic = stripped.split(None, 1)[0].lower() if stripped else ""
+    regs.update(_implicit_registers(mnemonic))
+    return regs
+
+
+def _sort_registers(regs) -> List[str]:
+    """Sort canonical register names into the stable display order."""
+    return sorted(regs, key=lambda r: (_REGISTER_ORDER.get(r, 99), r))
+
+
+def analyze_registers(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``registers`` list (the canonical
+    x86 registers that line's assembly touches) and return a program-wide
+    summary ``{"register_totals": {reg: instruction_count}}``. Mutates
+    ``line_map`` in place.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost``).
+    ``register_totals`` counts, per register, the number of instructions that
+    reference it (a register named twice in one instruction counts once), so the
+    totals read as "how many instructions touch this register".
+    """
+    totals: Dict[str, int] = {}
+    for mapping in line_map.values():
+        line_regs: Set[str] = set()
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if 1 <= asm_no <= len(asm_lines):
+                regs = _registers_in_instruction(asm_lines[asm_no - 1])
+                line_regs |= regs
+                for r in regs:
+                    totals[r] = totals.get(r, 0) + 1
+        mapping["registers"] = _sort_registers(line_regs)
+
+    register_totals = {r: totals[r] for r in _sort_registers(totals)}
+    return {"register_totals": register_totals}
+
+
 def _classify_mnemonic(mnemonic: str) -> str | None:
     """Return the cost flag for an x86 mnemonic, or None if it is unremarkable.
 
@@ -321,6 +473,10 @@ async def compile_python(python_source: str) -> dict:
     asm_lines = filtered_asm.splitlines()
     # Annotate each line_map entry with asm_count/flags and build the summary.
     cost_summary = analyze_cost(line_map, asm_lines)
+    # Annotate each line_map entry with its register footprint and build the
+    # program-wide register summary. Runs after analyze_cost so both passes
+    # enrich the same line_map entries.
+    register_summary = analyze_registers(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
 
@@ -332,5 +488,6 @@ async def compile_python(python_source: str) -> dict:
         "asm_lines": asm_lines,
         "line_map": line_map,
         "cost_summary": cost_summary,
+        "register_summary": register_summary,
         "asm_glossary": asm_glossary,
     }

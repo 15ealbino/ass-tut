@@ -27,6 +27,11 @@ class LineMapping(BaseModel):
     # (mem / compute / branch / call / stack / other). Zero categories are
     # omitted. Empty for the pyghidra pipeline, which computes no per-line mix.
     category_counts: Dict[str, int] = Field(default_factory=dict)
+    # Register footprint: the canonical 32-bit x86 registers this Python line's
+    # assembly touches, in stable display order (explicit operands plus implicit
+    # ones like %edx:%eax on integer division). Empty for the pyghidra pipeline,
+    # which computes no per-line footprint.
+    registers: List[str] = Field(default_factory=list)
 
 
 class Hotspot(BaseModel):
@@ -40,6 +45,12 @@ class CostSummary(BaseModel):
     hotspots: List[Hotspot]
     # Program-wide instruction mix, same categories as LineMapping.category_counts.
     category_totals: Dict[str, int] = Field(default_factory=dict)
+
+
+class RegisterSummary(BaseModel):
+    # Program-wide register footprint: each canonical register mapped to the
+    # number of instructions that reference it, in stable display order.
+    register_totals: Dict[str, int] = Field(default_factory=dict)
 
 
 class GlossaryEntry(BaseModel):
@@ -71,6 +82,9 @@ class CompileResponse(BaseModel):
     line_map: Dict[int, LineMapping]
     # Present for the transpile pipeline; None for pyghidra (no per-line cost).
     cost_summary: Optional[CostSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line
+    # register footprint).
+    register_summary: Optional[RegisterSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)

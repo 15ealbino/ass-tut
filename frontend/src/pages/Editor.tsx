@@ -42,6 +42,24 @@ function formatMix(counts?: Record<string, number>): string {
     .join(' · ')
 }
 
+// ─── Register-footprint presentation ────────────────────────────────────────
+// Backend reports the canonical 32-bit x86 registers each Python line's asm
+// touches, plus a program-wide count of how many instructions reference each.
+// This stable order (accumulator-first, frame/stack pointers last) is how the
+// registers are shown in the REGS summary chip and per-line tooltips.
+const REGISTER_ORDER = ['eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp', 'esp', 'eip', 'st'] as const
+
+// Render a register-count map as "eax 12 · edx 3" in REGISTER_ORDER, with any
+// unrecognised register names (kept as-is by the backend) appended after.
+function formatRegisterTotals(totals?: Record<string, number>): string {
+  if (!totals) return ''
+  const known = REGISTER_ORDER.filter(r => (totals[r] ?? 0) > 0) as string[]
+  const extra = Object.keys(totals)
+    .filter(r => !(REGISTER_ORDER as readonly string[]).includes(r) && totals[r] > 0)
+    .sort()
+  return [...known, ...extra].map(r => `%${r} ${totals[r]}`).join(' · ')
+}
+
 // ─── Instruction-glossary presentation ─────────────────────────────────────
 // The backend returns one entry per distinct mnemonic in the compiled asm.
 // Render them, grouped by the same category order as the mix, into a single
@@ -7918,6 +7936,26 @@ export default function EditorPage() {
               MIX:: {formatMix(result.cost_summary.category_totals)}
             </span>
           )}
+          {result.register_summary?.register_totals && formatRegisterTotals(result.register_summary.register_totals) && (
+            <span
+              title={`Register footprint — how many instructions touch each x86 register: ${formatRegisterTotals(result.register_summary.register_totals)}. Integer division implicitly uses the %edx:%eax pair, so %edx can appear even when your code never names it.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              REGS:: {formatRegisterTotals(result.register_summary.register_totals)}
+            </span>
+          )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (
             <span
               title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
@@ -7951,6 +7989,10 @@ export default function EditorPage() {
             const mixTitle = formatMix(mapping.category_counts)
               ? ` — mix: ${formatMix(mapping.category_counts)}`
               : ''
+            const regs = mapping.registers ?? []
+            const regsTitle = regs.length
+              ? ` — regs: ${regs.map(r => `%${r}`).join(', ')}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -7971,7 +8013,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${flagTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${flagTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
