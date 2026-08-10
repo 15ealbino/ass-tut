@@ -32,6 +32,11 @@ class LineMapping(BaseModel):
     # ones like %edx:%eax on integer division). Empty for the pyghidra pipeline,
     # which computes no per-line footprint.
     registers: List[str] = Field(default_factory=list)
+    # Memory traffic: how many memory reads (loads) and writes (stores) this
+    # Python line's assembly performs, splitting the instruction-mix "mem" bucket
+    # by direction. Only nonzero of {"loads", "stores"} are present. Empty for the
+    # pyghidra pipeline, which computes no per-line memory traffic.
+    memory_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class Hotspot(BaseModel):
@@ -51,6 +56,12 @@ class RegisterSummary(BaseModel):
     # Program-wide register footprint: each canonical register mapped to the
     # number of instructions that reference it, in stable display order.
     register_totals: Dict[str, int] = Field(default_factory=dict)
+
+
+class MemorySummary(BaseModel):
+    # Program-wide memory traffic: the total number of memory reads (loads) and
+    # writes (stores) across the whole program. Both keys are always present.
+    memory_totals: Dict[str, int] = Field(default_factory=lambda: {"loads": 0, "stores": 0})
 
 
 class GlossaryEntry(BaseModel):
@@ -85,6 +96,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # register footprint).
     register_summary: Optional[RegisterSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line memory
+    # traffic).
+    memory_summary: Optional[MemorySummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
