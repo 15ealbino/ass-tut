@@ -11,6 +11,7 @@ import tempfile
 from functools import partial
 from typing import Dict, List, Set, Tuple
 
+from app.asm_glossary import build_asm_glossary
 from app.transpiler import TranspileError, build_line_map, transpile
 
 logger = logging.getLogger(__name__)
@@ -476,6 +477,8 @@ async def compile_python(python_source: str) -> dict:
     # program-wide register summary. Runs after analyze_cost so both passes
     # enrich the same line_map entries.
     register_summary = analyze_registers(line_map, asm_lines)
+    # Plain-English glossary of the distinct mnemonics actually emitted.
+    asm_glossary = build_asm_glossary(asm_lines)
 
     return {
         "python_lines": lines,
@@ -486,4 +489,5 @@ async def compile_python(python_source: str) -> dict:
         "line_map": line_map,
         "cost_summary": cost_summary,
         "register_summary": register_summary,
+        "asm_glossary": asm_glossary,
     }

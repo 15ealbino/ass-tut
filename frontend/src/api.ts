@@ -61,6 +61,16 @@ export interface RegisterSummary {
   register_totals: Record<string, number>
 }
 
+export interface GlossaryEntry {
+  // One distinct x86 mnemonic present in the compiled asm, with a plain-English
+  // meaning. `base` is the canonical opcode family; `category` matches the
+  // instruction-mix buckets (mem / compute / branch / call / stack / other).
+  mnemonic: string
+  base: string
+  category: string
+  description: string
+}
+
 export interface CompileResponse {
   python_lines: string[]
   c_code: string
@@ -72,6 +82,8 @@ export interface CompileResponse {
   cost_summary?: CostSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
   register_summary?: RegisterSummary | null
+  // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
+  asm_glossary?: GlossaryEntry[]
 }
 
 export type CompileMethod = 'transpile' | 'pyghidra'

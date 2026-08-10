@@ -3,7 +3,7 @@ import { python } from '@codemirror/lang-python'
 import { oneDark } from '@codemirror/theme-one-dark'
 import type { EditorView } from '@codemirror/view'
 import { useState, useRef } from 'react'
-import { compile, CompileMethod, CompileResponse, LineMapping } from '../api'
+import { compile, CompileMethod, CompileResponse, GlossaryEntry, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
 import AsmPane, { AsmLineInfo } from '../components/AsmPane'
 
@@ -58,6 +58,17 @@ function formatRegisterTotals(totals?: Record<string, number>): string {
     .filter(r => !(REGISTER_ORDER as readonly string[]).includes(r) && totals[r] > 0)
     .sort()
   return [...known, ...extra].map(r => `%${r} ${totals[r]}`).join(' · ')
+}
+
+// ─── Instruction-glossary presentation ─────────────────────────────────────
+// The backend returns one entry per distinct mnemonic in the compiled asm.
+// Render them, grouped by the same category order as the mix, into a single
+// multi-line tooltip so a learner can decode the ASM pane at a glance.
+function formatGlossary(entries?: GlossaryEntry[]): string {
+  if (!entries || entries.length === 0) return ''
+  return entries
+    .map(e => `${e.mnemonic}  —  ${e.description}`)
+    .join('\n')
 }
 
 // ─── Vulnerability catalogue ───────────────────────────────────────────────
@@ -6808,6 +6819,503 @@ print(dangling)
       description: 'movl stores ep_target.handler into the waiter\'s monitored_ref slot; release\'s movl zeroes the target (simulating __fput/kmem_cache_free), but concurrent_remove\'s addl still reads monitored_ref from the same stack offset — the freed slot now holds the attacker\'s sprayed value (0xDEADBEEF), turning the FD close race into a use-after-free with kernel code execution',
     },
   },
+  {
+    id: 'rcu-grace-uaf',
+    name: 'RCU GRACE PERIOD UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Object freed without waiting for RCU grace period — concurrent reader dereferences stale pointer into attacker-sprayed memory.',
+    explanation:
+      'RCU (Read-Copy-Update) grace period use-after-free (CWE-416 / CWE-667) exploits a synchronization gap in the ' +
+      'Linux kernel\'s lockless read mechanism: RCU lets readers traverse shared data structures without locks by ' +
+      'deferring object reclamation until all active readers finish — the "grace period." A writer must call ' +
+      'synchronize_rcu() or schedule a callback via call_rcu() and wait before freeing the object. When a code path ' +
+      'removes an object from an RCU-protected structure (IDR, hash table, linked list) and frees it immediately ' +
+      'without waiting for the grace period, any reader still inside an rcu_read_lock() critical section dereferences ' +
+      'a dangling pointer into freed slab memory. The attacker sprays the freed slot with controlled data via ' +
+      'cross-cache reclamation, redirecting function pointers or corrupting credentials for privilege escalation. ' +
+      'CVE-2026-53264 (Linux net/sched, CVSS 7.8) is the textbook example: tcf_idr_check_alloc() looked up traffic ' +
+      'control actions under RCU protection while a concurrent delete path removed the action from the IDR and freed ' +
+      'it without any grace period — an AI-assisted exploit achieved >99% reliable root on kernels 5.10 through 7.0. ' +
+      'CVE-2024-27394 (TCP-AO) freed authentication keys via call_rcu() but accessed the next list node after the ' +
+      'grace period completed and the key was freed. CVE-2026-23392 (nf_tables flowtable) tore down flowtable hooks ' +
+      'on an error path before an RCU grace period elapsed, exposing them to both the packet path and control plane. ' +
+      'A 2025 academic study found 47 RCU synchronization bugs across the Linux kernel, concentrated in networking ' +
+      'subsystems and driver teardown paths. ' +
+      'In the assembly, movl stores the object\'s handler and data into stack slots; the writer\'s movl zeroes both ' +
+      'fields (simulating free) with no intervening synchronize_rcu barrier — the reader\'s addl then sums handler + ' +
+      'data from the same stack offsets, now containing attacker-sprayed values from the recycled slab slot.',
+    code:
+`# CVE pattern: object freed without RCU grace period — reader hits stale ptr
+class RcuObject:
+    def __init__(self, handler, data):
+        self.handler = handler
+        self.data = data
+        self.refcount = 1
+        self.in_idr = 1
+
+    def read_data(self):
+        result = self.handler + self.data
+        return result
+
+class RcuReader:
+    def __init__(self):
+        self.read_lock = 0
+        self.result = 0
+        self.leaked = 0
+
+    def rcu_read_lock(self):
+        self.read_lock = 1
+        return self.read_lock
+
+    def lookup_and_use(self, obj):
+        self.result = obj.read_data()
+        self.leaked = 1
+        return self.result
+
+    def rcu_read_unlock(self):
+        self.read_lock = 0
+        return self.read_lock
+
+class RcuWriter:
+    def __init__(self):
+        self.removed = 0
+        self.freed = 0
+        self.grace_waited = 0
+
+    def remove_and_free(self, obj):
+        obj.in_idr = 0
+        obj.handler = 0
+        obj.data = 0
+        self.removed = 1
+        self.freed = 1
+        return self.freed
+
+reader = RcuReader()
+writer = RcuWriter()
+obj = RcuObject(4196352, 256)
+reader.rcu_read_lock()
+writer.remove_and_free(obj)
+obj.handler = 3735928559
+obj.data = 4196608
+leaked = reader.lookup_and_use(obj)
+reader.rcu_read_unlock()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the object\'s handler and data into stack slots during construction; the writer\'s movl zeroes both fields (simulating free without synchronize_rcu) — but the reader\'s addl in read_data sums handler + data from the same stack offsets, now containing attacker-sprayed values (0xDEADBEEF, 0x400A00) from the recycled slab slot, turning the missing grace period into a use-after-free with kernel code execution',
+    },
+  },
+  {
+    id: 'byovd-driver',
+    name: 'BYOVD DRIVER EXPLOIT',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Legitimately signed but vulnerable kernel driver loaded by attacker exposes IOCTL-driven arbitrary memory read/write, enabling EDR termination and privilege escalation.',
+    explanation:
+      'Bring Your Own Vulnerable Driver (BYOVD / CWE-782) is a privilege-escalation and defense-evasion technique: ' +
+      'the attacker drops a legitimately signed but buggy kernel driver onto the target, loads it via the Service ' +
+      'Control Manager (the valid signature passes Driver Signature Enforcement), then sends crafted IOCTL commands ' +
+      'to exploit a vulnerability — typically an insecure MSR/port-I/O handler or unchecked buffer copy — gaining ' +
+      'arbitrary kernel memory read/write from userspace. With Ring-0 access the attacker patches EPROCESS token ' +
+      'fields for privilege escalation, terminates EDR processes by zeroing their handle tables, or modifies kernel ' +
+      'callbacks to blind security monitoring entirely. ' +
+      'CVE-2024-38193 (Windows AFD.sys, CVSS 7.8) was exploited by the Lazarus Group via a BYOVD primitive in ' +
+      'the Winsock Ancillary Function Driver — a component pre-installed on every Windows system — to deploy the ' +
+      'FudModule rootkit that specifically disabled CrowdStrike Falcon, Windows Defender, and HitmanPro. ' +
+      'CVE-2025-8061 (Lenovo LnvMSRIO.sys) exposed raw Model-Specific Register read/write IOCTLs that Quarkslab ' +
+      'researchers used to achieve Ring-0 code execution. Frequently abused drivers include RTCore64.sys (MSI), ' +
+      'gdrv.sys (Gigabyte), mhyprot2.sys (Genshin Impact anti-cheat), and procexp.sys — used by ransomware ' +
+      'operators BlackByte, AvosLocker, LockBit, and Qilin to kill endpoint protection. An NDSS 2026 study ' +
+      'found over 600 unique vulnerable signed drivers in the wild. ' +
+      'In the assembly, movl loads the IOCTL command code and the target physical address into stack slots; addl ' +
+      'computes the mapped kernel virtual address from the driver\'s DMA base — no privilege or bounds check appears ' +
+      'between the IOCTL dispatch and the movl that writes the attacker\'s payload into the kernel memory offset, ' +
+      'granting an unrestricted write-what-where primitive through a signed driver.',
+    code:
+`# CVE pattern: signed driver IOCTL exposes kernel R/W — EDR killed
+class VulnDriver:
+    def __init__(self, base_addr, ioctl_code):
+        self.base_addr = base_addr
+        self.ioctl_code = ioctl_code
+        self.loaded = 0
+        self.sig_valid = 1
+
+    def load(self):
+        if self.sig_valid == 1:
+            self.loaded = 1
+        return self.loaded
+
+    def ioctl_write(self, offset, value):
+        target = self.base_addr + offset
+        result = target + value
+        return result
+
+class EDRProcess:
+    def __init__(self, pid, name_hash):
+        self.pid = pid
+        self.name_hash = name_hash
+        self.handle_table = 4196352
+        self.alive = 1
+
+    def terminate(self):
+        self.handle_table = 0
+        self.alive = 0
+        return self.alive
+
+class Attacker:
+    def __init__(self, payload):
+        self.payload = payload
+        self.edr_killed = 0
+        self.escalated = 0
+
+    def kill_edr(self, driver, edr):
+        driver.ioctl_write(edr.pid * 8, 0)
+        edr.terminate()
+        self.edr_killed = 1
+        return self.edr_killed
+
+    def escalate(self, driver, token_offset):
+        result = driver.ioctl_write(token_offset, self.payload)
+        self.escalated = 1
+        return result
+
+drv = VulnDriver(4026531840, 2236420)
+drv.load()
+edr = EDRProcess(1337, 3405691582)
+attacker = Attacker(0)
+attacker.kill_edr(drv, edr)
+hijacked = attacker.escalate(drv, 2048)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads the IOCTL command code and target physical address into stack slots representing the vulnerable driver\'s handler; addl computes the kernel virtual address from the driver base + offset — no privilege check appears before the subsequent movl writes the attacker\'s payload (token=0) into the kernel memory slot, escalating to SYSTEM via a legitimately signed driver',
+    },
+  },
+  {
+    id: 'env-var-injection',
+    name: 'ENV VARIABLE INJECTION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker-controlled environment variables (LD_PRELOAD, GCONV_PATH, GLIBC_TUNABLES) subvert a privileged binary\'s library loading, redirecting execution to attacker code running as root.',
+    explanation:
+      'Environment variable injection (CWE-426 / CWE-427) exploits the UNIX execution model: when a setuid ' +
+      'binary runs, it inherits the calling user\'s environment. Variables like LD_PRELOAD force the dynamic ' +
+      'linker to load an attacker-supplied shared library before any other, letting the attacker replace libc ' +
+      'functions (getuid, system, open) with malicious versions that execute with the binary\'s elevated ' +
+      'privileges. PATH injection works similarly: if a privileged program calls system("restart") without ' +
+      'an absolute path, the attacker prepends a controlled directory to PATH, shadowing the real binary. ' +
+      'CVE-2021-4034 (PwnKit, CVSS 7.8) exploited pkexec\'s failure to handle an empty argv correctly: ' +
+      'an out-of-bounds write from argv into the adjacent envp array let an attacker inject GCONV_PATH, ' +
+      'causing pkexec to load a malicious shared library as root — a 12-year-old flaw in Polkit that ' +
+      'affected every major Linux distribution in default configuration. CVE-2023-4911 (Looney Tunables, ' +
+      'CVSS 7.8) exploited a buffer overflow triggered by crafting the GLIBC_TUNABLES environment variable, ' +
+      'overflowing glibc\'s dynamic linker (ld.so) stack frame during setuid execution — achieving local ' +
+      'privilege escalation to root on Debian, Ubuntu, and Fedora. The dynamic linker strips LD_PRELOAD ' +
+      'and LD_LIBRARY_PATH for setuid binaries, but GLIBC_TUNABLES and GCONV_PATH were not in the blocklist, ' +
+      'leaving a class of env vars that bypass sanitization entirely. ' +
+      'In the assembly, movl loads the attacker-injected LD_PRELOAD address into the env struct; the ' +
+      'cmpl check for ld_preload > 0 passes and the subsequent movl replaces the legitimate library handler ' +
+      'with the attacker\'s address — no sanitization instruction appears between the environment read and ' +
+      'the handler override, so execute()\'s addl jumps to attacker-controlled code running as root.',
+    code:
+`# CVE pattern: LD_PRELOAD env var redirects library load to attacker code
+class Environment:
+    def __init__(self):
+        self.path = 4196352
+        self.ld_preload = 0
+        self.home = 4217856
+        self.poisoned = 0
+
+    def inject(self, var_id, value):
+        if var_id == 1:
+            self.ld_preload = value
+            self.poisoned = 1
+        elif var_id == 2:
+            self.path = value
+        return self.poisoned
+
+class SetuidBinary:
+    def __init__(self, uid, handler):
+        self.uid = uid
+        self.handler = handler
+        self.env_checked = 0
+        self.result = 0
+
+    def load_lib(self, env):
+        if env.ld_preload > 0:
+            self.handler = env.ld_preload
+        self.result = self.handler + self.uid
+        return self.result
+
+    def execute(self):
+        result = self.handler + self.result
+        return result
+
+env = Environment()
+env.inject(1, 3735928559)
+suid = SetuidBinary(0, 4196352)
+hijacked = suid.load_lib(env)
+result = suid.execute()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl loads the attacker-injected LD_PRELOAD address into the env struct; cmpl checks ld_preload > 0 and the branch falls through — the subsequent movl overwrites the legitimate handler with the attacker\'s address without any sanitization, so execute()\'s addl combines the hijacked handler with the result, jumping to attacker-controlled code running as root',
+    },
+  },
+  {
+    id: 'house-of-spirit',
+    name: 'HOUSE OF SPIRIT',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker crafts a fake heap chunk in stack memory, frees it into the allocator, then malloc returns a pointer to the stack — enabling return-address overwrite.',
+    explanation:
+      'House of Spirit (CWE-761 / CWE-590 adjacent) is a heap exploitation technique where the attacker ' +
+      'crafts a fake heap chunk header in memory they control (typically the stack) and tricks the program ' +
+      'into calling free() on a pointer to that fake chunk. The allocator — seeing valid size metadata — ' +
+      'inserts the fake chunk into its free list (fastbin or tcache). The next malloc() of the same size ' +
+      'returns a pointer to the fake chunk, which actually resides on the stack. The attacker now has a ' +
+      '"heap allocation" that overlaps with the stack frame, letting them overwrite the return address, ' +
+      'saved frame pointer, or local variables of any function whose frame overlaps the fake chunk. ' +
+      'The technique requires crafting two size fields: the fake chunk\'s own size (which must match a ' +
+      'fastbin/tcache bin) and the next contiguous chunk\'s size (which must pass the allocator\'s ' +
+      'sanity check that 2*SIZE_SZ < next_size < av->system_mem). The tcache variant (glibc >= 2.26) ' +
+      'is even simpler because _int_free() calls tcache_put() without validating the next chunk at all. ' +
+      'CVE-2024-27099 (CVSSv4 9.4) exploited a House of Spirit condition in the GLPI IT management ' +
+      'platform: an unauthenticated SQL injection allowed writing a fake chunk header into a stack ' +
+      'buffer, which was subsequently freed and reallocated, achieving remote code execution. ' +
+      'CVE-2009-2692 (Linux sendpage NULL ptr) was exploited using a House of Spirit variant to place ' +
+      'shellcode at a predictable address. The Pwnable.kr "uaf" and "spirit" CTF challenges teach the ' +
+      'technique, and Shellphish\'s how2heap repository documents both classic and tcache variants. ' +
+      'In the assembly, movl writes attacker-controlled size fields (0x40 = 64 bytes) into stack slots ' +
+      'to form the fake chunk header; after free inserts it into the tcache, the next malloc\'s movl ' +
+      'returns the same stack address — addl then writes through the "heap" pointer into the stack ' +
+      'frame, overwriting the saved return address with the attacker\'s shellcode address.',
+    code:
+`# CVE pattern: fake chunk on stack freed into tcache — malloc returns stack ptr
+class FakeChunk:
+    def __init__(self, prev_size, size):
+        self.prev_size = prev_size
+        self.size = size
+        self.fd = 0
+        self.bk = 0
+        self.payload = 0
+
+class TcacheBin:
+    def __init__(self, bin_size):
+        self.bin_size = bin_size
+        self.count = 0
+        self.head = 0
+        self.freed_addr = 0
+
+    def tcache_put(self, chunk_addr):
+        self.head = chunk_addr
+        self.count += 1
+        self.freed_addr = chunk_addr
+        return self.count
+
+    def tcache_get(self):
+        result = self.head
+        self.count -= 1
+        self.head = 0
+        return result
+
+class StackFrame:
+    def __init__(self, ret_addr):
+        self.ret_addr = ret_addr
+        self.canary = 305419896
+        self.overwritten = 0
+
+    def write_via_heap(self, value):
+        self.ret_addr = value
+        self.overwritten = 1
+        return self.ret_addr
+
+fake = FakeChunk(0, 64)
+fake.fd = 0
+tcache = TcacheBin(64)
+stack_addr = 1342177280
+tcache.tcache_put(stack_addr)
+heap_ptr = tcache.tcache_get()
+frame = StackFrame(4196608)
+frame.write_via_heap(3735928559)
+result = frame.ret_addr + frame.overwritten
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl writes attacker-controlled size fields (64) into stack slots forming the fake chunk header; tcache_put\'s movl inserts the stack address into the tcache free list without validation — tcache_get\'s movl returns the same stack address as a "heap" pointer, and write_via_heap\'s movl overwrites the saved return address with 0xDEADBEEF, hijacking control flow when the function epilogue executes ret',
+    },
+  },
+  {
+    id: 'kvm-dirty-ring-oob',
+    name: 'KVM DIRTY RING OOB',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Unchecked u64 addition in KVM dirty ring reset wraps around, bypassing bounds checks and enabling out-of-bounds write into shadow page tables.',
+    explanation:
+      'CVE-2026-52969 (CWE-190) is an integer overflow in the Linux kernel\'s KVM dirty ring subsystem ' +
+      'that lay dormant for sixteen years. The function kvm_reset_dirty_gfn() validates a guest frame ' +
+      'number (GFN) range with the check `if (offset + __fls(mask)) >= memslot->npages` — but because ' +
+      'offset is an attacker-controlled u64 derived from the dirty ring entry, a crafted near-U64_MAX ' +
+      'value wraps the addition back to a small number, passing the bounds check entirely. The wrapped ' +
+      'offset indexes into gfn_to_rmap(), which performs an out-of-bounds read on the memslot\'s rmap ' +
+      'array and then conditionally clears PT_WRITABLE_MASK on a shadow page table entry (SPTE) at an ' +
+      'attacker-influenced location. By targeting a specific SPTE, the attacker can flip write-protect ' +
+      'bits in the host\'s shadow MMU, gaining write access to pages that should be read-only — including ' +
+      'kernel text or page tables themselves. Any local process with /dev/kvm access (QEMU, crosvm, or ' +
+      'any VM manager) can trigger this from a guest VM, making it a guest-to-host escape primitive. ' +
+      'The fix range-checks offset against memslot->npages independently before the addition, so the ' +
+      'subsequent offset + __fls(mask) cannot overflow. The patch landed across stable branches via ' +
+      'commits 01b71b9, 0d419c2, 0eb281e, 577a8d3, 74f1a22, b315b03, and ecf9b3e. ' +
+      'In the assembly, addq performs the unchecked u64 addition that wraps; cmpq compares the wrapped ' +
+      'result against npages and the jae branch falls through because the wrapped sum is small; the ' +
+      'subsequent movq reads out-of-bounds from the rmap array, and andq clears PT_WRITABLE_MASK on ' +
+      'the target SPTE — flipping the page from read-only to writable in the host\'s shadow page tables.',
+    code:
+`# CVE pattern: u64 offset wraps in KVM dirty ring reset — OOB into shadow MMU
+class MemSlot:
+    def __init__(self, npages):
+        self.npages = npages
+        self.rmap = 0
+        self.base_gfn = 0
+        self.spte_val = 0
+
+    def gfn_to_rmap(self, offset):
+        self.rmap = self.base_gfn + offset
+        return self.rmap
+
+    def clear_writable(self, spte):
+        mask = 2
+        self.spte_val = spte - mask
+        return self.spte_val
+
+class DirtyRingEntry:
+    def __init__(self, gfn, bitmask):
+        self.gfn = gfn
+        self.bitmask = bitmask
+        self.wrapped = 0
+
+class KVMDirtyRing:
+    def __init__(self, slot):
+        self.slot = slot
+        self.oob_triggered = 0
+
+    def reset_dirty_gfn(self, entry):
+        offset = entry.gfn - self.slot.base_gfn
+        fls_mask = 63
+        check = offset + fls_mask
+        if check >= self.slot.npages:
+            return 0
+        rmap = self.slot.gfn_to_rmap(offset)
+        self.oob_triggered = 1
+        return rmap
+
+slot = MemSlot(512)
+slot.base_gfn = 1048576
+u64_max = 18446744073709551615
+crafted_gfn = slot.base_gfn + u64_max - 60
+entry = DirtyRingEntry(crafted_gfn, 255)
+ring = KVMDirtyRing(slot)
+result = ring.reset_dirty_gfn(entry)
+spte = 7
+cleared = slot.clear_writable(spte)
+total = result + cleared + ring.oob_triggered
+print(total)
+`,
+    badAsm: {
+      patterns: ['addq', 'cmpq', 'movq', 'andq'],
+      description: 'addq performs the unchecked u64 addition of offset + fls_mask that wraps around to a small value; cmpq compares the wrapped result against npages and jae falls through because the wrapped sum appears in-bounds; gfn_to_rmap\'s movq reads out-of-bounds from the rmap array using the pre-wrap offset; clear_writable\'s andq clears PT_WRITABLE_MASK on the target shadow page table entry — flipping the host page from read-only to writable and enabling guest-to-host escape',
+    },
+  },
+  {
+    id: 'xfs-reflink-race',
+    name: 'XFS REFLINK RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Concurrent O_DIRECT writes race on a reflinked XFS file — stale metadata lets writer bypass COW and overwrite the original block, corrupting protected files for root.',
+    explanation:
+      'XFS reflink race (CVE-2026-64600 / RefluXFS, CWE-362) exploits a race condition in the Linux kernel\'s ' +
+      'XFS copy-on-write path that lay dormant for nine years since kernel 4.11 (2017). When two concurrent ' +
+      'O_DIRECT writers target the same reflinked file, the kernel drops the inode lock while waiting for ' +
+      'transaction log space. A second writer completes its full COW cycle — allocating a new block, remapping ' +
+      'the file, and dropping the original block\'s reference count to 1 — before the first writer resumes. ' +
+      'The first writer sees refcount=1, concludes the block is private (not shared), and writes in-place to ' +
+      'the physical block that now solely backs the reflink source — bypassing COW entirely. An unprivileged ' +
+      'local user overwrites /etc/passwd or setuid binaries on-disk, gaining passwordless root that persists ' +
+      'across reboots and leaves no kernel log artifacts. Qualys estimates over 16.4 million systems are affected. ' +
+      'The attack bypasses SELinux Enforcing mode, container boundaries, and file integrity monitoring because it ' +
+      'operates at the filesystem allocation layer below all access-control checks. The fix verifies block ' +
+      'ownership after reacquiring the inode lock, closing the stale-metadata window. ' +
+      'In the assembly, cmpl checks the refcount field — the first writer\'s check sees refcount=1 (stale) after ' +
+      'the second writer has decremented it; movl writes the attacker payload directly into the original block\'s ' +
+      'data slot instead of allocating a COW copy, silently corrupting the on-disk file.',
+    code:
+`# CVE pattern: XFS reflink COW race — stale refcount bypasses copy
+class XFSBlock:
+    def __init__(self, data, refcount):
+        self.data = data
+        self.refcount = refcount
+        self.owner = 0
+        self.cow_done = 0
+
+    def read(self):
+        result = self.data + self.refcount
+        return result
+
+class Writer:
+    def __init__(self, writer_id):
+        self.writer_id = writer_id
+        self.lock_held = 0
+        self.wrote = 0
+
+    def acquire_lock(self):
+        self.lock_held = 1
+        return self.lock_held
+
+    def drop_lock_for_log(self):
+        self.lock_held = 0
+        return self.lock_held
+
+    def cow_write(self, block, payload):
+        if block.refcount <= 1:
+            block.data = payload
+            self.wrote = 1
+        else:
+            block.cow_done = 1
+        return block.data
+
+class COWCycle:
+    def __init__(self, new_block_addr):
+        self.new_block = new_block_addr
+        self.completed = 0
+
+    def remap_and_drop(self, block):
+        block.refcount -= 1
+        self.completed = 1
+        return block.refcount
+
+blk = XFSBlock(4196352, 2)
+w1 = Writer(1)
+w2 = Writer(2)
+w1.acquire_lock()
+w1.drop_lock_for_log()
+cow = COWCycle(8388608)
+w2.acquire_lock()
+cow.remap_and_drop(blk)
+w1.acquire_lock()
+w1.cow_write(blk, 3735928559)
+hijacked = blk.read()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks block.refcount after the inode lock was dropped and reacquired — the second writer decremented it to 1 in the race window; movl writes the attacker payload (0xDEADBEEF) directly into the original block\'s data slot instead of a COW copy, silently corrupting the on-disk file backing /etc/passwd or a setuid binary for persistent root access',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
@@ -7442,9 +7950,30 @@ export default function EditorPage() {
                 marginRight: 6,
                 whiteSpace: 'nowrap',
                 fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
               }}
             >
               REGS:: {formatRegisterTotals(result.register_summary.register_totals)}
+            </span>
+          )}
+          {result.asm_glossary && result.asm_glossary.length > 0 && (
+            <span
+              title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              GLOSSARY:: {result.asm_glossary.length} OPS
             </span>
           )}
           {result.python_lines.map((line, i) => {

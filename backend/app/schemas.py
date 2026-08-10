@@ -52,6 +52,16 @@ class RegisterSummary(BaseModel):
     # number of instructions that reference it, in stable display order.
     register_totals: Dict[str, int] = Field(default_factory=dict)
 
+
+class GlossaryEntry(BaseModel):
+    # One distinct x86 mnemonic present in the compiled asm, with a plain-English
+    # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
+    # the same six-bucket classification as the instruction-mix feature.
+    mnemonic: str
+    base: str
+    category: str
+    description: str
+
 # Compile backend selectors:
 #   transpile — the AST→C→gcc pipeline (default; supports per-line mapping)
 #   pyghidra  — Nuitka → native binary → Ghidra disassembly + decompiled C
@@ -75,3 +85,6 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # register footprint).
     register_summary: Optional[RegisterSummary] = None
+    # Glossary of the distinct mnemonics in the compiled asm. Empty for the
+    # pyghidra pipeline, which does not annotate its disassembly.
+    asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
