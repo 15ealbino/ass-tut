@@ -3,7 +3,7 @@ import { python } from '@codemirror/lang-python'
 import { oneDark } from '@codemirror/theme-one-dark'
 import type { EditorView } from '@codemirror/view'
 import { useState, useRef } from 'react'
-import { compile, CompileMethod, CompileResponse, LineMapping } from '../api'
+import { compile, CompileMethod, CompileResponse, GlossaryEntry, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
 import AsmPane, { AsmLineInfo } from '../components/AsmPane'
 
@@ -40,6 +40,17 @@ function formatMix(counts?: Record<string, number>): string {
     .filter(cat => (counts[cat] ?? 0) > 0)
     .map(cat => `${CATEGORY_LABEL[cat] ?? cat} ${counts[cat]}`)
     .join(' · ')
+}
+
+// ─── Instruction-glossary presentation ─────────────────────────────────────
+// The backend returns one entry per distinct mnemonic in the compiled asm.
+// Render them, grouped by the same category order as the mix, into a single
+// multi-line tooltip so a learner can decode the ASM pane at a glance.
+function formatGlossary(entries?: GlossaryEntry[]): string {
+  if (!entries || entries.length === 0) return ''
+  return entries
+    .map(e => `${e.mnemonic}  —  ${e.description}`)
+    .join('\n')
 }
 
 // ─── Vulnerability catalogue ───────────────────────────────────────────────
@@ -7905,6 +7916,26 @@ export default function EditorPage() {
               }}
             >
               MIX:: {formatMix(result.cost_summary.category_totals)}
+            </span>
+          )}
+          {result.asm_glossary && result.asm_glossary.length > 0 && (
+            <span
+              title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              GLOSSARY:: {result.asm_glossary.length} OPS
             </span>
           )}
           {result.python_lines.map((line, i) => {
