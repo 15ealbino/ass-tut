@@ -7316,6 +7316,76 @@ print(hijacked)
       description: 'cmpl checks block.refcount after the inode lock was dropped and reacquired — the second writer decremented it to 1 in the race window; movl writes the attacker payload (0xDEADBEEF) directly into the original block\'s data slot instead of a COW copy, silently corrupting the on-disk file backing /etc/passwd or a setuid binary for persistent root access',
     },
   },
+  {
+    id: 'house-of-orange',
+    name: 'HOUSE OF ORANGE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Heap overflow corrupts the top chunk size, tricking sysmalloc into freeing it to the unsorted bin — arbitrary write without ever calling free().',
+    explanation:
+      'House of Orange (HITCON 2016, CWE-122) is a heap exploitation technique that achieves arbitrary write ' +
+      'without requiring any call to free() or delete — only a heap buffer overflow and malloc. The attacker ' +
+      'overflows into the wilderness (top) chunk\'s size field, shrinking it to a value smaller than the next ' +
+      'allocation request while keeping the PREV_INUSE bit set and the size page-aligned. When malloc cannot ' +
+      'satisfy the request from the corrupted top chunk, glibc\'s sysmalloc invokes _int_free() on the old top ' +
+      'chunk, placing it into the unsorted bin — a free that the program never asked for. The attacker now ' +
+      'controls the freed chunk\'s fd/bk pointers through the same overflow, enabling an unsorted bin attack to ' +
+      'overwrite _IO_list_all with a pointer to a forged _IO_FILE structure. On the next failed allocation or ' +
+      'abort, glibc traverses the corrupted file-stream chain and calls a vtable function pointer the attacker ' +
+      'controls — typically system("/bin/sh"). The technique was widely used in CTF exploitation and real-world ' +
+      'chains before glibc 2.24 added _IO_FILE vtable verification and glibc 2.26 removed the malloc_printerr ' +
+      'path to _IO_flush_all_lockp; modern variants (House of Kiwi, House of Emma) bypass these checks. ' +
+      'In the assembly, movl writes the attacker\'s undersized value (0xFF0) into the top chunk\'s size field; ' +
+      'cmpl compares the next allocation request against this corrupted size, branching into the sysmalloc path ' +
+      'that calls _int_free on the old top chunk and inserts it into the unsorted bin.',
+    code:
+`# CVE pattern: corrupt top chunk size — sysmalloc frees it without free()
+class TopChunk:
+    def __init__(self, base, size):
+        self.base = base
+        self.size = size
+        self.prev_inuse = 1
+        self.freed = 0
+
+class UnsortedBin:
+    def __init__(self):
+        self.head = 0
+        self.count = 0
+
+    def insert(self, addr):
+        self.head = addr
+        self.count += 1
+        return self.count
+
+class Exploiter:
+    def __init__(self, overflow_val):
+        self.overflow_val = overflow_val
+        self.got_shell = 0
+
+    def corrupt_top(self, top):
+        top.size = self.overflow_val
+        return top.size
+
+    def trigger(self, top, unsorted, request):
+        if request > top.size:
+            top.freed = 1
+            unsorted.insert(top.base)
+            self.got_shell = 1
+        return self.got_shell
+
+top = TopChunk(6291456, 131072)
+ubin = UnsortedBin()
+exp = Exploiter(4080)
+exp.corrupt_top(top)
+exp.trigger(top, ubin, 8192)
+leaked = ubin.head + top.prev_inuse
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl overwrites the top chunk\'s size field with the attacker\'s undersized value (0xFF0); cmpl compares the allocation request against the corrupted size — the request exceeds it, branching into sysmalloc which calls _int_free on the old top chunk and places it in the unsorted bin, achieving a free-without-free primitive for unsorted bin attack into _IO_FILE vtable hijack',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
