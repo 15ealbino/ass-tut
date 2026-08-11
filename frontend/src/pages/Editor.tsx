@@ -7386,6 +7386,69 @@ print(leaked)
       description: 'movl overwrites the top chunk\'s size field with the attacker\'s undersized value (0xFF0); cmpl compares the allocation request against the corrupted size — the request exceeds it, branching into sysmalloc which calls _int_free on the old top chunk and places it in the unsorted bin, achieving a free-without-free primitive for unsorted bin attack into _IO_FILE vtable hijack',
     },
   },
+  {
+    id: 'tls-canary-bypass',
+    name: 'TLS CANARY MASTER OVERWRITE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Buffer overflow extends into thread-local storage, overwriting the canary master at fs:0x28 so the stack canary check passes despite a smashed return address.',
+    explanation:
+      'On x86-64 Linux, every function prologue copies the stack canary from the thread-local storage segment ' +
+      'register (fs:0x28) into the stack frame, and the epilogue\'s xorl/cmpl compares them — a mismatch triggers ' +
+      '__stack_chk_fail and aborts the process, blocking classic stack smashing. TLS canary master overwrite ' +
+      '(CWE-121 / CWE-693) defeats this defense entirely: if the overflow is large enough to reach the adjacent TLS ' +
+      'region — which on glibc sits at a known offset from each thread\'s stack — the attacker overwrites the master ' +
+      'canary value at fs:0x28 to match the value already written over the stack canary. Both copies now agree, ' +
+      '__stack_chk_fail never fires, and the overwritten return address takes effect on ret. ' +
+      'CVE-2023-4911 (Looney Tunables, CVSS 7.8) exploited exactly this mechanism: a buffer overflow in glibc\'s ' +
+      'dynamic linker (ld.so) caused by GLIBC_TUNABLES environment variable processing extended into the TLS area, ' +
+      'enabling return-address hijack for local privilege escalation to root on Debian, Ubuntu, Fedora, and all ' +
+      'major Linux distributions — multiple public exploits achieved root in under a second. CVE-2020-1751 (glibc ' +
+      'glob GLOB_TILDE overflow) similarly allowed overwriting TLS memory from an adjacent stack buffer. ' +
+      'In the assembly, movl stores the attacker\'s chosen value into both the stack canary slot and the TLS master ' +
+      'field; the epilogue\'s cmpl compares them — both hold 0x41414141, so je skips __stack_chk_fail entirely, ' +
+      'and the overwritten return address (0xDEADBEEF) takes effect when ret pops it into %rip.',
+    code:
+`# CVE pattern: overflow into TLS overwrites canary master — check passes
+class ThreadLocal:
+    def __init__(self, canary, dtv_ptr):
+        self.canary_master = canary
+        self.dtv_ptr = dtv_ptr
+        self.errno_val = 0
+        self.corrupted = 0
+
+class VulnFrame:
+    def __init__(self, tls):
+        self.buf_size = 64
+        self.local_data = 0
+        self.canary = tls.canary_master
+        self.saved_rbp = 4196352
+        self.ret_addr = 4196608
+
+    def check_canary(self, tls):
+        if self.canary == tls.canary_master:
+            return 1
+        return 0
+
+    def overflow_into_tls(self, tls, payload, hijack_addr):
+        tls.canary_master = payload
+        self.canary = payload
+        self.ret_addr = hijack_addr
+        tls.corrupted = 1
+        return self.ret_addr
+
+tls = ThreadLocal(305419896, 4217856)
+frame = VulnFrame(tls)
+frame.overflow_into_tls(tls, 1094795585, 3735928559)
+passed = frame.check_canary(tls)
+hijacked = frame.ret_addr + passed
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl overwrites both the stack canary slot and the TLS canary master (fs:0x28) with the same attacker-chosen value (0x41414141); cmpl compares them — both match, so je skips __stack_chk_fail entirely, and the overwritten return address (0xDEADBEEF) takes effect when ret pops it into %rip',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
