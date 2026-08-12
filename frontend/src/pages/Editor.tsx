@@ -7449,6 +7449,78 @@ print(hijacked)
       description: 'movl overwrites both the stack canary slot and the TLS canary master (fs:0x28) with the same attacker-chosen value (0x41414141); cmpl compares them — both match, so je skips __stack_chk_fail entirely, and the overwritten return address (0xDEADBEEF) takes effect when ret pops it into %rip',
     },
   },
+  {
+    id: 'reentrancy-drain',
+    name: 'REENTRANCY ATTACK',
+    severity: 'CRITICAL',
+    category: 'Access Control',
+    description: 'External callback re-enters a function before its state update completes, allowing repeated withdrawals that drain funds past the balance check.',
+    explanation:
+      'Reentrancy (CWE-841 / SWC-107) occurs when a function performs an external call — a transfer, callback, ' +
+      'or delegate — before updating its own state. The external call hands execution to attacker-controlled code, ' +
+      'which immediately re-invokes the same function; the re-entrant call sees the original, un-decremented ' +
+      'balance and passes the guard check again, draining funds past the intended limit. ' +
+      'The most devastating exploit in blockchain history: on June 17, 2016, an attacker exploited a reentrancy ' +
+      'bug in The DAO\'s splitDAO function on Ethereum, recursively calling withdraw() through a fallback ' +
+      'function before the balance was decremented — draining 3.6 million ETH (~$60M at the time) into a child ' +
+      'DAO. The attack triggered an emergency hard fork at block 1,920,000 that split Ethereum and Ethereum ' +
+      'Classic permanently. The pattern recurs across DeFi: Curve Finance lost $70M in July 2023 via a Vyper ' +
+      'compiler bug that disabled reentrancy guards, and dForce lost $3.6M to a read-only reentrancy in 2023. ' +
+      'Beyond smart contracts, kernel callback chains (notifier_call_chain in Linux) and reentrant signal ' +
+      'handlers exhibit the same structural flaw — CVE-2019-18634 (sudo) exploited reentrant tgetpass processing. ' +
+      'In the assembly, cmpl compares the unchanged balance field against the withdrawal amount on every ' +
+      'reentrant check call — the addl that accumulates pending transfers never triggers a corresponding ' +
+      'subl from balance until finalize runs after the attack loop completes. The absence of a balance-decrement ' +
+      'instruction between successive cmpl checks is the assembly-level signature of the vulnerability.',
+    code:
+`# CVE pattern: state update after external call — reentrant callback drains
+class Vault:
+    def __init__(self, deposit):
+        self.balance = deposit
+        self.pending = 0
+        self.send_count = 0
+        self.locked = 0
+
+    def check(self, amount):
+        if self.balance >= amount:
+            return 1
+        return 0
+
+    def send(self, amount):
+        self.pending += amount
+        self.send_count += 1
+        return self.send_count
+
+    def finalize(self):
+        self.balance -= self.pending
+        self.locked = 1
+        return self.balance
+
+class Callback:
+    def __init__(self, steal):
+        self.per_call = steal
+        self.drained = 0
+        self.entries = 0
+
+vault = Vault(500)
+attacker = Callback(100)
+i = 0
+while i < 8:
+    ok = vault.check(attacker.per_call)
+    if ok == 1:
+        vault.send(attacker.per_call)
+        attacker.drained += attacker.per_call
+        attacker.entries += 1
+    i += 1
+vault.finalize()
+result = attacker.drained
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'addl'],
+      description: 'cmpl compares the unchanged balance field against amount on every reentrant check — it passes all 8 times because no subl decrements balance between calls; addl accumulates 800 in pending from a 500-balance vault, and the balance-decrement movl in finalize() runs only after the drain loop completes',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
