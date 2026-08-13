@@ -7521,6 +7521,93 @@ print(result)
       description: 'cmpl compares the unchanged balance field against amount on every reentrant check — it passes all 8 times because no subl decrements balance between calls; addl accumulates 800 in pending from a 500-balance vault, and the balance-decrement movl in finalize() runs only after the drain loop completes',
     },
   },
+  {
+    id: 'shadow-mmu-vm-escape',
+    name: 'SHADOW MMU VM ESCAPE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'KVM shadow MMU reuses a cached shadow page on GFN match alone without comparing the role field, causing role confusion that corrupts host kernel memory from inside a guest VM.',
+    explanation:
+      'Shadow MMU role confusion (CWE-416 / CWE-843) exploits a missing comparison in KVM\'s shadow page table ' +
+      'management. When hardware-assisted nested paging is unavailable or disabled, KVM maintains "shadow" page tables ' +
+      'that translate guest-virtual addresses directly to host-physical addresses. Each shadow page is identified by ' +
+      'a (gfn, role) tuple — the guest frame number and a role field encoding page size (4KB vs 2MB), direct/indirect ' +
+      'mapping mode, and access permissions. The function kvm_mmu_get_child_sp(), which fetches or reuses cached ' +
+      'shadow pages, compared only the GFN and never checked the role. A malicious guest triggers a page-size ' +
+      'transition — changing a 2MB large page (role.direct=1) to a 4KB small page (role.direct=0) at the same GFN — ' +
+      'and KVM reuses the stale large-page shadow entry. The reverse-map (rmap) now points to a shadow PTE that ' +
+      'references the wrong page-table level; when KVM later zaps or reclaims that shadow page, it frees host memory ' +
+      'still referenced by the mismatched entry — a use-after-free in host kernel address space. ' +
+      'CVE-2026-53359 (Januscape) exploited this exact primitive: the bug existed in the shadow MMU code shared by ' +
+      'both Intel VMX and AMD SVM for 16 years (since August 2010), making it the first publicly known guest-to-host ' +
+      'escape targeting both CPU vendors simultaneously. It was actively exploited as a zero-day in Google\'s kvmCTF ' +
+      'competition before disclosure, underscoring real-world exploitability against multi-tenant cloud platforms. ' +
+      'In the assembly, cmpl compares cached_gfn against the requested GFN — no cmpl for the role field follows; ' +
+      'movl reuses the stale shadow page entry with the wrong role, and after zap_stale frees it, addl in ' +
+      'reclaim_page reads the freed slot where the attacker has sprayed uid=0, crossing the VM isolation boundary.',
+    code:
+`# CVE pattern: shadow MMU reuses page on GFN match — role mismatch corrupts host
+class ShadowPage:
+    def __init__(self, gfn, role):
+        self.gfn = gfn
+        self.role = role
+        self.host_pte = 0
+        self.rmap_valid = 1
+
+    def link_rmap(self, host_addr):
+        self.host_pte = host_addr
+        self.rmap_valid = 1
+        return self.host_pte
+
+class ShadowMMU:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.cached_gfn = 0
+        self.cached_role = 0
+        self.reused = 0
+
+    def get_child_sp(self, gfn, new_role):
+        if gfn == self.cached_gfn:
+            self.reused = 1
+        else:
+            self.cached_gfn = gfn
+            self.cached_role = new_role
+        return self.reused
+
+    def zap_stale(self, sp):
+        sp.host_pte = 0
+        sp.rmap_valid = 0
+        return sp.rmap_valid
+
+class HostKernel:
+    def __init__(self, base):
+        self.base = base
+        self.cred_uid = 1000
+        self.cred_gid = 1000
+        self.escaped = 0
+
+    def reclaim_page(self, payload):
+        self.cred_uid = payload
+        self.cred_gid = payload
+        self.escaped = 1
+        return self.escaped
+
+mmu = ShadowMMU(512)
+sp = ShadowPage(1024, 1)
+sp.link_rmap(4196352)
+mmu.get_child_sp(1024, 1)
+mmu.get_child_sp(1024, 0)
+mmu.zap_stale(sp)
+host = HostKernel(4196352)
+host.reclaim_page(0)
+leaked = host.cred_uid + host.escaped
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl compares cached_gfn against the requested GFN but no subsequent cmpl checks the role field — movl reuses the stale shadow page entry with the wrong role (direct=1 when direct=0 was needed); after zap_stale\'s movl frees the host PTE, reclaim_page\'s movl overwrites cred_uid to 0 in the same stack offset, and addl sums the escalated values — crossing the VM isolation boundary to achieve host-level root',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
