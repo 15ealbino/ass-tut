@@ -7608,6 +7608,87 @@ print(leaked)
       description: 'cmpl compares cached_gfn against the requested GFN but no subsequent cmpl checks the role field — movl reuses the stale shadow page entry with the wrong role (direct=1 when direct=0 was needed); after zap_stale\'s movl frees the host PTE, reclaim_page\'s movl overwrites cred_uid to 0 in the same stack offset, and addl sums the escalated values — crossing the VM isolation boundary to achieve host-level root',
     },
   },
+  {
+    id: 'ghostlock-stack-uaf',
+    name: 'GHOSTLOCK STACK UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'rt_mutex cleanup clears the wrong thread\'s pi_blocked_on, leaving a dangling pointer to a freed kernel stack frame — use-after-free to root and container escape.',
+    explanation:
+      'GhostLock (CVE-2026-43499 / CWE-416, CVSS 7.8) is a use-after-free in the Linux kernel\'s real-time ' +
+      'mutex (rtmutex) priority-inheritance code, hidden for 15 years in every kernel from 2.6.39 (2011) through 7.0. ' +
+      'The bug lives in remove_waiter() in kernel/locking/rtmutex.c: on the FUTEX_WAIT_REQUEUE_PI proxy path, it ' +
+      'clears pi_blocked_on on the requeuer thread instead of the actual waiter. The waiter returns to userspace with ' +
+      'pi_blocked_on still pointing at the rt_mutex_waiter struct on its own syscall stack frame — memory freed the ' +
+      'instant the syscall returns. Any later PI chain walk through the task follows the dangling pointer into ' +
+      'recycled kernel stack memory. Crucially, the freed object sits on the kernel stack, not the heap — making the ' +
+      'target deterministic and bypassing heap randomization defenses like CONFIG_RANDOM_KMALLOC_CACHES. ' +
+      'Nebula Security\'s public exploit achieves root from an unprivileged process in ~5 seconds at 97% reliability, ' +
+      'and works from inside containers to escape to the host kernel. No special privileges, capabilities, namespaces, ' +
+      'or hardware are required — only CONFIG_FUTEX_PI, which is the default on every major distribution. ' +
+      'In the assembly, movl stores the waiter struct\'s fields (priority, task pointer) into stack slots during the ' +
+      'PI lock acquisition; after the syscall returns, those slots are freed but pi_blocked_on still references them — ' +
+      'a subsequent addl in pi_chain_walk reads the stale priority and task pointer from the recycled stack frame, ' +
+      'where the attacker has sprayed controlled values via a second thread\'s syscall frame.',
+    code:
+`# CVE pattern: remove_waiter clears wrong thread — stack UAF on return
+class PIWaiter:
+    def __init__(self, prio, task_ptr):
+        self.prio = prio
+        self.task_ptr = task_ptr
+        self.blocked_on = 1
+        self.on_stack = 1
+
+    def clear_blocked(self):
+        self.blocked_on = 0
+        return self.blocked_on
+
+class RTMutex:
+    def __init__(self, owner):
+        self.owner = owner
+        self.waiter_count = 0
+        self.pi_chain = 0
+
+    def add_waiter(self, waiter):
+        self.waiter_count += 1
+        self.pi_chain = waiter.prio
+        return self.waiter_count
+
+    def remove_waiter_buggy(self, requeuer, waiter):
+        requeuer.blocked_on = 0
+        self.waiter_count -= 1
+        return waiter.blocked_on
+
+class StackFrame:
+    def __init__(self, base):
+        self.base = base
+        self.stale_prio = 0
+        self.stale_task = 0
+
+    def recycle(self, payload_prio, payload_task):
+        self.stale_prio = payload_prio
+        self.stale_task = payload_task
+        return self.stale_prio
+
+    def pi_chain_walk(self):
+        result = self.stale_prio + self.stale_task
+        return result
+
+mtx = RTMutex(1000)
+waiter = PIWaiter(99, 4196352)
+requeuer = PIWaiter(50, 4196608)
+mtx.add_waiter(waiter)
+still_set = mtx.remove_waiter_buggy(requeuer, waiter)
+frame = StackFrame(4196352)
+frame.recycle(0, 3735928559)
+leaked = frame.pi_chain_walk()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the waiter\'s priority and task pointer into stack slots during PI lock acquisition; remove_waiter_buggy\'s movl clears requeuer.blocked_on instead of waiter.blocked_on — after the syscall returns, recycle\'s movl overwrites the freed stack frame with attacker-controlled values (0xDEADBEEF); addl in pi_chain_walk sums the stale fields from recycled memory, following the dangling pi_blocked_on pointer into attacker-controlled data',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
