@@ -7689,6 +7689,84 @@ print(leaked)
       description: 'movl stores the waiter\'s priority and task pointer into stack slots during PI lock acquisition; remove_waiter_buggy\'s movl clears requeuer.blocked_on instead of waiter.blocked_on — after the syscall returns, recycle\'s movl overwrites the freed stack frame with attacker-controlled values (0xDEADBEEF); addl in pi_chain_walk sums the stale fields from recycled memory, following the dangling pi_blocked_on pointer into attacker-controlled data',
     },
   },
+  {
+    id: 'unsorted-bin-attack',
+    name: 'UNSORTED BIN ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted bk pointer in an unsorted bin chunk causes malloc to write a libc address to an arbitrary location, enabling further exploitation.',
+    explanation:
+      'The unsorted bin attack is a glibc heap exploitation technique that weaponizes the malloc allocator\'s ' +
+      'free-list bookkeeping. When a freed chunk resides in the unsorted bin, its fd and bk pointers form a ' +
+      'doubly-linked list managed by _int_malloc(). During the next allocation, malloc removes the victim ' +
+      'chunk and performs `bck->fd = unsorted_chunks(av)` — writing the address of main_arena+88 (a known ' +
+      'libc address) to wherever bk points. If the attacker corrupts the chunk\'s bk pointer via a heap ' +
+      'overflow or use-after-free, this write lands at an arbitrary target: typically global_max_fast ' +
+      '(expanding the fastbin range to enable fastbin-dup attacks on larger allocations), _IO_list_all ' +
+      '(for FSOP file-stream hijacking), or __abort_msg. The write value is always the same libc address, ' +
+      'but its sheer magnitude (~0x7f…) is enough to corrupt size-based guards and boolean flags. ' +
+      'CVE-2018-1000001 (glibc getcwd realpath buffer underflow) was exploited using unsorted bin corruption ' +
+      'to overwrite global_max_fast and chain into fastbin-based arbitrary write for local privilege ' +
+      'escalation to root. CVE-2024-2961 (glibc iconv ISO-2022-CN-EXT overflow, CVSS 8.8) produced a 1–3 ' +
+      'byte out-of-bounds write adjacent to heap metadata that was weaponized via unsorted bin corruption ' +
+      'for PHP remote code execution across Debian, Ubuntu, and RHEL. glibc 2.29 added integrity checks ' +
+      '(`bck->fd != unsorted_chunks(av)`) that abort on corrupted doubly-linked lists, but these are ' +
+      'bypassable when the attacker can also forge the fd pointer via a second overlapping corruption primitive. ' +
+      'In the assembly, `movl` stores the corrupted bk value (the attacker\'s target address) into the ' +
+      'chunk\'s bk field; remove_from_unsorted\'s `addl` computes arena_addr+88 (the libc value written to ' +
+      'the target) and `movl` deposits it into max_fast — no integrity check (`cmpl` comparing bk->fd) ' +
+      'appears before the write, letting the libc address overwrite the target for further exploitation.',
+    code:
+`# CVE pattern: corrupted bk in unsorted bin — malloc writes libc addr to target
+class UnsortedChunk:
+    def __init__(self, size):
+        self.size = size
+        self.fd = 0
+        self.bk = 0
+        self.freed = 0
+
+    def free_chunk(self, bin_addr):
+        self.fd = bin_addr
+        self.bk = bin_addr
+        self.freed = 1
+        return self.freed
+
+    def corrupt_bk(self, target_addr):
+        self.bk = target_addr
+        return self.bk
+
+class MallocState:
+    def __init__(self, arena_addr):
+        self.arena_addr = arena_addr
+        self.max_fast = 128
+        self.bins_bk = 0
+
+    def remove_from_unsorted(self, chunk):
+        bck_val = chunk.bk
+        libc_write = self.arena_addr + 88
+        self.bins_bk = bck_val
+        self.max_fast = libc_write
+        return libc_write
+
+    def alloc_fast(self):
+        result = self.max_fast + self.bins_bk
+        return result
+
+arena = 3959422976
+chunk = UnsortedChunk(144)
+chunk.free_chunk(arena)
+target = arena + 224
+chunk.corrupt_bk(target)
+state = MallocState(arena)
+written = state.remove_from_unsorted(chunk)
+hijacked = state.alloc_fast()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the corrupted bk value (attacker\'s target address) into the chunk\'s bk field without integrity validation; remove_from_unsorted\'s addl computes arena_addr+88 (the libc main_arena address) and movl writes it into the max_fast slot — no cmpl integrity check verifies bk->fd before the write, so the libc address overwrites global_max_fast, expanding the fastbin range for a follow-up fastbin-dup arbitrary write',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
