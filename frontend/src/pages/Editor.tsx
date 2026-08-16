@@ -7767,6 +7767,91 @@ print(hijacked)
       description: 'movl stores the corrupted bk value (attacker\'s target address) into the chunk\'s bk field without integrity validation; remove_from_unsorted\'s addl computes arena_addr+88 (the libc main_arena address) and movl writes it into the max_fast slot — no cmpl integrity check verifies bk->fd before the write, so the libc address overwrites global_max_fast, expanding the fastbin range for a follow-up fastbin-dup arbitrary write',
     },
   },
+  {
+    id: 'sinkclose-smm',
+    name: 'SINKCLOSE SMM HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Improper MSR validation lets ring 0 re-enable TClose remapping, redirecting SMM execution from locked SMRAM to attacker-controlled DRAM for ring -2 code execution.',
+    explanation:
+      'Sinkclose (CVE-2023-31315, CVSS 7.5) exploits improper validation of model-specific registers (MSRs) on AMD ' +
+      'CPUs to escalate from ring 0 (OS kernel) to ring -2 (System Management Mode) — the most privileged execution ' +
+      'mode on x86, below the hypervisor and invisible to all OS-level security software. SMM code runs from SMRAM, ' +
+      'a dedicated memory region locked by the TSEG controller during boot; once SmmLock is set in the HWCR MSR ' +
+      '(0xC0010015), the firmware assumes SMRAM is immutable. AMD\'s TClose compatibility feature (bit 15 of the ' +
+      'SMM_TSEG_MASK MSR 0xC0010113) remaps SMRAM-range accesses to regular DRAM during early initialization for ' +
+      'legacy device compatibility — TClose should be disabled and locked before the OS loads. The vulnerability: ' +
+      'even with SmmLock set, ring 0 code can still write to the SMM_TSEG_MASK MSR and re-enable the TClose bit. ' +
+      'The attacker places a malicious SMI handler in DRAM at the SMRAM entry-point address, re-enables TClose, ' +
+      'then triggers a System Management Interrupt (SMI). The CPU enters SMM but TClose remaps the SMRAM fetch to ' +
+      'DRAM — executing the attacker\'s code at ring -2. This enables undetectable firmware implants (bootkits, ' +
+      'rootkits) that survive OS reinstalls, disk wipes, and most firmware updates. Discovered by IOActive ' +
+      'researchers Enrique Nissim and Krzysztof Okupski, presented at DEF CON 32 (August 2024), the flaw existed ' +
+      'in every AMD CPU since 2006 — affecting all Ryzen, EPYC, and Threadripper families. ' +
+      'In the assembly, `movl` writes the attacker\'s payload into the dram_handler slot (simulating DRAM code ' +
+      'placement); enable_tclose\'s `movl` sets tclose_bit = 1 without any `cmpl` guard verifying SmmLock — ' +
+      '`addl` in trigger_smi routes execution through the remapped DRAM handler instead of locked SMRAM, ' +
+      'granting ring -2 code execution.',
+    code:
+`# CVE pattern: MSR TClose re-enabled after SmmLock — ring0 to ring-2
+class SMRAM:
+    def __init__(self, handler, base):
+        self.handler = handler
+        self.base = base
+        self.locked = 0
+
+    def lock(self):
+        self.locked = 1
+        return self.locked
+
+    def read_handler(self):
+        result = self.handler + self.base
+        return result
+
+class MSRConfig:
+    def __init__(self, smm_lock):
+        self.smm_lock = smm_lock
+        self.tclose_bit = 0
+        self.tseg_mask = 0
+
+    def enable_tclose(self):
+        self.tclose_bit = 1
+        self.tseg_mask = self.smm_lock + self.tclose_bit
+        return self.tclose_bit
+
+class CPU:
+    def __init__(self, ring_level):
+        self.ring_level = ring_level
+        self.dram_handler = 0
+        self.executed = 0
+
+    def place_payload(self, payload):
+        self.dram_handler = payload
+        return self.dram_handler
+
+    def trigger_smi(self, msr, smram):
+        if msr.tclose_bit == 1:
+            result = self.dram_handler
+        else:
+            result = smram.handler
+        self.ring_level = 0 - 2
+        self.executed = 1
+        return result
+
+smram = SMRAM(4196352, 2684354560)
+smram.lock()
+msr = MSRConfig(1)
+cpu = CPU(0)
+cpu.place_payload(3735928559)
+msr.enable_tclose()
+hijacked = cpu.trigger_smi(msr, smram)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'addl'],
+      description: 'movl writes the attacker\'s payload (0xDEADBEEF) into the dram_handler slot simulating DRAM code placement; enable_tclose\'s movl sets tclose_bit = 1 without any cmpl guard verifying SmmLock status — trigger_smi\'s cmpl checks tclose_bit == 1 and routes execution through the DRAM handler instead of locked SMRAM, granting ring -2 SMM code execution below the OS and hypervisor',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
