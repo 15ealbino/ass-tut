@@ -7852,6 +7852,85 @@ print(hijacked)
       description: 'movl writes the attacker\'s payload (0xDEADBEEF) into the dram_handler slot simulating DRAM code placement; enable_tclose\'s movl sets tclose_bit = 1 without any cmpl guard verifying SmmLock status — trigger_smi\'s cmpl checks tclose_bit == 1 and routes execution through the DRAM handler instead of locked SMRAM, granting ring -2 SMM code execution below the OS and hypervisor',
     },
   },
+  {
+    id: 'ret2dir-physmap',
+    name: 'RET2DIR PHYSMAP BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Kernel physmap mirrors user-controlled pages at kernel-space addresses, bypassing SMEP/SMAP to execute attacker shellcode as ring 0.',
+    explanation:
+      'Return-to-direct-mapped memory (ret2dir) exploits a fundamental design choice in OS kernels: the physmap ' +
+      '(direct-map) region maps ALL physical RAM at a fixed kernel virtual address offset for fast access. Every ' +
+      'user-space page has a kernel-space "synonym" — a second virtual address in the physmap pointing to the same ' +
+      'physical frame. SMEP (Supervisor Mode Execution Prevention) blocks the kernel from executing user-space ' +
+      'virtual addresses, but the physmap synonym is a kernel address, so SMEP does not fire. The attacker sprays ' +
+      'user-space pages with shellcode via mmap(), computes their physmap synonyms (user_phys_addr + physmap_base), ' +
+      'then uses any kernel function-pointer overwrite to redirect execution into the physmap. Because the spray ' +
+      'covers megabytes of contiguous physical memory, the landing is near-deterministic even without a kernel ' +
+      'info leak. Presented at USENIX Security 2014 by Kemerlis et al. and demonstrated against CVE-2013-2094 ' +
+      '(Linux perf_event_open), CVE-2013-1763 (sock_diag), and CVE-2013-0268 (/dev/cpu MSR write) — all three ' +
+      'gave local root on kernels with SMEP, KERNEXEC, and kGuard enabled. The technique works across x86, ' +
+      'x86-64, AArch32, and AArch64. CVE-2017-5123 (waitid stack write) was later exploited via physmap spray ' +
+      'to bypass both SMEP and SMAP on hardened kernels. Modern mitigations include marking the physmap NX ' +
+      '(CONFIG_STRICT_KERNEL_RWX) and exclusive page-frame ownership, but data-only ret2dir variants that corrupt ' +
+      'kernel data structures through the physmap synonym remain viable. ' +
+      'In the assembly, movl loads the shellcode marker (0xDEADBEEF) into the user page\'s stack slot; addl in ' +
+      'compute_synonym adds physmap_base to the user physical address, producing the kernel synonym; movl in ' +
+      'hijack_fptr overwrites the function pointer with the synonym address — cmpl finds the synonym lies in ' +
+      'kernel range so SMEP does not trigger, and the kernel executes the attacker\'s shellcode from the physmap.',
+    code:
+`# CVE pattern: physmap synonym bypasses SMEP — user shellcode runs as ring 0
+class UserPage:
+    def __init__(self, phys_addr, data):
+        self.phys_addr = phys_addr
+        self.data = data
+        self.mapped = 1
+
+class PhysMap:
+    def __init__(self, base, size):
+        self.base = base
+        self.size = size
+        self.synonym = 0
+        self.resolved = 0
+
+    def compute_synonym(self, user_phys):
+        self.synonym = self.base + user_phys
+        self.resolved = 1
+        return self.synonym
+
+class KernelTarget:
+    def __init__(self, fptr, stack_canary):
+        self.fptr = fptr
+        self.stack_canary = stack_canary
+        self.smep_active = 1
+        self.executed = 0
+
+    def hijack_fptr(self, new_addr):
+        self.fptr = new_addr
+        return self.fptr
+
+    def dispatch(self, kernel_base):
+        if self.fptr >= kernel_base:
+            result = self.fptr + self.smep_active
+        else:
+            result = 0
+        self.executed = 1
+        return result
+
+shellcode = 3735928559
+user = UserPage(1048576, shellcode)
+physmap = PhysMap(4227858432, 268435456)
+synonym = physmap.compute_synonym(user.phys_addr)
+target = KernelTarget(4196352, 305419896)
+target.hijack_fptr(synonym)
+hijacked = target.dispatch(4194304)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl', 'movl'],
+      description: 'movl loads the shellcode marker (0xDEADBEEF) into the user page slot; addl in compute_synonym adds physmap_base to the user physical address, producing a kernel-space synonym; movl in hijack_fptr overwrites the function pointer with the synonym — cmpl in dispatch verifies fptr >= kernel_base so SMEP does not block execution, and the kernel runs attacker shellcode from the physmap-mapped user page',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
