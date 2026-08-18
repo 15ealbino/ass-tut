@@ -7931,6 +7931,87 @@ print(hijacked)
       description: 'movl loads the shellcode marker (0xDEADBEEF) into the user page slot; addl in compute_synonym adds physmap_base to the user physical address, producing a kernel-space synonym; movl in hijack_fptr overwrites the function pointer with the synonym — cmpl in dispatch verifies fptr >= kernel_base so SMEP does not block execution, and the kernel runs attacker shellcode from the physmap-mapped user page',
     },
   },
+  {
+    id: 'exit-handler-hijack',
+    name: 'EXIT HANDLER HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker overwrites an atexit-registered function pointer so program cleanup redirects execution to malicious code.',
+    explanation:
+      'Exit handler hijacking targets the __exit_funcs linked list in glibc — the internal data structure ' +
+      'that stores function pointers registered via atexit() and on_exit(). When a process calls exit(), ' +
+      'the runtime iterates this list and calls each registered handler in LIFO order. If an attacker ' +
+      'has an arbitrary write primitive (heap overflow, format string, or dangling pointer), they can ' +
+      'overwrite a function pointer in the exit handler table with the address of system() or a one-gadget ' +
+      'RCE, gaining code execution the moment the program exits normally — no crash required. Modern glibc ' +
+      'applies PTR_MANGLE (rotate right 0x11 bits, XOR with a per-thread secret at fs:[0x30]) to each ' +
+      'stored pointer, but if the attacker can also leak or corrupt the TLS guard value, the mangling is ' +
+      'fully defeated. This technique surged in importance after glibc 2.34 removed __malloc_hook and ' +
+      '__free_hook (2021), eliminating the traditional heap exploitation endgame and making __exit_funcs ' +
+      'the primary remaining writable function-pointer table in libc. Documented extensively in CTF ' +
+      'exploitation research (binholic 2017, HackTricks WWW2Exec series) and used in real exploit chains ' +
+      'targeting CVE-2022-23222 (Linux eBPF verifier) and CVE-2023-4911 (Looney Tunables glibc ld.so). ' +
+      'In the assembly, movl stores the legitimate cleanup address into each ExitFuncList slot during ' +
+      'register(); corrupt_slot\'s movl overwrites slot_1 with the system() address — the same stack ' +
+      'offset that held a safe pointer now holds the attacker\'s target; dispatch_all\'s addl accumulates ' +
+      'the hijacked value, and at runtime the corrupted entry redirects execution to attacker-controlled code.',
+    code:
+`# CVE pattern: overwrite __exit_funcs to hijack cleanup execution
+class ExitFuncList:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.count = 0
+        self.slot_0 = 0
+        self.slot_1 = 0
+        self.slot_2 = 0
+
+    def register(self, func_ptr):
+        if self.count == 0:
+            self.slot_0 = func_ptr
+        elif self.count == 1:
+            self.slot_1 = func_ptr
+        else:
+            self.slot_2 = func_ptr
+        self.count += 1
+        return self.count
+
+    def corrupt_slot(self, idx, evil_ptr):
+        if idx == 0:
+            self.slot_0 = evil_ptr
+        elif idx == 1:
+            self.slot_1 = evil_ptr
+        else:
+            self.slot_2 = evil_ptr
+        return evil_ptr
+
+    def dispatch_all(self):
+        total = 0
+        i = 0
+        while i < self.count:
+            if i == 0:
+                total += self.slot_0
+            elif i == 1:
+                total += self.slot_1
+            else:
+                total += self.slot_2
+            i += 1
+        return total
+
+cleanup = 4198400
+system_addr = 4199424
+funcs = ExitFuncList(4)
+funcs.register(cleanup)
+funcs.register(cleanup)
+funcs.register(cleanup)
+funcs.corrupt_slot(1, system_addr)
+result = funcs.dispatch_all()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'movl stores the legitimate cleanup pointer into each ExitFuncList slot during register(); corrupt_slot\'s movl overwrites slot_1 with the system() address — the same stack offset now holds the attacker\'s target; dispatch_all\'s cmpl tests the loop bound while addl accumulates the hijacked pointer value, redirecting execution at runtime',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
