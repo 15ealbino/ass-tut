@@ -8012,6 +8012,79 @@ print(result)
       description: 'movl stores the legitimate cleanup pointer into each ExitFuncList slot during register(); corrupt_slot\'s movl overwrites slot_1 with the system() address — the same stack offset now holds the attacker\'s target; dispatch_all\'s cmpl tests the loop bound while addl accumulates the hijacked pointer value, redirecting execution at runtime',
     },
   },
+  {
+    id: 'large-bin-attack',
+    name: 'LARGE BIN ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted bk_nextsize pointer in the glibc large bin lets an attacker write a heap address to an arbitrary memory location during chunk insertion.',
+    explanation:
+      'The large bin attack exploits the glibc malloc large-bin insertion path: when a freed chunk is sorted ' +
+      'into a large bin (size >= 0x400 on 64-bit), the allocator maintains a skip list via fd_nextsize and ' +
+      'bk_nextsize pointers for efficient size-ordered traversal. If a chunk P already in the large bin has ' +
+      'its bk_nextsize pointer corrupted by an attacker (via heap overflow, UAF, or double-free), inserting ' +
+      'a smaller chunk V triggers the assignment `P->bk_nextsize->fd_nextsize = V` — writing the heap address ' +
+      'of V to an arbitrary memory location chosen by the attacker. This single write primitive can target ' +
+      'global_max_fast (expanding fastbin range to cover most allocations, enabling further corruption), ' +
+      '_IO_list_all (hijacking FILE stream vtable dispatch for code execution via FSOP), or mp_.tcache_bins ' +
+      '(widening tcache coverage for tcache poisoning). The technique was formalized by shellphish\'s how2heap ' +
+      'project and works on glibc 2.23 through 2.35. After glibc 2.30 tightened some checks, the attack was ' +
+      'adapted to write the unsorted bin address instead, still sufficient for the global_max_fast overwrite. ' +
+      'CVE-2024-2961 (glibc iconv buffer overflow) provided the heap corruption primitive needed to trigger ' +
+      'a large bin attack in real-world exploitation chains, escalating arbitrary file read to RCE. ' +
+      'CVE-2023-6246 (glibc syslog heap overflow) and CVE-2026-0861 (glibc memalign integer overflow, CVSS 8.4) ' +
+      'both involve heap metadata corruption in the same allocator structures that the large bin attack targets. ' +
+      'In the assembly, movl stores the victim chunk\'s bk_nextsize pointer to an attacker-controlled target ' +
+      'address; during insertion, addl computes the size comparison and cmpl determines the insertion point — ' +
+      'the subsequent movl writes the new chunk\'s address into the corrupted bk_nextsize->fd_nextsize slot, ' +
+      'landing a heap pointer at the attacker-chosen arbitrary address with no bounds check.',
+    code:
+`# CVE pattern: corrupted bk_nextsize writes heap addr to arbitrary location
+class LargeBinChunk:
+    def __init__(self, size, fd_next, bk_next):
+        self.size = size
+        self.fd_nextsize = fd_next
+        self.bk_nextsize = bk_next
+        self.in_bin = 0
+
+    def insert_into_bin(self):
+        self.in_bin = 1
+        return self.size
+
+class LargeBin:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.head_size = 0
+        self.target_slot = 0
+        self.write_count = 0
+
+    def add_chunk(self, existing, victim):
+        if victim.size < existing.size:
+            self.target_slot = existing.bk_nextsize
+            self.target_slot = victim.size
+            self.write_count += 1
+        self.head_size = existing.size
+        victim.insert_into_bin()
+        return self.write_count
+
+    def read_target(self):
+        result = self.target_slot + self.head_size
+        return result
+
+existing = LargeBinChunk(1024, 4196352, 0)
+existing.insert_into_bin()
+existing.bk_nextsize = 3735928559
+victim = LargeBinChunk(512, 0, 0)
+largebin = LargeBin(16)
+largebin.add_chunk(existing, victim)
+leaked = largebin.read_target()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl compares victim.size against existing.size to determine the insertion point; movl loads the corrupted bk_nextsize (0xDEADBEEF) into the target slot — the large bin insertion code writes the victim chunk\'s address through the corrupted pointer with no integrity check, landing a heap address at an attacker-chosen arbitrary memory location',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
