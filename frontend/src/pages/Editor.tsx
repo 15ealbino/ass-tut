@@ -8085,6 +8085,93 @@ print(leaked)
       description: 'cmpl compares victim.size against existing.size to determine the insertion point; movl loads the corrupted bk_nextsize (0xDEADBEEF) into the target slot — the large bin insertion code writes the victim chunk\'s address through the corrupted pointer with no integrity check, landing a heap address at an attacker-chosen arbitrary memory location',
     },
   },
+  {
+    id: 'brop-oracle',
+    name: 'BLIND ROP (BROP)',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Crash oracle in a forking server lets an attacker recover the stack canary and discover ROP gadgets without access to the binary.',
+    explanation:
+      'Blind Return-Oriented Programming (BROP), introduced by Bittau et al. in "Hacking Blind" (IEEE S&P 2014), ' +
+      'enables remote exploitation of stack buffer overflows without access to the target binary or source code. ' +
+      'The technique targets servers that fork child processes for each connection — fork() preserves the parent\'s ' +
+      'entire memory layout, so the stack canary, ASLR base addresses, and code gadgets remain identical across ' +
+      'children. The attacker uses each forked child as a crash oracle: overwriting the stack canary byte-by-byte ' +
+      'and observing whether the child crashes (wrong byte) or stays alive (correct byte). On 64-bit Linux the ' +
+      'canary has 7 unknown bytes (the low byte is always 0x00), requiring at most 7 × 256 = 1,792 probes instead ' +
+      'of brute-forcing 2^56 possibilities. Once the canary is recovered, the attacker scans the text segment for ' +
+      'a "stop gadget" — an address that causes the child to hang rather than crash — and uses it to fingerprint ' +
+      'useful ROP gadgets (pop rdi; ret, write() PLT entry) purely from behavioral signatures. The final chain ' +
+      'calls write(socket_fd, text_base, length) to dump the server binary to the attacker, enabling a full ' +
+      'conventional ROP exploit. The original research demonstrated BROP against nginx and yaSSL + MySQL in under ' +
+      '4,000 requests (~20 minutes). CVE-2015-7547 (glibc getaddrinfo stack-based buffer overflow, CVSS 8.1) ' +
+      'affected nearly every Linux system and was exploitable via BROP against forking resolvers; any forking daemon ' +
+      'with a stack overflow — Apache prefork, PostgreSQL, OpenSSH — is a candidate target. The technique defeats ' +
+      'ASLR, stack canaries, and NX simultaneously in a single automated scan. ' +
+      'In the assembly, the while loop\'s cmpl checks each brute-force guess against the probe count bound; movl ' +
+      'loads the current guess into the comparison slot; when the guess matches the canary, the conditional return ' +
+      'bypasses the crash path — an attacker observing which guess keeps the child alive recovers the secret value ' +
+      'byte-by-byte, then uses the same oracle to scan code addresses and identify stop gadgets and ROP primitives.',
+    code:
+`# CVE pattern: BROP crash oracle — fork preserves canary across probes
+class ForkServer:
+    def __init__(self, canary, text_base):
+        self.canary = canary
+        self.text_base = text_base
+        self.forks = 0
+        self.crashes = 0
+    def probe_canary(self, guess):
+        self.forks += 1
+        if guess == self.canary:
+            return 1
+        self.crashes += 1
+        return 0
+    def probe_gadget(self, addr):
+        self.forks += 1
+        offset = addr - self.text_base
+        if offset == 4096:
+            return 1
+        self.crashes += 1
+        return 0
+class Exploit:
+    def __init__(self):
+        self.probes = 0
+        self.canary = 0
+        self.stop_gadget = 0
+    def brute_canary(self, srv, lo, count):
+        i = 0
+        while i < count:
+            guess = lo + i
+            hit = srv.probe_canary(guess)
+            self.probes += 1
+            if hit == 1:
+                self.canary = guess
+                return guess
+            i += 1
+        return 0
+    def find_gadgets(self, srv, base, count):
+        i = 0
+        while i < count:
+            addr = base + i * 256
+            hit = srv.probe_gadget(addr)
+            self.probes += 1
+            if hit == 1:
+                self.stop_gadget = addr
+                return addr
+            i += 1
+        return 0
+srv = ForkServer(202, 4194304)
+exploit = Exploit()
+canary = exploit.brute_canary(srv, 200, 8)
+gadget = exploit.find_gadgets(srv, 4198400, 8)
+result = canary + gadget + exploit.probes
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl in the while loop checks each brute-force guess against the probe count; movl loads the current guess into the canary comparison slot — when the guess matches, the conditional return skips the crash increment, revealing the correct byte to the attacker; the same crash-or-alive oracle then scans text-segment addresses via probe_gadget to identify stop gadgets and ROP primitives without ever reading the binary',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
