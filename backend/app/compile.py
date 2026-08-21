@@ -440,6 +440,179 @@ def analyze_stack(
     }
 
 
+# ── Memory-traffic analysis (loads vs stores) ───────────────────────────────
+#
+# The instruction mix lumps every data-movement instruction into a single "mem"
+# bucket. Memory traffic splits that bucket by *direction*: how many memory
+# reads (loads) and writes (stores) each Python line performs.
+#
+# The lesson this teaches (mission pillar 2 — spotting bad/inefficient asm):
+# at gcc -O0 every variable lives on the stack, so even a trivial line is a
+# read-modify-write round-trip through memory. `x += 1` compiles to
+#
+#   movl -4(%ebp), %eax     # load  x  from its stack slot
+#   addl $1, %eax           # compute in a register
+#   movl %eax, -4(%ebp)     # store x  back to its stack slot
+#
+# — one load and one store just to bump a counter. Seeing "1 load · 1 store"
+# next to that line makes the memory round-trip concrete, and the load/store
+# totals show how much of the program is pure stack shuffling that an optimising
+# build (`-O2`, keeping the value in a register) would erase entirely.
+
+# A memory operand in AT&T syntax always carries a parenthesised base/index
+# register: `-4(%ebp)`, `(%eax)`, `sym@GOTOFF(%ebx)`, `(%eax,%ecx,4)`,
+# `.L4(,%eax,4)`. Immediates (`$5`), bare registers (`%eax`), and code labels
+# (`.L2`, `foo`) carry no such `(...%...)`, so this cleanly matches every
+# stack-slot access — the whole -O0 spill story — while excluding non-memory
+# operands. A bare-symbol direct memory operand (no parentheses) is out of
+# scope; gcc's -m32 PIC output routes globals through a parenthesised GOT base,
+# so it does not occur for this transpiler's output.
+_MEM_OPERAND_RE = re.compile(r"\([^)]*%")
+
+# Two-operand+ mnemonics whose destination (last operand) is overwritten without
+# first being read — the pure "move" family. For every other mnemonic that
+# writes a memory destination (add/sub/and/or/xor/shift-to-memory) the write is
+# read-modify-write, so a memory destination counts as both a load and a store.
+_MOV_DEST_PREFIXES: Tuple[str, ...] = ("mov",)
+
+# Two-operand mnemonics that only READ their last operand (they set flags and
+# discard the result). For these a memory "destination" is a load, not a store —
+# e.g. `cmpl $0, -4(%ebp)` reads the stack slot to compare it.
+_DEST_READ_ONLY_PREFIXES: Tuple[str, ...] = ("cmp", "test")
+
+# Single-operand mnemonics whose lone memory operand is WRITTEN (a store). The
+# read-modify-write subset (`inc`/`dec`/`neg`/`not`/shifts) additionally reads
+# it; the x87 stores (`fst*`/`fist*`/`fbstp`) and `pop` are pure writes.
+# Every other single-operand memory access (`push`, `idiv`/`div`/`imul`/`mul`,
+# `fld`/`fild`, a memory branch target) is a read (a load).
+_SINGLE_OP_STORE_PREFIXES: Tuple[str, ...] = (
+    "pop", "inc", "dec", "neg", "not",
+    "sal", "sar", "shl", "shr", "rol", "ror",
+    "fst", "fist", "fbstp",
+)
+_SINGLE_OP_RMW_PREFIXES: Tuple[str, ...] = (
+    "inc", "dec", "neg", "not", "sal", "sar", "shl", "shr", "rol", "ror",
+)
+
+
+def _split_operands(operand_str: str) -> List[str]:
+    """Split an AT&T operand string on top-level commas, keeping commas that sit
+    inside an addressing-mode parenthesis together (so `(%eax,%ecx,4)` stays one
+    operand)."""
+    operands: List[str] = []
+    depth = 0
+    current: List[str] = []
+    for ch in operand_str:
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            operands.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        operands.append(tail)
+    return operands
+
+
+def _is_mem_operand(operand: str) -> bool:
+    """True if an operand references memory (an AT&T addressing mode)."""
+    return _MEM_OPERAND_RE.search(operand) is not None
+
+
+def memory_accesses(text: str) -> Tuple[int, int]:
+    """Return ``(loads, stores)`` — the memory reads and writes performed by one
+    assembly instruction line.
+
+    ``text`` is a raw display-asm line. Labels, directives and register-only
+    instructions contribute nothing. Direction is decided by operand position
+    (AT&T: the last operand is the destination) refined by a small mnemonic
+    table for the cases where position alone is misleading:
+
+    * ``lea`` computes an address and never touches memory — always ``(0, 0)``.
+    * ``mov*`` overwrites its destination (pure store); every other mnemonic that
+      writes a memory destination is read-modify-write (load + store).
+    * ``cmp``/``test`` only read their destination (flags-only) — a load.
+    * single-operand ``pop``/x87-store/RMW mnemonics write their operand; every
+      other single-operand memory access (``push``, ``idiv``, ``fld``, …) reads.
+    """
+    stripped = text.strip()
+    if not stripped or stripped.startswith(".") or stripped.endswith(":"):
+        return (0, 0)
+    parts = stripped.split(None, 1)
+    mnemonic = parts[0].lower()
+    if mnemonic.startswith("lea"):  # address calculation, not a memory access
+        return (0, 0)
+    operands = _split_operands(parts[1]) if len(parts) > 1 else []
+    if not operands:
+        return (0, 0)
+
+    loads = stores = 0
+    if len(operands) == 1:
+        if _is_mem_operand(operands[0]):
+            if mnemonic.startswith(_SINGLE_OP_STORE_PREFIXES):
+                stores += 1
+                if mnemonic.startswith(_SINGLE_OP_RMW_PREFIXES):
+                    loads += 1
+            else:
+                loads += 1
+        return (loads, stores)
+
+    *sources, dest = operands
+    for src in sources:
+        if _is_mem_operand(src):
+            loads += 1
+    if _is_mem_operand(dest):
+        if mnemonic.startswith(_DEST_READ_ONLY_PREFIXES):
+            loads += 1                      # cmp/test read the destination
+        elif mnemonic.startswith(_MOV_DEST_PREFIXES):
+            stores += 1                     # mov overwrites, no read
+        else:
+            loads += 1                      # read-modify-write: read then write
+            stores += 1
+    return (loads, stores)
+
+
+def analyze_memory_traffic(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``memory_counts`` map and return a
+    program-wide summary ``{"memory_totals": {"loads": N, "stores": N}}``.
+    Mutates ``line_map`` in place.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` and
+    ``analyze_registers``). Per line, ``memory_counts`` carries only the nonzero
+    of ``{"loads", "stores"}`` (mirroring the zero-omitting instruction mix); the
+    program-wide ``memory_totals`` always carries both keys.
+    """
+    total_loads = total_stores = 0
+    for mapping in line_map.values():
+        loads = stores = 0
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if 1 <= asm_no <= len(asm_lines):
+                dl, ds = memory_accesses(asm_lines[asm_no - 1])
+                loads += dl
+                stores += ds
+        total_loads += loads
+        total_stores += stores
+        counts: Dict[str, int] = {}
+        if loads:
+            counts["loads"] = loads
+        if stores:
+            counts["stores"] = stores
+        mapping["memory_counts"] = counts
+
+    return {"memory_totals": {"loads": total_loads, "stores": total_stores}}
+
+
 def _classify_mnemonic(mnemonic: str) -> str | None:
     """Return the cost flag for an x86 mnemonic, or None if it is unremarkable.
 
@@ -602,6 +775,9 @@ async def compile_python(python_source: str) -> dict:
     # passes over the same line_map — the memory-side complement to the register
     # footprint.
     stack_summary = analyze_stack(line_map, asm_lines)
+    # Split each Python line's memory movement into loads vs stores. Independent
+    # of the passes above; runs over the same already-mapped display asm.
+    memory_summary = analyze_memory_traffic(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
 
@@ -615,5 +791,6 @@ async def compile_python(python_source: str) -> dict:
         "cost_summary": cost_summary,
         "register_summary": register_summary,
         "stack_summary": stack_summary,
+        "memory_summary": memory_summary,
         "asm_glossary": asm_glossary,
     }

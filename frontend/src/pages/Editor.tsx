@@ -60,6 +60,19 @@ function formatRegisterTotals(totals?: Record<string, number>): string {
   return [...known, ...extra].map(r => `%${r} ${totals[r]}`).join(' · ')
 }
 
+// ─── Memory-traffic presentation ────────────────────────────────────────────
+// Backend splits each line's data movement into memory reads (loads) and writes
+// (stores). At -O0 every variable lives on the stack, so a plain `x += 1` is a
+// load → compute → store round-trip; the counts make that stack shuffling
+// visible. Rendered "N ld · N st" in the MEM chip and per-line tooltips.
+function formatMemory(counts?: Record<string, number>): string {
+  if (!counts) return ''
+  const parts: string[] = []
+  if ((counts.loads ?? 0) > 0) parts.push(`${counts.loads} ld`)
+  if ((counts.stores ?? 0) > 0) parts.push(`${counts.stores} st`)
+  return parts.join(' · ')
+}
+
 // ─── Instruction-glossary presentation ─────────────────────────────────────
 // The backend returns one entry per distinct mnemonic in the compiled asm.
 // Render them, grouped by the same category order as the mix, into a single
@@ -7767,6 +7780,489 @@ print(hijacked)
       description: 'movl stores the corrupted bk value (attacker\'s target address) into the chunk\'s bk field without integrity validation; remove_from_unsorted\'s addl computes arena_addr+88 (the libc main_arena address) and movl writes it into the max_fast slot — no cmpl integrity check verifies bk->fd before the write, so the libc address overwrites global_max_fast, expanding the fastbin range for a follow-up fastbin-dup arbitrary write',
     },
   },
+  {
+    id: 'sinkclose-smm',
+    name: 'SINKCLOSE SMM HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Improper MSR validation lets ring 0 re-enable TClose remapping, redirecting SMM execution from locked SMRAM to attacker-controlled DRAM for ring -2 code execution.',
+    explanation:
+      'Sinkclose (CVE-2023-31315, CVSS 7.5) exploits improper validation of model-specific registers (MSRs) on AMD ' +
+      'CPUs to escalate from ring 0 (OS kernel) to ring -2 (System Management Mode) — the most privileged execution ' +
+      'mode on x86, below the hypervisor and invisible to all OS-level security software. SMM code runs from SMRAM, ' +
+      'a dedicated memory region locked by the TSEG controller during boot; once SmmLock is set in the HWCR MSR ' +
+      '(0xC0010015), the firmware assumes SMRAM is immutable. AMD\'s TClose compatibility feature (bit 15 of the ' +
+      'SMM_TSEG_MASK MSR 0xC0010113) remaps SMRAM-range accesses to regular DRAM during early initialization for ' +
+      'legacy device compatibility — TClose should be disabled and locked before the OS loads. The vulnerability: ' +
+      'even with SmmLock set, ring 0 code can still write to the SMM_TSEG_MASK MSR and re-enable the TClose bit. ' +
+      'The attacker places a malicious SMI handler in DRAM at the SMRAM entry-point address, re-enables TClose, ' +
+      'then triggers a System Management Interrupt (SMI). The CPU enters SMM but TClose remaps the SMRAM fetch to ' +
+      'DRAM — executing the attacker\'s code at ring -2. This enables undetectable firmware implants (bootkits, ' +
+      'rootkits) that survive OS reinstalls, disk wipes, and most firmware updates. Discovered by IOActive ' +
+      'researchers Enrique Nissim and Krzysztof Okupski, presented at DEF CON 32 (August 2024), the flaw existed ' +
+      'in every AMD CPU since 2006 — affecting all Ryzen, EPYC, and Threadripper families. ' +
+      'In the assembly, `movl` writes the attacker\'s payload into the dram_handler slot (simulating DRAM code ' +
+      'placement); enable_tclose\'s `movl` sets tclose_bit = 1 without any `cmpl` guard verifying SmmLock — ' +
+      '`addl` in trigger_smi routes execution through the remapped DRAM handler instead of locked SMRAM, ' +
+      'granting ring -2 code execution.',
+    code:
+`# CVE pattern: MSR TClose re-enabled after SmmLock — ring0 to ring-2
+class SMRAM:
+    def __init__(self, handler, base):
+        self.handler = handler
+        self.base = base
+        self.locked = 0
+
+    def lock(self):
+        self.locked = 1
+        return self.locked
+
+    def read_handler(self):
+        result = self.handler + self.base
+        return result
+
+class MSRConfig:
+    def __init__(self, smm_lock):
+        self.smm_lock = smm_lock
+        self.tclose_bit = 0
+        self.tseg_mask = 0
+
+    def enable_tclose(self):
+        self.tclose_bit = 1
+        self.tseg_mask = self.smm_lock + self.tclose_bit
+        return self.tclose_bit
+
+class CPU:
+    def __init__(self, ring_level):
+        self.ring_level = ring_level
+        self.dram_handler = 0
+        self.executed = 0
+
+    def place_payload(self, payload):
+        self.dram_handler = payload
+        return self.dram_handler
+
+    def trigger_smi(self, msr, smram):
+        if msr.tclose_bit == 1:
+            result = self.dram_handler
+        else:
+            result = smram.handler
+        self.ring_level = 0 - 2
+        self.executed = 1
+        return result
+
+smram = SMRAM(4196352, 2684354560)
+smram.lock()
+msr = MSRConfig(1)
+cpu = CPU(0)
+cpu.place_payload(3735928559)
+msr.enable_tclose()
+hijacked = cpu.trigger_smi(msr, smram)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'addl'],
+      description: 'movl writes the attacker\'s payload (0xDEADBEEF) into the dram_handler slot simulating DRAM code placement; enable_tclose\'s movl sets tclose_bit = 1 without any cmpl guard verifying SmmLock status — trigger_smi\'s cmpl checks tclose_bit == 1 and routes execution through the DRAM handler instead of locked SMRAM, granting ring -2 SMM code execution below the OS and hypervisor',
+    },
+  },
+  {
+    id: 'ret2dir-physmap',
+    name: 'RET2DIR PHYSMAP BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Kernel physmap mirrors user-controlled pages at kernel-space addresses, bypassing SMEP/SMAP to execute attacker shellcode as ring 0.',
+    explanation:
+      'Return-to-direct-mapped memory (ret2dir) exploits a fundamental design choice in OS kernels: the physmap ' +
+      '(direct-map) region maps ALL physical RAM at a fixed kernel virtual address offset for fast access. Every ' +
+      'user-space page has a kernel-space "synonym" — a second virtual address in the physmap pointing to the same ' +
+      'physical frame. SMEP (Supervisor Mode Execution Prevention) blocks the kernel from executing user-space ' +
+      'virtual addresses, but the physmap synonym is a kernel address, so SMEP does not fire. The attacker sprays ' +
+      'user-space pages with shellcode via mmap(), computes their physmap synonyms (user_phys_addr + physmap_base), ' +
+      'then uses any kernel function-pointer overwrite to redirect execution into the physmap. Because the spray ' +
+      'covers megabytes of contiguous physical memory, the landing is near-deterministic even without a kernel ' +
+      'info leak. Presented at USENIX Security 2014 by Kemerlis et al. and demonstrated against CVE-2013-2094 ' +
+      '(Linux perf_event_open), CVE-2013-1763 (sock_diag), and CVE-2013-0268 (/dev/cpu MSR write) — all three ' +
+      'gave local root on kernels with SMEP, KERNEXEC, and kGuard enabled. The technique works across x86, ' +
+      'x86-64, AArch32, and AArch64. CVE-2017-5123 (waitid stack write) was later exploited via physmap spray ' +
+      'to bypass both SMEP and SMAP on hardened kernels. Modern mitigations include marking the physmap NX ' +
+      '(CONFIG_STRICT_KERNEL_RWX) and exclusive page-frame ownership, but data-only ret2dir variants that corrupt ' +
+      'kernel data structures through the physmap synonym remain viable. ' +
+      'In the assembly, movl loads the shellcode marker (0xDEADBEEF) into the user page\'s stack slot; addl in ' +
+      'compute_synonym adds physmap_base to the user physical address, producing the kernel synonym; movl in ' +
+      'hijack_fptr overwrites the function pointer with the synonym address — cmpl finds the synonym lies in ' +
+      'kernel range so SMEP does not trigger, and the kernel executes the attacker\'s shellcode from the physmap.',
+    code:
+`# CVE pattern: physmap synonym bypasses SMEP — user shellcode runs as ring 0
+class UserPage:
+    def __init__(self, phys_addr, data):
+        self.phys_addr = phys_addr
+        self.data = data
+        self.mapped = 1
+
+class PhysMap:
+    def __init__(self, base, size):
+        self.base = base
+        self.size = size
+        self.synonym = 0
+        self.resolved = 0
+
+    def compute_synonym(self, user_phys):
+        self.synonym = self.base + user_phys
+        self.resolved = 1
+        return self.synonym
+
+class KernelTarget:
+    def __init__(self, fptr, stack_canary):
+        self.fptr = fptr
+        self.stack_canary = stack_canary
+        self.smep_active = 1
+        self.executed = 0
+
+    def hijack_fptr(self, new_addr):
+        self.fptr = new_addr
+        return self.fptr
+
+    def dispatch(self, kernel_base):
+        if self.fptr >= kernel_base:
+            result = self.fptr + self.smep_active
+        else:
+            result = 0
+        self.executed = 1
+        return result
+
+shellcode = 3735928559
+user = UserPage(1048576, shellcode)
+physmap = PhysMap(4227858432, 268435456)
+synonym = physmap.compute_synonym(user.phys_addr)
+target = KernelTarget(4196352, 305419896)
+target.hijack_fptr(synonym)
+hijacked = target.dispatch(4194304)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl', 'movl'],
+      description: 'movl loads the shellcode marker (0xDEADBEEF) into the user page slot; addl in compute_synonym adds physmap_base to the user physical address, producing a kernel-space synonym; movl in hijack_fptr overwrites the function pointer with the synonym — cmpl in dispatch verifies fptr >= kernel_base so SMEP does not block execution, and the kernel runs attacker shellcode from the physmap-mapped user page',
+    },
+  },
+  {
+    id: 'exit-handler-hijack',
+    name: 'EXIT HANDLER HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker overwrites an atexit-registered function pointer so program cleanup redirects execution to malicious code.',
+    explanation:
+      'Exit handler hijacking targets the __exit_funcs linked list in glibc — the internal data structure ' +
+      'that stores function pointers registered via atexit() and on_exit(). When a process calls exit(), ' +
+      'the runtime iterates this list and calls each registered handler in LIFO order. If an attacker ' +
+      'has an arbitrary write primitive (heap overflow, format string, or dangling pointer), they can ' +
+      'overwrite a function pointer in the exit handler table with the address of system() or a one-gadget ' +
+      'RCE, gaining code execution the moment the program exits normally — no crash required. Modern glibc ' +
+      'applies PTR_MANGLE (rotate right 0x11 bits, XOR with a per-thread secret at fs:[0x30]) to each ' +
+      'stored pointer, but if the attacker can also leak or corrupt the TLS guard value, the mangling is ' +
+      'fully defeated. This technique surged in importance after glibc 2.34 removed __malloc_hook and ' +
+      '__free_hook (2021), eliminating the traditional heap exploitation endgame and making __exit_funcs ' +
+      'the primary remaining writable function-pointer table in libc. Documented extensively in CTF ' +
+      'exploitation research (binholic 2017, HackTricks WWW2Exec series) and used in real exploit chains ' +
+      'targeting CVE-2022-23222 (Linux eBPF verifier) and CVE-2023-4911 (Looney Tunables glibc ld.so). ' +
+      'In the assembly, movl stores the legitimate cleanup address into each ExitFuncList slot during ' +
+      'register(); corrupt_slot\'s movl overwrites slot_1 with the system() address — the same stack ' +
+      'offset that held a safe pointer now holds the attacker\'s target; dispatch_all\'s addl accumulates ' +
+      'the hijacked value, and at runtime the corrupted entry redirects execution to attacker-controlled code.',
+    code:
+`# CVE pattern: overwrite __exit_funcs to hijack cleanup execution
+class ExitFuncList:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.count = 0
+        self.slot_0 = 0
+        self.slot_1 = 0
+        self.slot_2 = 0
+
+    def register(self, func_ptr):
+        if self.count == 0:
+            self.slot_0 = func_ptr
+        elif self.count == 1:
+            self.slot_1 = func_ptr
+        else:
+            self.slot_2 = func_ptr
+        self.count += 1
+        return self.count
+
+    def corrupt_slot(self, idx, evil_ptr):
+        if idx == 0:
+            self.slot_0 = evil_ptr
+        elif idx == 1:
+            self.slot_1 = evil_ptr
+        else:
+            self.slot_2 = evil_ptr
+        return evil_ptr
+
+    def dispatch_all(self):
+        total = 0
+        i = 0
+        while i < self.count:
+            if i == 0:
+                total += self.slot_0
+            elif i == 1:
+                total += self.slot_1
+            else:
+                total += self.slot_2
+            i += 1
+        return total
+
+cleanup = 4198400
+system_addr = 4199424
+funcs = ExitFuncList(4)
+funcs.register(cleanup)
+funcs.register(cleanup)
+funcs.register(cleanup)
+funcs.corrupt_slot(1, system_addr)
+result = funcs.dispatch_all()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'movl stores the legitimate cleanup pointer into each ExitFuncList slot during register(); corrupt_slot\'s movl overwrites slot_1 with the system() address — the same stack offset now holds the attacker\'s target; dispatch_all\'s cmpl tests the loop bound while addl accumulates the hijacked pointer value, redirecting execution at runtime',
+    },
+  },
+  {
+    id: 'large-bin-attack',
+    name: 'LARGE BIN ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted bk_nextsize pointer in the glibc large bin lets an attacker write a heap address to an arbitrary memory location during chunk insertion.',
+    explanation:
+      'The large bin attack exploits the glibc malloc large-bin insertion path: when a freed chunk is sorted ' +
+      'into a large bin (size >= 0x400 on 64-bit), the allocator maintains a skip list via fd_nextsize and ' +
+      'bk_nextsize pointers for efficient size-ordered traversal. If a chunk P already in the large bin has ' +
+      'its bk_nextsize pointer corrupted by an attacker (via heap overflow, UAF, or double-free), inserting ' +
+      'a smaller chunk V triggers the assignment `P->bk_nextsize->fd_nextsize = V` — writing the heap address ' +
+      'of V to an arbitrary memory location chosen by the attacker. This single write primitive can target ' +
+      'global_max_fast (expanding fastbin range to cover most allocations, enabling further corruption), ' +
+      '_IO_list_all (hijacking FILE stream vtable dispatch for code execution via FSOP), or mp_.tcache_bins ' +
+      '(widening tcache coverage for tcache poisoning). The technique was formalized by shellphish\'s how2heap ' +
+      'project and works on glibc 2.23 through 2.35. After glibc 2.30 tightened some checks, the attack was ' +
+      'adapted to write the unsorted bin address instead, still sufficient for the global_max_fast overwrite. ' +
+      'CVE-2024-2961 (glibc iconv buffer overflow) provided the heap corruption primitive needed to trigger ' +
+      'a large bin attack in real-world exploitation chains, escalating arbitrary file read to RCE. ' +
+      'CVE-2023-6246 (glibc syslog heap overflow) and CVE-2026-0861 (glibc memalign integer overflow, CVSS 8.4) ' +
+      'both involve heap metadata corruption in the same allocator structures that the large bin attack targets. ' +
+      'In the assembly, movl stores the victim chunk\'s bk_nextsize pointer to an attacker-controlled target ' +
+      'address; during insertion, addl computes the size comparison and cmpl determines the insertion point — ' +
+      'the subsequent movl writes the new chunk\'s address into the corrupted bk_nextsize->fd_nextsize slot, ' +
+      'landing a heap pointer at the attacker-chosen arbitrary address with no bounds check.',
+    code:
+`# CVE pattern: corrupted bk_nextsize writes heap addr to arbitrary location
+class LargeBinChunk:
+    def __init__(self, size, fd_next, bk_next):
+        self.size = size
+        self.fd_nextsize = fd_next
+        self.bk_nextsize = bk_next
+        self.in_bin = 0
+
+    def insert_into_bin(self):
+        self.in_bin = 1
+        return self.size
+
+class LargeBin:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.head_size = 0
+        self.target_slot = 0
+        self.write_count = 0
+
+    def add_chunk(self, existing, victim):
+        if victim.size < existing.size:
+            self.target_slot = existing.bk_nextsize
+            self.target_slot = victim.size
+            self.write_count += 1
+        self.head_size = existing.size
+        victim.insert_into_bin()
+        return self.write_count
+
+    def read_target(self):
+        result = self.target_slot + self.head_size
+        return result
+
+existing = LargeBinChunk(1024, 4196352, 0)
+existing.insert_into_bin()
+existing.bk_nextsize = 3735928559
+victim = LargeBinChunk(512, 0, 0)
+largebin = LargeBin(16)
+largebin.add_chunk(existing, victim)
+leaked = largebin.read_target()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl compares victim.size against existing.size to determine the insertion point; movl loads the corrupted bk_nextsize (0xDEADBEEF) into the target slot — the large bin insertion code writes the victim chunk\'s address through the corrupted pointer with no integrity check, landing a heap address at an attacker-chosen arbitrary memory location',
+    },
+  },
+  {
+    id: 'brop-oracle',
+    name: 'BLIND ROP (BROP)',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Crash oracle in a forking server lets an attacker recover the stack canary and discover ROP gadgets without access to the binary.',
+    explanation:
+      'Blind Return-Oriented Programming (BROP), introduced by Bittau et al. in "Hacking Blind" (IEEE S&P 2014), ' +
+      'enables remote exploitation of stack buffer overflows without access to the target binary or source code. ' +
+      'The technique targets servers that fork child processes for each connection — fork() preserves the parent\'s ' +
+      'entire memory layout, so the stack canary, ASLR base addresses, and code gadgets remain identical across ' +
+      'children. The attacker uses each forked child as a crash oracle: overwriting the stack canary byte-by-byte ' +
+      'and observing whether the child crashes (wrong byte) or stays alive (correct byte). On 64-bit Linux the ' +
+      'canary has 7 unknown bytes (the low byte is always 0x00), requiring at most 7 × 256 = 1,792 probes instead ' +
+      'of brute-forcing 2^56 possibilities. Once the canary is recovered, the attacker scans the text segment for ' +
+      'a "stop gadget" — an address that causes the child to hang rather than crash — and uses it to fingerprint ' +
+      'useful ROP gadgets (pop rdi; ret, write() PLT entry) purely from behavioral signatures. The final chain ' +
+      'calls write(socket_fd, text_base, length) to dump the server binary to the attacker, enabling a full ' +
+      'conventional ROP exploit. The original research demonstrated BROP against nginx and yaSSL + MySQL in under ' +
+      '4,000 requests (~20 minutes). CVE-2015-7547 (glibc getaddrinfo stack-based buffer overflow, CVSS 8.1) ' +
+      'affected nearly every Linux system and was exploitable via BROP against forking resolvers; any forking daemon ' +
+      'with a stack overflow — Apache prefork, PostgreSQL, OpenSSH — is a candidate target. The technique defeats ' +
+      'ASLR, stack canaries, and NX simultaneously in a single automated scan. ' +
+      'In the assembly, the while loop\'s cmpl checks each brute-force guess against the probe count bound; movl ' +
+      'loads the current guess into the comparison slot; when the guess matches the canary, the conditional return ' +
+      'bypasses the crash path — an attacker observing which guess keeps the child alive recovers the secret value ' +
+      'byte-by-byte, then uses the same oracle to scan code addresses and identify stop gadgets and ROP primitives.',
+    code:
+`# CVE pattern: BROP crash oracle — fork preserves canary across probes
+class ForkServer:
+    def __init__(self, canary, text_base):
+        self.canary = canary
+        self.text_base = text_base
+        self.forks = 0
+        self.crashes = 0
+    def probe_canary(self, guess):
+        self.forks += 1
+        if guess == self.canary:
+            return 1
+        self.crashes += 1
+        return 0
+    def probe_gadget(self, addr):
+        self.forks += 1
+        offset = addr - self.text_base
+        if offset == 4096:
+            return 1
+        self.crashes += 1
+        return 0
+class Exploit:
+    def __init__(self):
+        self.probes = 0
+        self.canary = 0
+        self.stop_gadget = 0
+    def brute_canary(self, srv, lo, count):
+        i = 0
+        while i < count:
+            guess = lo + i
+            hit = srv.probe_canary(guess)
+            self.probes += 1
+            if hit == 1:
+                self.canary = guess
+                return guess
+            i += 1
+        return 0
+    def find_gadgets(self, srv, base, count):
+        i = 0
+        while i < count:
+            addr = base + i * 256
+            hit = srv.probe_gadget(addr)
+            self.probes += 1
+            if hit == 1:
+                self.stop_gadget = addr
+                return addr
+            i += 1
+        return 0
+srv = ForkServer(202, 4194304)
+exploit = Exploit()
+canary = exploit.brute_canary(srv, 200, 8)
+gadget = exploit.find_gadgets(srv, 4198400, 8)
+result = canary + gadget + exploit.probes
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl in the while loop checks each brute-force guess against the probe count; movl loads the current guess into the canary comparison slot — when the guess matches, the conditional return skips the crash increment, revealing the correct byte to the attacker; the same crash-or-alive oracle then scans text-segment addresses via probe_gadget to identify stop gadgets and ROP primitives without ever reading the binary',
+    },
+  },
+  {
+    id: 'dop-chain',
+    name: 'DATA-ORIENTED PROGRAMMING',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Non-control data corruption chains DOP gadgets to achieve Turing-complete exploitation without hijacking any code pointer, bypassing CFI and shadow stacks.',
+    explanation:
+      'Data-Oriented Programming (DOP), introduced by Hu et al. (IEEE S&P 2016), is a code-reuse technique ' +
+      'that achieves arbitrary computation by corrupting only non-control data — never touching function pointers, ' +
+      'return addresses, or vtables. This makes DOP invisible to all control-flow integrity (CFI) defenses, Intel CET ' +
+      'shadow stacks, and ARM PAC. The attacker identifies "DOP gadgets": short sequences in the existing program ' +
+      'that perform a single virtual operation (load, store, add, conditional branch) on attacker-influenced variables. ' +
+      'A loop in the program serves as the "dispatcher" that re-executes these gadgets each iteration, with a corrupted ' +
+      'loop variable acting as a virtual program counter. By chaining gadgets through successive iterations, the attacker ' +
+      'builds a Turing-complete virtual machine inside the victim process. The original research demonstrated DOP against ' +
+      'ProFTPD (CVE-2006-5815): an integer overflow allowed corrupting a buffer pointer used in the main I/O loop, turning ' +
+      'each loop iteration into a DOP gadget dispatch that leaked ASLR bases and escalated privileges — all while the ' +
+      'program\'s control flow graph remained perfectly valid. USENIX Security 2025 presented an automated DOP compiler ' +
+      'that generates DOP exploit chains from vulnerable binaries. In 2024, researchers showed that CFI-hardened nginx ' +
+      'and OpenSSH could be exploited via DOP without triggering any CFI violation. ' +
+      'In the assembly, the while loop\'s cmpl acts as the dispatcher — re-entering the gadget sequence each iteration; ' +
+      'movl loads the corrupted virtual-PC index to select which gadget fires; addl performs the arithmetic micro-operation ' +
+      'on attacker-controlled operands. No indirect call or ret instruction is corrupted — the entire exploit runs within ' +
+      'valid control flow.',
+    code:
+`# CVE pattern: DOP — dispatcher loop chains non-control data gadgets
+class Memory:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.reg_a = 0
+        self.reg_b = 0
+        self.secret = 3735928559
+        self.priv_flag = 0
+
+    def gadget_load(self, src):
+        self.reg_a = src
+        return self.reg_a
+
+    def gadget_add(self, val):
+        self.reg_b = self.reg_a + val
+        return self.reg_b
+
+    def gadget_store(self, result):
+        self.priv_flag = result
+        return self.priv_flag
+
+class Dispatcher:
+    def __init__(self, gadget_count):
+        self.gadget_count = gadget_count
+        self.vpc = 0
+        self.iterations = 0
+        self.result = 0
+
+    def run(self, mem):
+        i = 0
+        while i < self.gadget_count:
+            self.vpc = i
+            if i == 0:
+                mem.gadget_load(mem.secret)
+            elif i == 1:
+                mem.gadget_add(1)
+            elif i == 2:
+                mem.gadget_store(mem.reg_b)
+            self.iterations += 1
+            i += 1
+        self.result = mem.priv_flag
+        return self.result
+
+mem = Memory(4096)
+disp = Dispatcher(3)
+hijacked = disp.run(mem)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl in the while loop acts as the DOP dispatcher, re-entering the gadget chain each iteration without any indirect call or ret corruption; movl loads the corrupted virtual-PC (vpc) selecting which gadget fires; addl performs the arithmetic micro-operation on attacker-controlled operands — the entire exploit runs within valid control flow, invisible to CFI, CET shadow stacks, and ARM PAC',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
@@ -8407,6 +8903,26 @@ export default function EditorPage() {
               REGS:: {formatRegisterTotals(result.register_summary.register_totals)}
             </span>
           )}
+          {result.memory_summary?.memory_totals && formatMemory(result.memory_summary.memory_totals) && (
+            <span
+              title={`Memory traffic — total memory reads (loads) and writes (stores): ${formatMemory(result.memory_summary.memory_totals)}. At -O0 every variable lives on the stack, so even 'x += 1' is a load → compute → store round-trip. High load/store counts are pure stack shuffling an optimising build would keep in registers instead.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              MEM:: {formatMemory(result.memory_summary.memory_totals)}
+            </span>
+          )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (
             <span
               title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
@@ -8444,6 +8960,9 @@ export default function EditorPage() {
             const regsTitle = regs.length
               ? ` — regs: ${regs.map(r => `%${r}`).join(', ')}`
               : ''
+            const memTitle = formatMemory(mapping.memory_counts)
+              ? ` — mem: ${formatMemory(mapping.memory_counts)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -8464,7 +8983,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${flagTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${memTitle}${flagTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (

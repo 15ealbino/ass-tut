@@ -47,6 +47,9 @@ export interface LineMapping {
   // Stack frame map: the distinct %ebp-relative stack slots this line's asm
   // touches (e.g. "-4(%ebp)", "8(%ebp)"), ordered by offset (locals then args).
   stack_slots?: string[]
+  // Memory traffic: how many memory reads (loads) and writes (stores) this
+  // line's asm performs. Only nonzero of {loads, stores} are present.
+  memory_counts?: Record<string, number>
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
@@ -74,6 +77,12 @@ export interface StackSummary {
   locals_bytes: number
 }
 
+export interface MemorySummary {
+  // Program-wide memory traffic: total memory reads (loads) and writes (stores)
+  // across the whole program. Both keys are always present.
+  memory_totals: Record<string, number>
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -97,6 +106,7 @@ export interface CompileResponse {
   register_summary?: RegisterSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
   stack_summary?: StackSummary | null
+  memory_summary?: MemorySummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
 }
