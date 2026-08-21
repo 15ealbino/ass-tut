@@ -320,6 +320,126 @@ def analyze_registers(
     return {"register_totals": register_totals}
 
 
+# ── Stack frame map ─────────────────────────────────────────────────────────
+#
+# The register footprint says WHICH registers a Python line touches; the stack
+# frame map says WHICH STACK SLOTS it touches — the displacements off the frame
+# pointer %ebp. Together they cover both halves of where a value can live at
+# gcc -O0: a handful of registers and a pile of %ebp-relative stack slots.
+#
+# The lessons this teaches:
+#   * Pillar 1 (make the mapping concrete): at gcc -O0 every local is spilled to
+#     the stack, so a Python line like `x = a + b` reads two slots and writes a
+#     third. Listing the exact slots ("-4(%ebp)", "8(%ebp)") makes the abstract
+#     "variables live on the stack" real — you can read the frame off the asm.
+#   * Reverse-engineering skill: reading a stack frame from a disassembly is a
+#     day-one RE task. The System V i386 convention gcc uses here is visible in
+#     the offsets themselves — NEGATIVE offsets are the function's own locals,
+#     POSITIVE offsets (8(%ebp), 12(%ebp), ...) are incoming arguments passed by
+#     the caller, with 0(%ebp) the saved %ebp and 4(%ebp) the return address in
+#     between. Seeing `a`/`b` at 8/12(%ebp) and `x` at -4(%ebp) on real code
+#     teaches that layout far better than a diagram does.
+#
+# Only %ebp-relative operands are collected: at -O0 %ebp is the frame pointer, so
+# %ebp-relative slots ARE the stack frame. %esp-relative slots (outgoing-argument
+# staging for the next call) are a different concept and are deliberately left
+# out so the map reads as one coherent frame (see the module docs / feature README).
+
+# Match an AT&T memory operand based on %ebp, capturing the (optional) signed
+# displacement. Covers the three forms gcc emits:
+#   -4(%ebp)            simple local / positive-offset arg
+#   (%ebp)              displacement 0 (bare base)
+#   -24(%ebp,%eax,4)    indexed — array element access; the base slot is the disp
+# The displacement may be decimal or (defensively) 0x-hex; a missing displacement
+# means 0. The `\b` after `ebp` prevents matching a stray longer register name.
+_STACK_SLOT_RE = re.compile(
+    r"(?P<disp>-?(?:0x[0-9a-fA-F]+|\d+))?\(%ebp\b(?:,[^)]*)?\)"
+)
+
+
+def canonical_slot(disp: int) -> str:
+    """Render a frame-pointer displacement as its disassembly-style slot label.
+
+    ``canonical_slot(-4) == "-4(%ebp)"``, ``canonical_slot(8) == "8(%ebp)"``,
+    ``canonical_slot(0) == "(%ebp)"`` (gcc writes the zero-displacement base
+    without a leading ``0``, so the label matches what appears in the asm pane).
+    """
+    return f"{disp}(%ebp)" if disp != 0 else "(%ebp)"
+
+
+def _stack_offsets_in_instruction(text: str) -> Set[int]:
+    """Signed %ebp-relative displacements referenced by one instruction line.
+
+    Returns the raw integer offsets (e.g. ``{-4}`` for ``movl $1, -4(%ebp)``,
+    ``{-24}`` for the indexed ``movl -24(%ebp,%eax,4), %eax``). A line with no
+    %ebp operand returns the empty set. An indexed operand contributes only its
+    base displacement — the per-element address is computed at run time from the
+    index register and is not a fixed slot.
+    """
+    offsets: Set[int] = set()
+    for m in _STACK_SLOT_RE.finditer(text):
+        disp = m.group("disp")
+        if disp is None:
+            offsets.add(0)
+        else:
+            offsets.add(int(disp, 16) if disp.lower().startswith(("0x", "-0x")) else int(disp))
+    return offsets
+
+
+def _sort_slots(offsets) -> List[str]:
+    """Sort offsets ascending (locals -N first, then args +N) into slot labels."""
+    return [canonical_slot(off) for off in sorted(offsets)]
+
+
+def analyze_stack(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``stack_slots`` list (the distinct
+    %ebp-relative slot labels that line's assembly touches, ordered by offset)
+    and return a program-wide summary. Mutates ``line_map`` in place.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` /
+    ``analyze_registers``).
+
+    The summary is::
+
+        {
+          "slot_totals":  {label: instruction_count, ...},  # ordered by offset
+          "frame_slots":  <number of distinct slots touched>,
+          "locals_bytes": <|most-negative offset|, else 0>,
+        }
+
+    ``slot_totals`` counts, per slot, the number of instructions that reference it
+    (a slot named twice in one instruction counts once). ``locals_bytes`` is the
+    magnitude of the most-negative offset seen — a LOWER-BOUND estimate of the
+    local-variable region's size. It is a lower bound, not the exact frame size:
+    gcc's prologue ``sub $N, %esp`` carries no ``.loc`` and so is not in
+    ``line_map``, and the compiler may reserve extra bytes for alignment.
+    """
+    totals: Dict[int, int] = {}
+    for mapping in line_map.values():
+        line_offsets: Set[int] = set()
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if 1 <= asm_no <= len(asm_lines):
+                offs = _stack_offsets_in_instruction(asm_lines[asm_no - 1])
+                line_offsets |= offs
+                for off in offs:
+                    totals[off] = totals.get(off, 0) + 1
+        mapping["stack_slots"] = _sort_slots(line_offsets)
+
+    slot_totals = {canonical_slot(off): totals[off] for off in sorted(totals)}
+    negatives = [off for off in totals if off < 0]
+    locals_bytes = -min(negatives) if negatives else 0
+    return {
+        "slot_totals": slot_totals,
+        "frame_slots": len(totals),
+        "locals_bytes": locals_bytes,
+    }
+
+
 # ── Memory-traffic analysis (loads vs stores) ───────────────────────────────
 #
 # The instruction mix lumps every data-movement instruction into a single "mem"
@@ -650,6 +770,11 @@ async def compile_python(python_source: str) -> dict:
     # program-wide register summary. Runs after analyze_cost so both passes
     # enrich the same line_map entries.
     register_summary = analyze_registers(line_map, asm_lines)
+    # Annotate each line_map entry with the %ebp-relative stack slots it touches
+    # and build the program-wide frame map. Runs alongside the other per-line
+    # passes over the same line_map — the memory-side complement to the register
+    # footprint.
+    stack_summary = analyze_stack(line_map, asm_lines)
     # Split each Python line's memory movement into loads vs stores. Independent
     # of the passes above; runs over the same already-mapped display asm.
     memory_summary = analyze_memory_traffic(line_map, asm_lines)
@@ -665,6 +790,7 @@ async def compile_python(python_source: str) -> dict:
         "line_map": line_map,
         "cost_summary": cost_summary,
         "register_summary": register_summary,
+        "stack_summary": stack_summary,
         "memory_summary": memory_summary,
         "asm_glossary": asm_glossary,
     }

@@ -32,6 +32,11 @@ class LineMapping(BaseModel):
     # ones like %edx:%eax on integer division). Empty for the pyghidra pipeline,
     # which computes no per-line footprint.
     registers: List[str] = Field(default_factory=list)
+    # Stack frame map: the distinct %ebp-relative stack slots this Python line's
+    # assembly touches (e.g. "-4(%ebp)", "8(%ebp)"), ordered by offset ascending
+    # (locals first, then incoming args). Empty for the pyghidra pipeline, which
+    # computes no per-line frame map.
+    stack_slots: List[str] = Field(default_factory=list)
     # Memory traffic: how many memory reads (loads) and writes (stores) this
     # Python line's assembly performs, splitting the instruction-mix "mem" bucket
     # by direction. Only nonzero of {"loads", "stores"} are present. Empty for the
@@ -56,6 +61,20 @@ class RegisterSummary(BaseModel):
     # Program-wide register footprint: each canonical register mapped to the
     # number of instructions that reference it, in stable display order.
     register_totals: Dict[str, int] = Field(default_factory=dict)
+
+
+class StackSummary(BaseModel):
+    # Program-wide stack frame map.
+    #   slot_totals  — each %ebp-relative slot label mapped to the number of
+    #                  instructions that reference it, ordered by offset ascending.
+    #   frame_slots  — number of distinct slots touched.
+    #   locals_bytes — magnitude of the most-negative offset; a LOWER-BOUND
+    #                  estimate of the local-variable region (the prologue's
+    #                  `sub $N, %esp` carries no .loc and alignment padding is
+    #                  not counted).
+    slot_totals: Dict[str, int] = Field(default_factory=dict)
+    frame_slots: int = 0
+    locals_bytes: int = 0
 
 
 class MemorySummary(BaseModel):
@@ -96,6 +115,8 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # register footprint).
     register_summary: Optional[RegisterSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line frame map).
+    stack_summary: Optional[StackSummary] = None
     # Present for the transpile pipeline; None for pyghidra (no per-line memory
     # traffic).
     memory_summary: Optional[MemorySummary] = None

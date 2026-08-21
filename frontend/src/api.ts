@@ -44,6 +44,9 @@ export interface LineMapping {
   // Register footprint: canonical 32-bit x86 registers this line's asm touches,
   // in stable display order (includes implicit regs like edx:eax on division).
   registers?: string[]
+  // Stack frame map: the distinct %ebp-relative stack slots this line's asm
+  // touches (e.g. "-4(%ebp)", "8(%ebp)"), ordered by offset (locals then args).
+  stack_slots?: string[]
   // Memory traffic: how many memory reads (loads) and writes (stores) this
   // line's asm performs. Only nonzero of {loads, stores} are present.
   memory_counts?: Record<string, number>
@@ -62,6 +65,16 @@ export interface RegisterSummary {
   // Program-wide register footprint: each canonical register mapped to the
   // number of instructions that reference it, in stable display order.
   register_totals: Record<string, number>
+}
+
+export interface StackSummary {
+  // Program-wide stack frame map: each %ebp-relative slot label mapped to the
+  // number of instructions that reference it, ordered by offset ascending.
+  slot_totals: Record<string, number>
+  // Number of distinct slots touched, and a lower-bound estimate (in bytes) of
+  // the local-variable region (magnitude of the most-negative offset).
+  frame_slots: number
+  locals_bytes: number
 }
 
 export interface MemorySummary {
@@ -92,6 +105,7 @@ export interface CompileResponse {
   // Present for the transpile pipeline; absent/null for pyghidra.
   register_summary?: RegisterSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
+  stack_summary?: StackSummary | null
   memory_summary?: MemorySummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
