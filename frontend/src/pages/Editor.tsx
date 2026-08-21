@@ -60,6 +60,19 @@ function formatRegisterTotals(totals?: Record<string, number>): string {
   return [...known, ...extra].map(r => `%${r} ${totals[r]}`).join(' · ')
 }
 
+// ─── Memory-traffic presentation ────────────────────────────────────────────
+// Backend splits each line's data movement into memory reads (loads) and writes
+// (stores). At -O0 every variable lives on the stack, so a plain `x += 1` is a
+// load → compute → store round-trip; the counts make that stack shuffling
+// visible. Rendered "N ld · N st" in the MEM chip and per-line tooltips.
+function formatMemory(counts?: Record<string, number>): string {
+  if (!counts) return ''
+  const parts: string[] = []
+  if ((counts.loads ?? 0) > 0) parts.push(`${counts.loads} ld`)
+  if ((counts.stores ?? 0) > 0) parts.push(`${counts.stores} st`)
+  return parts.join(' · ')
+}
+
 // ─── Instruction-glossary presentation ─────────────────────────────────────
 // The backend returns one entry per distinct mnemonic in the compiled asm.
 // Render them, grouped by the same category order as the mix, into a single
@@ -8890,6 +8903,26 @@ export default function EditorPage() {
               REGS:: {formatRegisterTotals(result.register_summary.register_totals)}
             </span>
           )}
+          {result.memory_summary?.memory_totals && formatMemory(result.memory_summary.memory_totals) && (
+            <span
+              title={`Memory traffic — total memory reads (loads) and writes (stores): ${formatMemory(result.memory_summary.memory_totals)}. At -O0 every variable lives on the stack, so even 'x += 1' is a load → compute → store round-trip. High load/store counts are pure stack shuffling an optimising build would keep in registers instead.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              MEM:: {formatMemory(result.memory_summary.memory_totals)}
+            </span>
+          )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (
             <span
               title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
@@ -8927,6 +8960,9 @@ export default function EditorPage() {
             const regsTitle = regs.length
               ? ` — regs: ${regs.map(r => `%${r}`).join(', ')}`
               : ''
+            const memTitle = formatMemory(mapping.memory_counts)
+              ? ` — mem: ${formatMemory(mapping.memory_counts)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -8947,7 +8983,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${flagTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${memTitle}${flagTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (

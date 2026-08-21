@@ -44,6 +44,9 @@ export interface LineMapping {
   // Register footprint: canonical 32-bit x86 registers this line's asm touches,
   // in stable display order (includes implicit regs like edx:eax on division).
   registers?: string[]
+  // Memory traffic: how many memory reads (loads) and writes (stores) this
+  // line's asm performs. Only nonzero of {loads, stores} are present.
+  memory_counts?: Record<string, number>
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
@@ -59,6 +62,12 @@ export interface RegisterSummary {
   // Program-wide register footprint: each canonical register mapped to the
   // number of instructions that reference it, in stable display order.
   register_totals: Record<string, number>
+}
+
+export interface MemorySummary {
+  // Program-wide memory traffic: total memory reads (loads) and writes (stores)
+  // across the whole program. Both keys are always present.
+  memory_totals: Record<string, number>
 }
 
 export interface GlossaryEntry {
@@ -82,6 +91,8 @@ export interface CompileResponse {
   cost_summary?: CostSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
   register_summary?: RegisterSummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  memory_summary?: MemorySummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
 }
