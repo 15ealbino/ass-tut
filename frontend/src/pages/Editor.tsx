@@ -8172,6 +8172,84 @@ print(result)
       description: 'cmpl in the while loop checks each brute-force guess against the probe count; movl loads the current guess into the canary comparison slot — when the guess matches, the conditional return skips the crash increment, revealing the correct byte to the attacker; the same crash-or-alive oracle then scans text-segment addresses via probe_gadget to identify stop gadgets and ROP primitives without ever reading the binary',
     },
   },
+  {
+    id: 'dop-chain',
+    name: 'DATA-ORIENTED PROGRAMMING',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Non-control data corruption chains DOP gadgets to achieve Turing-complete exploitation without hijacking any code pointer, bypassing CFI and shadow stacks.',
+    explanation:
+      'Data-Oriented Programming (DOP), introduced by Hu et al. (IEEE S&P 2016), is a code-reuse technique ' +
+      'that achieves arbitrary computation by corrupting only non-control data — never touching function pointers, ' +
+      'return addresses, or vtables. This makes DOP invisible to all control-flow integrity (CFI) defenses, Intel CET ' +
+      'shadow stacks, and ARM PAC. The attacker identifies "DOP gadgets": short sequences in the existing program ' +
+      'that perform a single virtual operation (load, store, add, conditional branch) on attacker-influenced variables. ' +
+      'A loop in the program serves as the "dispatcher" that re-executes these gadgets each iteration, with a corrupted ' +
+      'loop variable acting as a virtual program counter. By chaining gadgets through successive iterations, the attacker ' +
+      'builds a Turing-complete virtual machine inside the victim process. The original research demonstrated DOP against ' +
+      'ProFTPD (CVE-2006-5815): an integer overflow allowed corrupting a buffer pointer used in the main I/O loop, turning ' +
+      'each loop iteration into a DOP gadget dispatch that leaked ASLR bases and escalated privileges — all while the ' +
+      'program\'s control flow graph remained perfectly valid. USENIX Security 2025 presented an automated DOP compiler ' +
+      'that generates DOP exploit chains from vulnerable binaries. In 2024, researchers showed that CFI-hardened nginx ' +
+      'and OpenSSH could be exploited via DOP without triggering any CFI violation. ' +
+      'In the assembly, the while loop\'s cmpl acts as the dispatcher — re-entering the gadget sequence each iteration; ' +
+      'movl loads the corrupted virtual-PC index to select which gadget fires; addl performs the arithmetic micro-operation ' +
+      'on attacker-controlled operands. No indirect call or ret instruction is corrupted — the entire exploit runs within ' +
+      'valid control flow.',
+    code:
+`# CVE pattern: DOP — dispatcher loop chains non-control data gadgets
+class Memory:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.reg_a = 0
+        self.reg_b = 0
+        self.secret = 3735928559
+        self.priv_flag = 0
+
+    def gadget_load(self, src):
+        self.reg_a = src
+        return self.reg_a
+
+    def gadget_add(self, val):
+        self.reg_b = self.reg_a + val
+        return self.reg_b
+
+    def gadget_store(self, result):
+        self.priv_flag = result
+        return self.priv_flag
+
+class Dispatcher:
+    def __init__(self, gadget_count):
+        self.gadget_count = gadget_count
+        self.vpc = 0
+        self.iterations = 0
+        self.result = 0
+
+    def run(self, mem):
+        i = 0
+        while i < self.gadget_count:
+            self.vpc = i
+            if i == 0:
+                mem.gadget_load(mem.secret)
+            elif i == 1:
+                mem.gadget_add(1)
+            elif i == 2:
+                mem.gadget_store(mem.reg_b)
+            self.iterations += 1
+            i += 1
+        self.result = mem.priv_flag
+        return self.result
+
+mem = Memory(4096)
+disp = Dispatcher(3)
+hijacked = disp.run(mem)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl in the while loop acts as the DOP dispatcher, re-entering the gadget chain each iteration without any indirect call or ret corruption; movl loads the corrupted virtual-PC (vpc) selecting which gadget fires; addl performs the arithmetic micro-operation on attacker-controlled operands — the entire exploit runs within valid control flow, invisible to CFI, CET shadow stacks, and ARM PAC',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
