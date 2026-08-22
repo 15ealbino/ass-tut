@@ -8263,6 +8263,99 @@ print(hijacked)
       description: 'cmpl in the while loop acts as the DOP dispatcher, re-entering the gadget chain each iteration without any indirect call or ret corruption; movl loads the corrupted virtual-PC (vpc) selecting which gadget fires; addl performs the arithmetic micro-operation on attacker-controlled operands — the entire exploit runs within valid control flow, invisible to CFI, CET shadow stacks, and ARM PAC',
     },
   },
+  {
+    id: 'coop-vfunc-chain',
+    name: 'COUNTERFEIT OOP CHAIN',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Chains legitimate C++ virtual function calls on attacker-crafted counterfeit objects to achieve arbitrary computation, bypassing CFI, Control Flow Guard, and Intel CET.',
+    explanation:
+      'Counterfeit Object-Oriented Programming (COOP), introduced by Schuster et al. (IEEE S&P 2015), is a code-reuse ' +
+      'attack that chains legitimate C++ virtual function invocations — each through a real, compiler-emitted call site — ' +
+      'on attacker-controlled counterfeit objects. Unlike ROP or JOP, every indirect call in a COOP chain targets a valid ' +
+      'function at a valid call site, making the attack invisible to both coarse-grained and many fine-grained Control Flow ' +
+      'Integrity (CFI) implementations, including Microsoft\'s Control Flow Guard (CFG) and Intel CET with shadow stacks. ' +
+      'The attacker injects a block of counterfeit C++ objects into the victim\'s address space via a heap spray or buffer ' +
+      'overflow. Each counterfeit object carries an attacker-chosen vptr that points to an existing vtable, and attacker-chosen ' +
+      'data fields that serve as operands. A "main-loop gadget" (ML-G) — a virtual function containing a loop that iterates ' +
+      'over an array of object pointers and calls a virtual method on each — acts as the dispatcher. Each iteration invokes a ' +
+      'different virtual-function gadget (vfgadget): ARITH-G for arithmetic on attacker operands, W-G for memory writes, ' +
+      'R-G for memory reads, W-COND-G for conditional branches, and INV-G for invoking system APIs. Together they form a ' +
+      'Turing-complete virtual machine running entirely within valid control flow. CVE-2019-0539 (Chakra JIT type confusion ' +
+      'in Microsoft Edge, CVSS 7.5) was exploited using COOP gadget chains to bypass CFG on Windows 10. Researchers also ' +
+      'demonstrated full COOP exploits against Internet Explorer 10/11, showing that even C++-aware defenses like CPS, T-VIP, ' +
+      'vfGuard, and VTint are defeated. In 2023, OffSec demonstrated COOP bypassing Intel CET on the latest Windows releases, ' +
+      'proving the technique remains viable against state-of-the-art hardware-assisted CFI. ' +
+      'In the assembly, each call to invoke() generates a call instruction that CFI validates as legitimate because it targets ' +
+      'a real function; movl loads the counterfeit object\'s vptr-selected field values as operands; the dispatcher\'s cmpl/jl ' +
+      're-enters the loop for the next counterfeit object — no ret gadget, no indirect jmp, and no corrupted code pointer is ' +
+      'ever used.',
+    code:
+`# CVE pattern: COOP — counterfeit objects chain vfunc calls past CFI
+class ArithVFG:
+    def __init__(self, operand):
+        self.vptr = 1
+        self.field_a = operand
+        self.result = 0
+
+    def invoke(self, acc):
+        self.result = acc + self.field_a
+        return self.result
+
+class WriteVFG:
+    def __init__(self, target):
+        self.vptr = 2
+        self.field_a = target
+        self.result = 0
+
+    def invoke(self, acc):
+        self.result = self.field_a
+        return self.result
+
+class CondVFG:
+    def __init__(self, threshold):
+        self.vptr = 3
+        self.field_a = threshold
+        self.result = 0
+
+    def invoke(self, acc):
+        if acc > self.field_a:
+            self.result = 1
+        else:
+            self.result = 0
+        return self.result
+
+class MainLoopGadget:
+    def __init__(self, count):
+        self.count = count
+        self.vpc = 0
+        self.acc = 0
+
+    def dispatch(self, g0, g1, g2):
+        i = 0
+        while i < self.count:
+            self.vpc = i
+            if i == 0:
+                self.acc = g0.invoke(self.acc)
+            elif i == 1:
+                self.acc = g1.invoke(self.acc)
+            elif i == 2:
+                self.acc = g2.invoke(self.acc)
+            i += 1
+        return self.acc
+
+fake0 = ArithVFG(48879)
+fake1 = ArithVFG(16657)
+fake2 = CondVFG(60000)
+ml = MainLoopGadget(3)
+hijacked = ml.dispatch(fake0, fake1, fake2)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['call', 'movl', 'cmpl'],
+      description: 'call instructions target real virtual functions through compiler-emitted call sites — CFI validates each as legitimate because the target is a valid vfgadget entry point; movl loads attacker-chosen field values (vptr, field_a) from each counterfeit object as operands for the vfgadget micro-operation; cmpl in the dispatcher loop re-enters the chain for the next counterfeit object, forming a Turing-complete virtual machine invisible to CFG, Intel CET, and shadow stacks',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
