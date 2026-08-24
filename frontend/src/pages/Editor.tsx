@@ -8434,6 +8434,107 @@ print(hijacked)
       description: 'movl loads the attacker-supplied lookup reference (0xDEADBEEF) into a stack slot via the log method; cmpl in resolve_lookup checks lookup_enabled == 1 and passes the reference through without sanitization — fetch_remote\'s addl combines the reference with the LDAP server base address to compute the malicious class address, and execute\'s addl invokes it with no type or origin check, achieving unauthenticated RCE',
     },
   },
+  {
+    id: 'seq-num-desync',
+    name: 'SEQUENCE NUMBER DESYNC',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'Man-in-the-middle manipulates protocol sequence counters to desynchronize sender and receiver state machines, enabling silent message truncation and security downgrade.',
+    explanation:
+      'Sequence number desynchronization (CWE-354 / CWE-757) exploits protocols that use incrementing sequence ' +
+      'counters to order and authenticate messages. A man-in-the-middle injects or drops unauthenticated messages ' +
+      'during the handshake phase — before the secure channel is established — to shift the sequence counter on one ' +
+      'side without the other\'s knowledge. Once the encrypted channel begins, the attacker deletes a precisely ' +
+      'chosen number of ciphertext messages from the wire; the receiver, whose counter is now offset, decrypts ' +
+      'subsequent messages with the wrong sequence number but the cipher still accepts them because the injected ' +
+      'offset was pre-compensated during the handshake. The result: the attacker silently truncates the beginning ' +
+      'of the secure session, removing security-critical negotiation messages such as feature extensions or ' +
+      'downgrade-protection flags. ' +
+      'CVE-2023-48795 (Terrapin, CVSS 5.9) is the defining example: the SSH Binary Packet Protocol\'s ChaCha20-Poly1305 ' +
+      'and Encrypt-then-MAC cipher suites used sequence numbers as implicit nonces but did not bind the handshake ' +
+      'transcript to the counter state. A MitM injected SSH_MSG_IGNORE packets during key exchange (incrementing the ' +
+      'server\'s send counter), then deleted the same number of encrypted packets after SSH_MSG_NEWKEYS — stripping ' +
+      'SSH_MSG_EXT_INFO and disabling keystroke-timing countermeasures. Over 77% of internet-facing SSH servers were ' +
+      'vulnerable at disclosure. The fix ("strict kex") resets sequence numbers at SSH_MSG_NEWKEYS and rejects ' +
+      'unexpected messages during key exchange. CVE-2024-45337 (Go x/crypto/ssh, CVSS 9.1) showed the class extends ' +
+      'beyond OpenSSH: the Go SSH library\'s handshake callback could be bypassed entirely, granting unauthenticated ' +
+      'access. CVE-2016-0777 (OpenSSH roaming) exploited a similar state desync to leak client private keys. ' +
+      'In the assembly, movl loads the initial sequence counter; addl in inject_ignore increments send_seq without ' +
+      'a corresponding increment on recv_seq — cmpl in verify_seq compares the desynchronized counters and the ' +
+      'mismatch lets the attacker\'s movl overwrite the ext_info field with zero, silently disabling security extensions.',
+    code:
+`# CVE pattern: MitM shifts sequence counter — truncates security extensions
+class Channel:
+    def __init__(self, send_seq, recv_seq):
+        self.send_seq = send_seq
+        self.recv_seq = recv_seq
+        self.ext_info = 0
+        self.secured = 0
+
+    def send_msg(self, msg_type):
+        self.send_seq += 1
+        return self.send_seq
+
+    def recv_msg(self):
+        self.recv_seq += 1
+        return self.recv_seq
+
+class MitM:
+    def __init__(self, injected):
+        self.injected = injected
+        self.dropped = 0
+        self.desync = 0
+
+    def inject_ignore(self, channel, count):
+        i = 0
+        while i < count:
+            channel.send_seq += 1
+            self.injected += 1
+            i += 1
+        self.desync = self.injected
+        return self.desync
+
+    def drop_after_newkeys(self, channel, count):
+        i = 0
+        while i < count:
+            self.dropped += 1
+            i += 1
+        return self.dropped
+
+    def strip_ext_info(self, channel):
+        channel.ext_info = 0
+        return channel.ext_info
+
+class Handshake:
+    def __init__(self, strict_kex):
+        self.strict_kex = strict_kex
+        self.ext_negotiated = 0
+        self.downgraded = 0
+
+    def negotiate(self, channel):
+        if channel.ext_info == 1:
+            self.ext_negotiated = 1
+        else:
+            self.downgraded = 1
+        return self.downgraded
+
+server = Channel(0, 0)
+server.ext_info = 1
+attacker = MitM(0)
+attacker.inject_ignore(server, 3)
+server.send_msg(1)
+attacker.drop_after_newkeys(server, 3)
+attacker.strip_ext_info(server)
+hs = Handshake(0)
+hs.negotiate(server)
+result = server.send_seq + hs.downgraded
+print(result)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl', 'movl'],
+      description: 'addl increments send_seq in the inject_ignore loop without a matching recv_seq increment, desynchronizing the counters; cmpl in negotiate checks ext_info — which the attacker\'s movl has zeroed via strip_ext_info — and the branch sets downgraded=1, silently disabling security extensions the same way Terrapin strips SSH_MSG_EXT_INFO from the encrypted channel',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
