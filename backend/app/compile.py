@@ -706,6 +706,12 @@ def _parse_branch(text: str) -> Tuple[str, str, str] | None:
     for every other ``j*`` / ``loop*`` mnemonic. ``target`` is the raw operand
     text (typically a label like ``".L2"``; ``""`` for the malformed no-operand
     case; starts with ``"*"`` for an indirect target like ``"*%eax"``).
+
+    Assumes the operand carries no trailing comment (e.g. ``jmp .L2 # foo``),
+    which would otherwise poison ``target`` and misclassify direction as
+    ``external``. This holds because ``_run_gcc`` does not pass
+    ``-fverbose-asm``; if that ever changes, strip a trailing ``#``/``//``
+    comment off the operand here.
     """
     stripped = text.strip()
     if not stripped or stripped.endswith(':'):
