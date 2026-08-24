@@ -13,6 +13,25 @@ class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
+
+class Branch(BaseModel):
+    # One branch instruction as it appears on a single Python line's asm.
+    #   mnemonic     — lowercased opcode with any size suffix (e.g. "jle", "jmp")
+    #   conditional  — False for the jmp/jmpl unconditional family, else True
+    #   direction    — forward | backward | self_loop | external | unknown
+    #                  (forward = target below the branch — the if/else skip
+    #                  pattern; backward = target above — a loop back-edge;
+    #                  external = target label is not defined in this file, e.g.
+    #                  a tail call; unknown = indirect target like `jmp *%eax`)
+    #   target       — raw operand text (typically a label like ".L2"; empty
+    #                  for a malformed no-operand line; starts with "*" for
+    #                  an indirect target)
+    mnemonic: str
+    conditional: bool
+    direction: str
+    target: str
+
+
 class LineMapping(BaseModel):
     c_lines: List[int]
     asm_lines: List[int]
@@ -42,6 +61,13 @@ class LineMapping(BaseModel):
     # by direction. Only nonzero of {"loads", "stores"} are present. Empty for the
     # pyghidra pipeline, which computes no per-line memory traffic.
     memory_counts: Dict[str, int] = Field(default_factory=dict)
+    # Branch flow: every branch instruction this Python line emits, in
+    # occurrence order. Each entry names the mnemonic, whether it is
+    # conditional, its direction relative to its source line (forward =
+    # if/else branch-around, backward = loop back-edge), and the raw target
+    # label. Empty for the pyghidra pipeline, which computes no per-line
+    # branch map.
+    branches: List[Branch] = Field(default_factory=list)
 
 
 class Hotspot(BaseModel):
@@ -83,6 +109,27 @@ class MemorySummary(BaseModel):
     memory_totals: Dict[str, int] = Field(default_factory=lambda: {"loads": 0, "stores": 0})
 
 
+class BranchSummary(BaseModel):
+    # Program-wide branch flow counts. Per-line branch entries live on
+    # LineMapping.branches; this summary tallies them.
+    #   total          — number of branch instructions overall
+    #   conditional    — count where mnemonic is not jmp/jmpl
+    #   unconditional  — count of jmp/jmpl
+    #   forward        — target's asm line > source's (if/else branch-around)
+    #   backward       — target's asm line < source's (loop back-edge)
+    #   self_loop      — target's asm line == source's
+    #   external       — target label is not defined in this asm file (tail call)
+    #   unknown        — indirect target (`jmp *%eax`) or missing operand
+    total: int = 0
+    conditional: int = 0
+    unconditional: int = 0
+    forward: int = 0
+    backward: int = 0
+    self_loop: int = 0
+    external: int = 0
+    unknown: int = 0
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -120,6 +167,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line memory
     # traffic).
     memory_summary: Optional[MemorySummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line branch
+    # map).
+    branch_summary: Optional[BranchSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
