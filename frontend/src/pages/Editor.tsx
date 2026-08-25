@@ -8535,6 +8535,95 @@ print(result)
       description: 'addl increments send_seq in the inject_ignore loop without a matching recv_seq increment, desynchronizing the counters; cmpl in negotiate checks ext_info — which the attacker\'s movl has zeroed via strip_ext_info — and the branch sets downgraded=1, silently disabling security extensions the same way Terrapin strips SSH_MSG_EXT_INFO from the encrypted channel',
     },
   },
+  {
+    id: 'iconv-bof',
+    name: 'ICONV BUFFER OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Missing bounds check in glibc iconv() ISO-2022-CN-EXT escape sequence emission overflows the output buffer by up to 4 bytes, corrupting adjacent heap metadata for arbitrary code execution.',
+    explanation:
+      'The GNU C Library\'s iconv() character set conversion function (glibc <= 2.39) contains an out-of-bounds ' +
+      'write (CWE-787) in the ISO-2022-CN-EXT codec. When converting from UCS-4 to ISO-2022-CN-EXT, certain ' +
+      'input characters require multi-byte escape sequences (SS2/SS3 designation) to signal a character set ' +
+      'switch. The vulnerable code writes these escape bytes — ESC, "$", "*", and a set indicator — into the ' +
+      'output buffer without verifying that enough space remains, allowing a 1-to-4-byte write past the end ' +
+      'of the caller-supplied buffer. ' +
+      'CVE-2024-2961 (CVSS 8.8) is the defining instance. The CNEXT exploit chain demonstrated full remote ' +
+      'code execution against PHP applications: an attacker sends crafted multi-byte input to any code path ' +
+      'that calls iconv() or uses the php://filter iconv wrapper. The overflow lands in an adjacent tcache ' +
+      'free chunk on the glibc heap, corrupting its forward pointer (fd). Through careful heap grooming — ' +
+      'arranging allocations so a freed tcache chunk sits directly after the iconv output buffer — the ' +
+      'attacker redirects the next malloc() return to an arbitrary address, achieving a write-what-where ' +
+      'primitive. From there, overwriting __free_hook or the GOT entry for a frequently called function ' +
+      'yields code execution. The bug affected every Linux distribution shipping glibc 2.1.93 through 2.39, ' +
+      'spanning over two decades of deployments. ' +
+      'In the assembly, movl stores each escape byte into the output buffer via an offset from the base ' +
+      'pointer; the critical flaw is the absent cmpl that should compare buf.used against buf.capacity before ' +
+      'each write — addl blindly increments the write cursor past the allocation boundary, and the subsequent ' +
+      'movl overwrites the victim chunk\'s fd_ptr field, redirecting the tcache freelist.',
+    code:
+`# CVE pattern: iconv escape-sequence write overflows output into adjacent heap chunk
+class IconvBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.used = 0
+        self.data = 0
+        self.overflow = 0
+
+    def write_byte(self, val):
+        self.used += 1
+        self.data = val
+        return self.used
+
+    def check_bounds(self):
+        if self.used > self.capacity:
+            self.overflow = self.used - self.capacity
+        return self.overflow
+
+class CharsetConverter:
+    def __init__(self, escape_len):
+        self.escape_len = escape_len
+        self.converted = 0
+        self.escapes_written = 0
+
+    def convert_char(self, buf, char_val):
+        i = 0
+        while i < self.escape_len:
+            buf.write_byte(27)
+            self.escapes_written += 1
+            i += 1
+        buf.write_byte(char_val)
+        self.converted += 1
+        return self.converted
+
+class TcacheChunk:
+    def __init__(self, fd_ptr, size):
+        self.fd_ptr = fd_ptr
+        self.size = size
+        self.corrupted = 0
+
+    def check_metadata(self, expected_fd):
+        if self.fd_ptr != expected_fd:
+            self.corrupted = 1
+        return self.corrupted
+
+output = IconvBuffer(8)
+victim = TcacheChunk(4919, 64)
+conv = CharsetConverter(4)
+conv.convert_char(output, 65)
+conv.convert_char(output, 66)
+output.check_bounds()
+if output.overflow > 0:
+    victim.fd_ptr = 0
+    victim.check_metadata(4919)
+result = output.overflow + victim.corrupted
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'movl stores each escape byte at the current buffer offset without a preceding cmpl against capacity — addl increments used past the allocation boundary on every write_byte call in the convert_char loop, and the final movl that writes char_val lands 2 bytes beyond the buffer, overwriting the adjacent TcacheChunk\'s fd_ptr field the same way CVE-2024-2961\'s 4-byte overflow corrupts a tcache forward pointer to hijack malloc',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
