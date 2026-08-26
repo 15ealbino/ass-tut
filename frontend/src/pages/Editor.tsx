@@ -8624,6 +8624,77 @@ print(result)
       description: 'movl stores each escape byte at the current buffer offset without a preceding cmpl against capacity — addl increments used past the allocation boundary on every write_byte call in the convert_char loop, and the final movl that writes char_val lands 2 bytes beyond the buffer, overwriting the adjacent TcacheChunk\'s fd_ptr field the same way CVE-2024-2961\'s 4-byte overflow corrupts a tcache forward pointer to hijack malloc',
     },
   },
+  {
+    id: 'ub-null-elision',
+    name: 'UNDEFINED BEHAVIOR NULL ELISION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Compiler optimizes away a NULL-pointer safety check because a prior dereference implies the pointer cannot be NULL — attacker maps code at address zero for privilege escalation.',
+    explanation:
+      'Undefined behavior null elision (CWE-476 / CWE-733) is a compiler-induced vulnerability where the C ' +
+      'optimizer removes a security-critical NULL check because the pointer was already dereferenced earlier in ' +
+      'the function. Under the C standard, dereferencing NULL is undefined behavior — so the compiler infers that ' +
+      'a pointer that has been dereferenced "must" be non-NULL, and eliminates any subsequent NULL guard as dead ' +
+      'code. If the pointer actually IS null at runtime (e.g. a failed allocation, an uninitialized struct field), ' +
+      'the absent check lets execution continue with address zero, where the attacker has mapped shellcode via ' +
+      'mmap on older kernels without mmap_min_addr protection. ' +
+      'CVE-2009-1897 (Linux kernel tun_chr_poll) is the textbook example: the tun driver dereferenced a socket ' +
+      'pointer to read its flags, then checked if the pointer was NULL — GCC (correctly, per the standard) ' +
+      'optimized the NULL check away since dereferencing it first constituted UB if NULL, meaning it "could not" ' +
+      'be NULL. An attacker mapped executable code at page zero, triggered the path with a NULL socket, and ' +
+      'achieved kernel-mode code execution. CVE-2009-1895 (Linux kernel, personality flags) similarly allowed ' +
+      'an unprivileged user to map page zero and exploit a removed NULL check for local privilege escalation. ' +
+      'USENIX Security 2023 ("Silent Bugs Matter") systematically found 47 compiler-introduced security bugs in ' +
+      'the Linux kernel caused by UB-driven optimizations, including NULL-check removals, dead-store eliminations ' +
+      'that zeroed passwords, and signed-overflow assumption violations that removed bounds checks. CERT issued ' +
+      'vulnerability note VU#162289 against GCC itself for this behavior class. The Linux kernel adopted ' +
+      '-fno-delete-null-pointer-checks as a mandatory CFLAGS defense in 2009 (commit a3ca86aea5) and ' +
+      '-fwrapv to prevent signed-overflow UB exploitation. ' +
+      'In the assembly, the first movl dereferences the pointer (reading obj.flags from offset 0) before any ' +
+      'guard; cmpl that should check ptr == 0 is ABSENT from the compiled output because the optimizer eliminated ' +
+      'it — addl proceeds to use the zero-derived address, and the CPU executes attacker code mapped at 0x0.',
+    code:
+`# CVE pattern: compiler removes NULL check after prior deref — code at 0x0
+class KernelObj:
+    def __init__(self, flags, handler):
+        self.flags = flags
+        self.handler = handler
+        self.refcount = 1
+
+    def read_flags(self):
+        result = self.flags + self.handler
+        return result
+
+class Driver:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.obj_flags = 0
+        self.checked = 0
+        self.result = 0
+
+    def poll(self, obj):
+        self.obj_flags = obj.flags
+        if obj.handler == 0:
+            self.checked = 1
+        self.result = self.obj_flags + obj.handler
+        return self.result
+
+    def exploit_null(self, shellcode_addr):
+        result = self.obj_flags + shellcode_addr
+        return result
+
+obj = KernelObj(0, 0)
+drv = Driver(64)
+drv.poll(obj)
+mapped_page_zero = 3735928559
+hijacked = drv.exploit_null(mapped_page_zero)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl dereferences obj.flags from the pointer before any NULL guard appears; the compiler eliminates the subsequent cmpl against zero as dead code (since dereferencing implies non-NULL under UB rules) — addl proceeds with the zero-derived address unchecked, and on a system without mmap_min_addr the CPU executes attacker shellcode mapped at page zero',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
