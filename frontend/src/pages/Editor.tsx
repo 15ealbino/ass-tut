@@ -8695,6 +8695,83 @@ print(hijacked)
       description: 'movl dereferences obj.flags from the pointer before any NULL guard appears; the compiler eliminates the subsequent cmpl against zero as dead code (since dereferencing implies non-NULL under UB rules) — addl proceeds with the zero-derived address unchecked, and on a system without mmap_min_addr the CPU executes attacker shellcode mapped at page zero',
     },
   },
+  {
+    id: 'posix-timer-zombie',
+    name: 'POSIX TIMER ZOMBIE RACE',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'POSIX CPU timer handler fires on a zombie task whose structures are concurrently reaped, producing a use-after-free on freed task memory for kernel privilege escalation.',
+    explanation:
+      'POSIX timer zombie race (CWE-362 / CWE-416) exploits a timing window in the Linux kernel\'s POSIX CPU ' +
+      'timer subsystem: handle_posix_cpu_timers() runs in IRQ context on every scheduler tick to check whether ' +
+      'any CPU timers have expired, but it is allowed to execute even when the owning task has transitioned to ' +
+      'EXIT_ZOMBIE state. After a thread calls exit_notify() and releases its sighand lock, the parent process ' +
+      'or debugger can immediately reap the zombie — freeing the task_struct and its embedded timer list. ' +
+      'Meanwhile, handle_posix_cpu_timers() on another CPU still holds a stale reference from its earlier ' +
+      'lock_task_sighand() call: it traverses the now-freed timer list, dereferencing pointers into reclaimed ' +
+      'slab memory. An attacker heap-sprays the freed task_struct slot with controlled data, redirecting the ' +
+      'timer handler\'s function pointer dereference to achieve arbitrary code execution in kernel context. ' +
+      'CVE-2025-38352 (CVSS 7.8, CISA KEV, actively exploited) is the defining instance: the race between ' +
+      'handle_posix_cpu_timers() and posix_cpu_timer_del() on an exiting non-autoreaping task produced a ' +
+      'UAF that the "Chronomaly" PoC weaponized for root on 32-bit Android devices. The September 2025 ' +
+      'Android Security Bulletin confirmed limited, targeted exploitation in the wild. The flaw requires ' +
+      'at least two CPUs: one executing the IRQ timer handler, the other reaping the zombie. Systems with ' +
+      'CONFIG_POSIX_CPU_TIMERS_TASK_WORK disabled (most 32-bit Android kernels) lack the task-work path ' +
+      'that would serialize timer deletion, making them directly exploitable. ' +
+      'In the assembly, movl stores the timer handler address and task state into stack slots; after the zombie ' +
+      'transition, cmpl checks exit_state but the IRQ context on the other CPU has already passed this check — ' +
+      'addl dereferences the freed timer_list pointer, reading attacker-sprayed data from the reclaimed slab.',
+    code:
+`# CVE pattern: IRQ timer fires on zombie task — freed timer list dereferenced
+class TaskStruct:
+    def __init__(self, pid, handler):
+        self.pid = pid
+        self.handler = handler
+        self.exit_state = 0
+        self.timer_val = 0
+        self.reaped = 0
+
+    def exit_notify(self):
+        self.exit_state = 1
+        return self.exit_state
+
+    def reap(self):
+        self.handler = 0
+        self.timer_val = 0
+        self.reaped = 1
+        return self.reaped
+
+class TimerIRQ:
+    def __init__(self, cpu_id):
+        self.cpu_id = cpu_id
+        self.stale_ref = 0
+        self.result = 0
+
+    def lock_sighand(self, task):
+        self.stale_ref = task.handler
+        return self.stale_ref
+
+    def handle_timers(self, task):
+        result = task.handler + task.timer_val
+        self.result = result
+        return self.result
+
+task = TaskStruct(1337, 4196352)
+task.timer_val = 256
+irq = TimerIRQ(1)
+irq.lock_sighand(task)
+task.exit_notify()
+task.reap()
+task.handler = 3735928559
+task.timer_val = 4196608
+leaked = irq.handle_timers(task)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'addl'],
+      description: 'movl stores the timer handler address and task state into stack slots during lock_sighand; after exit_notify sets exit_state=1, reap zeroes the handler — but the IRQ context on another CPU has already captured the stale reference; addl in handle_timers dereferences the freed timer_list slot where the attacker has sprayed 0xDEADBEEF, achieving kernel code execution via the stale pointer',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
