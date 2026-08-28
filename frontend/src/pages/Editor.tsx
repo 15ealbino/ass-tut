@@ -8772,6 +8772,78 @@ print(leaked)
       description: 'movl stores the timer handler address and task state into stack slots during lock_sighand; after exit_notify sets exit_state=1, reap zeroes the handler — but the IRQ context on another CPU has already captured the stale reference; addl in handle_timers dereferences the freed timer_list slot where the attacker has sprayed 0xDEADBEEF, achieving kernel code execution via the stale pointer',
     },
   },
+  {
+    id: 'sctp-asconf-uaf',
+    name: 'SCTP ASCONF TRANSPORT UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'SCTP ASCONF identity mismatch frees the cached transport pointer while a subsequent wildcard DEL-IP dereferences it, enabling root and container escape.',
+    explanation:
+      'SCTP ASCONF transport use-after-free (CVE-2026-64564 / SCTPhantom / CWE-416) exploits an identity ' +
+      'mismatch in the Linux kernel\'s SCTP Dynamic Address Reconfiguration (RFC 5061) processing. When an ' +
+      'ASCONF chunk arrives, sctp_process_asconf() caches the transport used to process it in asconf->transport. ' +
+      'However, __sctp_rcv_asconf_lookup() locates the ASCONF through its Address Parameter, which may reference ' +
+      'a different transport than the packet\'s source address. An attacker crafts an ordered ASCONF sequence: ' +
+      'a DEL-IP for a non-source address passes the validation check and frees the transport referenced by ' +
+      'asconf->transport; a subsequent wildcard DEL-IP (0.0.0.0) then reuses the now-dangling pointer via ' +
+      'sctp_assoc_set_primary() and sctp_assoc_del_nonprimary_peers(), triggering a use-after-free. ' +
+      'The bug was introduced in Linux 2.6.25 (December 2007) and lay dormant for 18 years. Discovered by ' +
+      'Tencent Zhuque Lab and disclosed in August 2026, SCTPhantom achieved root on Ubuntu 24.04, Debian 13, ' +
+      'Rocky Linux 9, and kernels 5.14 through 7.2-rc. Because SCTP sockets are available inside unprivileged ' +
+      'network namespaces, the exploit also achieves container escape — the freed transport object is reclaimed ' +
+      'via cross-cache slab spraying with a cred struct, and overwriting uid/gid to zero escalates to root on ' +
+      'the host. Patches landed in stable kernels 6.6.148, 6.12.101, 6.18.42, and 7.1.6. ' +
+      'In the assembly, movl stores the transport handler and addr fields into stack slots during process_asconf; ' +
+      'del_ip\'s movl zeroes them (freeing the transport), but the cached asconf->transport pointer is never ' +
+      'updated — wildcard_del\'s addl dereferences the freed slot where the attacker has sprayed a zeroed cred ' +
+      'struct, achieving root via the stale transport pointer.',
+    code:
+`# CVE pattern: ASCONF identity mismatch frees cached transport — UAF to root
+class Transport:
+    def __init__(self, addr, handler):
+        self.addr = addr
+        self.handler = handler
+        self.refcount = 1
+        self.freed = 0
+
+    def release(self):
+        self.handler = 0
+        self.addr = 0
+        self.freed = 1
+        self.refcount = 0
+        return self.freed
+
+class AsconfState:
+    def __init__(self, src_transport, cached_transport):
+        self.src_transport = src_transport
+        self.cached = cached_transport
+        self.processed = 0
+
+    def del_ip(self, target):
+        if target.addr == self.cached.addr:
+            target.release()
+            self.processed += 1
+        return self.processed
+
+    def wildcard_del(self):
+        result = self.cached.handler + self.cached.addr
+        self.processed += 1
+        return result
+
+t1 = Transport(167772161, 4196352)
+t2 = Transport(167772162, 4196608)
+asconf = AsconfState(t1, t2)
+asconf.del_ip(t2)
+t2.handler = 3735928559
+t2.addr = 0
+leaked = asconf.wildcard_del()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the transport handler and addr fields during construction; del_ip\'s movl zeroes them (simulating free) but the cached asconf->transport pointer is never cleared — wildcard_del\'s addl dereferences the freed slot where the attacker has sprayed 0xDEADBEEF, achieving kernel code execution via the stale SCTP transport pointer',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
