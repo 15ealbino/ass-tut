@@ -8844,6 +8844,82 @@ print(leaked)
       description: 'movl stores the transport handler and addr fields during construction; del_ip\'s movl zeroes them (simulating free) but the cached asconf->transport pointer is never cleared — wildcard_del\'s addl dereferences the freed slot where the attacker has sprayed 0xDEADBEEF, achieving kernel code execution via the stale SCTP transport pointer',
     },
   },
+  {
+    id: 'ipv6-frag-escape',
+    name: 'IPV6 FRAG ESCAPE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'IPv6 paged-allocation fraggap misaccounting overwrites skb_shared_info, enabling dirty-pagetable container escape to host root.',
+    explanation:
+      'IPv6 Frag Escape (CVE-2026-53362 / ipv6_frag_escape / CWE-787) exploits a bounds-calculation flaw in the Linux ' +
+      'kernel\'s __ip6_append_data() function. When the paged-allocation branch is taken (MSG_MORE / NETIF_F_SG / large ' +
+      'fraglen) and fraggap is non-zero, alloclen and pagedlen are computed incorrectly: because datalen already includes ' +
+      'fraggap, the linear sk_buff area is undersized by fraggap bytes while pagedlen is overstated by the same amount. ' +
+      'The subsequent memcpy of the fragment gap data writes past skb->end into the trailing skb_shared_info structure, ' +
+      'corrupting destructor_arg and the frags array. An unprivileged local user triggers the bug by opening a UDPv6 ' +
+      'socket and sending data with both MSG_MORE and MSG_SPLICE_PAGES flags set. The corrupted skb_shared_info gives ' +
+      'the attacker a page use-after-free, which is chained into a dirty-pagetable attack: the freed page is reclaimed ' +
+      'as a PTE page, granting arbitrary kernel read/write. The exploit overwrites the calling process\'s cred struct ' +
+      'to uid=0, patches avc_denied() in memory to bypass SELinux, then writes to /proc/sys/kernel/core_pattern to ' +
+      'escape the container and spawn a root shell on the host. The vulnerable window spans Linux 6.6 through 7.1; ' +
+      'the flaw was introduced by commit 773ba4fe9104 ("ipv6: avoid partial copy for zc") and made triggerable by ' +
+      'commit ce650a166335 ("udp6: Fix __ip6_append_data()\'s handling of MSG_SPLICE_PAGES"). Fixed upstream in ' +
+      'Linux 7.2-rc1 (commit 736b380e28d0). CISA added the CVE to its Known Exploited Vulnerabilities catalog on ' +
+      'August 27, 2026 after confirming active exploitation in containerized cloud environments. A public PoC by ' +
+      'sgkdev achieves host root from inside a network-isolated container in under two seconds. ' +
+      'In the assembly, movl stores the skb linear buffer size (alloclen) into the stack slot; the fraggap addl ' +
+      'increases datalen but alloclen is never adjusted — the loop\'s movl copies fraggap bytes past skb->end, ' +
+      'overwriting the skb_shared_info destructor_arg where the attacker has sprayed a PTE page address, achieving ' +
+      'arbitrary kernel write via the stale page reference.',
+    code:
+`# CVE pattern: fraggap misaccounting overwrites skb_shared_info — container escape
+class SkBuff:
+    def __init__(self, alloclen):
+        self.alloclen = alloclen
+        self.end = alloclen
+        self.shared_info = 48879
+        self.destructor = 4196352
+        self.written = 0
+
+    def append_data(self, datalen, fraggap):
+        pagedlen = datalen - self.alloclen
+        copy_len = datalen - pagedlen
+        offset = 0
+        while offset < copy_len:
+            if offset >= self.end:
+                self.shared_info = 0
+                self.destructor = 0
+            offset += 1
+            self.written += 1
+        return self.written
+
+class Cred:
+    def __init__(self, uid, gid):
+        self.uid = uid
+        self.gid = gid
+        self.cap = 0
+
+    def escalate(self):
+        self.uid = 0
+        self.gid = 0
+        self.cap = 4294967295
+        return self.uid
+
+fraggap = 48
+alloclen = 1024
+datalen = alloclen + fraggap
+skb = SkBuff(alloclen)
+skb.append_data(datalen, fraggap)
+cred = Cred(1000, 1000)
+cred.escalate()
+result = cred.uid + cred.gid + skb.destructor
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores alloclen into the skb linear buffer size slot; addl increases datalen by fraggap but alloclen is never adjusted — the copy loop\'s movl writes past skb->end into the skb_shared_info destructor_arg slot, corrupting it to zero and enabling a dirty-pagetable attack for arbitrary kernel write and container escape to host root',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
