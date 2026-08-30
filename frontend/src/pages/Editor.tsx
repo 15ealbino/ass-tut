@@ -8920,6 +8920,104 @@ print(result)
       description: 'movl stores alloclen into the skb linear buffer size slot; addl increases datalen by fraggap but alloclen is never adjusted — the copy loop\'s movl writes past skb->end into the skb_shared_info destructor_arg slot, corrupting it to zero and enabling a dirty-pagetable attack for arbitrary kernel write and container escape to host root',
     },
   },
+  {
+    id: 'stale-tlb-flush',
+    name: 'STALE TLB FLUSH',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Missing TLB invalidation after page-table permission revocation lets an attacker read or write freed kernel pages through a stale cached translation.',
+    explanation:
+      'Stale TLB Entry (CWE-672 / CWE-1264) exploits a missing or delayed Translation Lookaside Buffer invalidation ' +
+      'after the kernel modifies a page-table entry. The TLB is a per-CPU cache that stores recent virtual-to-physical ' +
+      'address translations so the MMU can skip the expensive four-level page-table walk on every memory access. When ' +
+      'the kernel frees a page, changes permissions, or migrates a mapping, it must issue a TLB flush (INVLPG on x86) ' +
+      'for every CPU that may have cached the old entry. If the flush is omitted or arrives too late, the CPU continues ' +
+      'using the stale translation — reads and writes hit a physical page the kernel believes is freed or read-only, ' +
+      'bypassing all page-table permission checks silently. ' +
+      'CVE-2025-29934 (AMD, CVSS 6.0) allowed a privileged attacker to run an SEV-SNP guest using stale TLB entries, ' +
+      'breaking the confidentiality guarantee of AMD\'s encrypted virtual-machine technology. CVE-2025-37964 (Linux ' +
+      'kernel x86/mm) fixed a window where TLB flushes were inadvertently skipped during page-table updates, leaving ' +
+      'a race where another CPU could write through the stale mapping before the IPI-broadcast flush propagated. ' +
+      'CVE-2024-56559 (Linux kernel KASAN shadow) caused soft lockups from incorrect TLB flush handling of sanitizer ' +
+      'shadow virtual addresses. The pattern is especially dangerous in hypervisors: a stale guest-physical-to-host-' +
+      'physical translation can break VM isolation entirely, letting a malicious guest read or corrupt host memory — ' +
+      'the same class of flaw that underpins Foreshadow/L1TF (CVE-2018-3646). ' +
+      'In the assembly, cmpl checks cached_vaddr against the requested address and finds a TLB hit; the subsequent ' +
+      'movl returns cached_paddr even though revoke\'s movl zeroed the PTE writable and present bits — no INVLPG-' +
+      'equivalent flush cleared the TLB cache, so write_through_stale\'s movl overwrites cred_uid to zero through ' +
+      'the stale physical mapping, achieving a kernel write on a page the kernel believes is freed.',
+    code:
+`# CVE pattern: missing TLB invalidation lets stale mapping bypass permission revoke
+class PageTableEntry:
+    def __init__(self, vaddr, paddr, writable):
+        self.vaddr = vaddr
+        self.paddr = paddr
+        self.writable = writable
+        self.present = 1
+
+    def revoke(self):
+        self.writable = 0
+        self.present = 0
+        return self.present
+
+class TLBCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.cached_vaddr = 0
+        self.cached_paddr = 0
+        self.cached_perm = 0
+        self.valid = 0
+        self.hits = 0
+
+    def insert(self, vaddr, paddr, perm):
+        self.cached_vaddr = vaddr
+        self.cached_paddr = paddr
+        self.cached_perm = perm
+        self.valid = 1
+        return self.valid
+
+    def lookup(self, vaddr):
+        if self.valid == 1 and self.cached_vaddr == vaddr:
+            self.hits += 1
+            return self.cached_paddr
+        return 0
+
+    def flush(self, vaddr):
+        if self.cached_vaddr == vaddr:
+            self.valid = 0
+            self.cached_perm = 0
+        return self.valid
+
+class KernelPage:
+    def __init__(self, base):
+        self.base = base
+        self.cred_uid = 1000
+        self.secret = 3405691582
+        self.corrupted = 0
+
+    def write_through_stale(self, value):
+        self.cred_uid = value
+        self.corrupted = 1
+        return self.corrupted
+
+pte = PageTableEntry(4096, 8192, 1)
+tlb = TLBCache(512)
+tlb.insert(pte.vaddr, pte.paddr, pte.writable)
+pte.revoke()
+should_flush = 0
+if should_flush == 1:
+    tlb.flush(pte.vaddr)
+stale = tlb.lookup(4096)
+page = KernelPage(stale)
+page.write_through_stale(0)
+result = page.cred_uid + page.corrupted
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks cached_vaddr against the requested address and finds a TLB hit — movl returns the cached_paddr even though revoke\'s movl zeroed the PTE writable and present bits; no INVLPG-equivalent flush invalidated the cache, so write_through_stale\'s movl overwrites cred_uid to 0 through the stale physical mapping, achieving kernel write on a page the kernel believes is freed',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
