@@ -14,7 +14,12 @@ import subprocess
 
 import pytest
 
-from app.cycle_cost import DEFAULT_WEIGHT, analyze_cycles, cycle_weight
+from app.cycle_cost import (
+    DEFAULT_WEIGHT,
+    _WEIGHT_PREFIXES,
+    analyze_cycles,
+    cycle_weight,
+)
 
 # asyncio_mode=auto (pytest.ini) auto-detects the async e2e tests; the sync unit
 # tests below need no marker.
@@ -76,6 +81,23 @@ def test_cycle_weight(mnemonic, expected):
 def test_default_weight_is_one():
     # The whole model hangs on cheap staples costing 1; guard the constant.
     assert DEFAULT_WEIGHT == 1
+
+
+def test_weight_prefixes_no_shadowing():
+    """Ordering invariant for the prefix table: under first-match-wins lookup, an
+    entry is unreachable if any EARLIER entry's prefix is a prefix of it — every
+    mnemonic that would match the later entry already matched the earlier one. A
+    future addition that violated this (e.g. adding "id" before "idiv") would
+    silently change weights, so assert the invariant directly rather than trust
+    manual ordering.
+    """
+    prefixes = [p for p, _ in _WEIGHT_PREFIXES]
+    for i, earlier in enumerate(prefixes):
+        for later in prefixes[i + 1:]:
+            assert not later.startswith(earlier), (
+                f"'{later}' is shadowed by earlier prefix '{earlier}' — reorder so "
+                f"the more specific prefix comes first"
+            )
 
 
 # ─── Unit: analyze_cycles (pure, no gcc) ─────────────────────────────────────

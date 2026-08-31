@@ -99,6 +99,14 @@ def analyze_cycles(
     stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` and
     the other per-line passes). Out-of-range indices are skipped defensively.
 
+    Summation convention: each mapped instruction's weight is added into its
+    Python line's ``cycle_estimate`` and once into ``total_cycles``. The
+    ``.loc``-derived mapping assigns every asm line to a single Python line, so
+    in practice the per-line estimates partition the total exactly. Were an asm
+    index ever shared across two lines' ``asm_lines``, its weight would be added
+    into both lines and into the total for each — the same additive convention
+    the sibling per-line passes use.
+
     The summary mirrors ``analyze_cost``'s shape so the two read as siblings::
 
         {
