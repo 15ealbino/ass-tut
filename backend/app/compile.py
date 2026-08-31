@@ -12,6 +12,7 @@ from functools import partial
 from typing import Dict, List, Set, Tuple
 
 from app.asm_glossary import build_asm_glossary
+from app.cycle_cost import analyze_cycles
 from app.transpiler import TranspileError, build_line_map, transpile
 
 logger = logging.getLogger(__name__)
@@ -778,6 +779,10 @@ async def compile_python(python_source: str) -> dict:
     # Split each Python line's memory movement into loads vs stores. Independent
     # of the passes above; runs over the same already-mapped display asm.
     memory_summary = analyze_memory_traffic(line_map, asm_lines)
+    # Weight each Python line's instructions by approximate cycle cost so the
+    # costliest lines — not merely the longest — stand out. Sharpens analyze_cost's
+    # raw instruction count into a latency-oriented ranking.
+    cycle_summary = analyze_cycles(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
 
@@ -792,5 +797,6 @@ async def compile_python(python_source: str) -> dict:
         "register_summary": register_summary,
         "stack_summary": stack_summary,
         "memory_summary": memory_summary,
+        "cycle_summary": cycle_summary,
         "asm_glossary": asm_glossary,
     }

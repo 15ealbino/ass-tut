@@ -42,6 +42,12 @@ class LineMapping(BaseModel):
     # by direction. Only nonzero of {"loads", "stores"} are present. Empty for the
     # pyghidra pipeline, which computes no per-line memory traffic.
     memory_counts: Dict[str, int] = Field(default_factory=dict)
+    # Cycle-cost estimate: the summed approximate relative cycle weight of the
+    # instructions this Python line compiled to (a divide weighs ~20, a multiply
+    # or call ~3-4, most staples 1). A latency-oriented sharpening of asm_count —
+    # the costliest line is not always the longest. Zero for the pyghidra
+    # pipeline, which computes no per-line cycle estimate.
+    cycle_estimate: int = 0
 
 
 class Hotspot(BaseModel):
@@ -83,6 +89,21 @@ class MemorySummary(BaseModel):
     memory_totals: Dict[str, int] = Field(default_factory=lambda: {"loads": 0, "stores": 0})
 
 
+class CycleHotspot(BaseModel):
+    py_line: int
+    cycles: int
+
+
+class CycleSummary(BaseModel):
+    # Program-wide cycle-cost estimate.
+    #   total_cycles — sum of every mapped instruction's approximate cycle weight.
+    #   hotspots     — Python lines ranked by estimated cost (costliest first),
+    #                  the cycle-weighted counterpart to CostSummary.hotspots.
+    # These are coarse RELATIVE teaching estimates, not cycle-accurate figures.
+    total_cycles: int = 0
+    hotspots: List[CycleHotspot] = Field(default_factory=list)
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -120,6 +141,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line memory
     # traffic).
     memory_summary: Optional[MemorySummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line cycle
+    # estimate).
+    cycle_summary: Optional[CycleSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)

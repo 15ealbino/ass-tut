@@ -50,6 +50,10 @@ export interface LineMapping {
   // Memory traffic: how many memory reads (loads) and writes (stores) this
   // line's asm performs. Only nonzero of {loads, stores} are present.
   memory_counts?: Record<string, number>
+  // Cycle-cost estimate: summed approximate relative cycle weight of this line's
+  // instructions (divide ~20, multiply/call ~3-4, most staples 1). A latency-
+  // oriented sharpening of asm_count — the costliest line isn't always the longest.
+  cycle_estimate?: number
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
@@ -83,6 +87,16 @@ export interface MemorySummary {
   memory_totals: Record<string, number>
 }
 
+export interface CycleHotspot { py_line: number; cycles: number }
+
+export interface CycleSummary {
+  // Program-wide cycle-cost estimate: sum of every mapped instruction's
+  // approximate cycle weight, plus the Python lines ranked by estimated cost
+  // (costliest first). Coarse RELATIVE teaching estimates, not cycle-accurate.
+  total_cycles: number
+  hotspots: CycleHotspot[]
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -107,6 +121,8 @@ export interface CompileResponse {
   // Present for the transpile pipeline; absent/null for pyghidra.
   stack_summary?: StackSummary | null
   memory_summary?: MemorySummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  cycle_summary?: CycleSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
 }
