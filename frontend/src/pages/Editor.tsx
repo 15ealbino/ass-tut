@@ -9018,6 +9018,99 @@ print(result)
       description: 'cmpl checks cached_vaddr against the requested address and finds a TLB hit — movl returns the cached_paddr even though revoke\'s movl zeroed the PTE writable and present bits; no INVLPG-equivalent flush invalidated the cache, so write_through_stale\'s movl overwrites cred_uid to 0 through the stale physical mapping, achieving kernel write on a page the kernel believes is freed',
     },
   },
+  {
+    id: 'stackrot-vma-uaf',
+    name: 'STACKROT VMA UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Maple tree node replacement during VMA stack expansion frees the old node via RCU callback while a concurrent reader still dereferences it, achieving use-after-free privilege escalation.',
+    explanation:
+      'StackRot (CVE-2023-3269 / CWE-416 / CVSS 7.8) is a use-after-free-by-RCU (UAFBR) vulnerability in the Linux ' +
+      'kernel\'s memory management subsystem, introduced in kernel 6.1 when the Virtual Memory Area (VMA) tree was ' +
+      'migrated from red-black trees to maple trees. When the user-space stack expands and closes a gap between two ' +
+      'adjacent VMAs, the maple tree replaces the affected node: it allocates a new node with the updated boundaries ' +
+      'and schedules the old node for deallocation via call_rcu(). The critical flaw is that VMA lookups on the read ' +
+      'path (e.g., page faults, madvise, mbind) only acquire the MM read lock (mmap_read_lock) and do NOT enter an ' +
+      'RCU read-side critical section. Because the RCU callback fires after all pre-existing RCU critical sections ' +
+      'complete — but MM read-lock holders never register as RCU readers — the old maple node can be freed while a ' +
+      'concurrent thread still holds a pointer to it and is actively walking its slots. The attacker forces the race ' +
+      'by growing the stack from one thread while another performs a VMA lookup, then sprays the freed SLAB_TYPESAFE' +
+      '_BY_RCU slab with controlled data via cross-cache reclamation, redirecting the stale node\'s VMA pointers to ' +
+      'attacker-controlled memory. This was the first publicly demonstrated exploitation of a UAFBR bug class, ' +
+      'proving that the RCU deferral window — previously considered too narrow to hit — is reliably exploitable even ' +
+      'without CONFIG_PREEMPT or CONFIG_SLAB_MERGE_DEFAULT. CVE-2023-4611 (mbind vs VMA-locked page fault, CVSS 7.0) ' +
+      'is a closely related VMA race where mbind() frees a VMA that a concurrent page fault still references under ' +
+      'the per-VMA lock. Fixed in kernels 6.1.37, 6.3.11, and 6.4.1 by ensuring maple tree node replacements during ' +
+      'stack expansion are performed under the MM write lock. ' +
+      'In the assembly, movl stores the maple node\'s vma_start and vma_end fields into stack slots during the initial ' +
+      'VMA setup; expand_stack\'s movl zeros the gap field and rcu_free\'s movl clears all three fields — but the ' +
+      'reader\'s addl in lookup_vma still sums vma_start + vma_end from the same stack offsets, now containing ' +
+      'attacker-sprayed values (0xDEADBEEF, 0x400A00) from the recycled slab, turning the stale maple node pointer ' +
+      'into a controlled read primitive for kernel privilege escalation.',
+    code:
+`# CVE pattern: maple tree node freed by RCU while VMA reader holds stale pointer
+class MapleNode:
+    def __init__(self, vma_start, vma_end, gap):
+        self.vma_start = vma_start
+        self.vma_end = vma_end
+        self.gap = gap
+        self.freed = 0
+        self.refcount = 1
+
+    def rcu_free(self):
+        self.vma_start = 0
+        self.vma_end = 0
+        self.gap = 0
+        self.freed = 1
+        return self.freed
+
+class VMAManager:
+    def __init__(self, mm_read_lock):
+        self.mm_read_lock = mm_read_lock
+        self.rcu_section = 0
+        self.stale_ptr = 0
+        self.result = 0
+
+    def expand_stack(self, node):
+        node.gap = 0
+        new_start = node.vma_start + node.vma_end
+        return new_start
+
+    def lookup_vma(self, node):
+        self.stale_ptr = 1
+        self.result = node.vma_start + node.vma_end
+        return self.result
+
+class Attacker:
+    def __init__(self, payload):
+        self.payload = payload
+        self.escalated = 0
+
+    def spray_freed_slab(self, node):
+        node.vma_start = self.payload
+        node.vma_end = 4196352
+        return node.vma_start
+
+    def escalate(self):
+        self.escalated = 1
+        return self.escalated
+
+old_node = MapleNode(134217728, 4096, 8192)
+mgr = VMAManager(1)
+mgr.expand_stack(old_node)
+old_node.rcu_free()
+attacker = Attacker(3735928559)
+attacker.spray_freed_slab(old_node)
+leaked = mgr.lookup_vma(old_node)
+attacker.escalate()
+result = leaked + attacker.escalated
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the maple node\'s vma_start and vma_end fields during construction; expand_stack\'s movl zeros the gap and rcu_free\'s movl clears all fields — but lookup_vma\'s addl still sums vma_start + vma_end from the same stack offsets, now containing attacker-sprayed values (0xDEADBEEF, 0x400A00) from the recycled slab, achieving controlled read through the stale maple node pointer',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
