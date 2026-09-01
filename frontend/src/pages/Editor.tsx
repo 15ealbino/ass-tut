@@ -9111,6 +9111,95 @@ print(result)
       description: 'movl stores the maple node\'s vma_start and vma_end fields during construction; expand_stack\'s movl zeros the gap and rcu_free\'s movl clears all fields — but lookup_vma\'s addl still sums vma_start + vma_end from the same stack offsets, now containing attacker-sprayed values (0xDEADBEEF, 0x400A00) from the recycled slab, achieving controlled read through the stale maple node pointer',
     },
   },
+  {
+    id: 'branch-history-injection',
+    name: 'BRANCH HISTORY INJECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Attacker poisons the CPU Branch History Buffer in user mode to steer kernel indirect branch predictions toward disclosure gadgets, leaking privileged memory via cache side channels.',
+    explanation:
+      'Branch History Injection (BHI / Spectre-BHB, CVE-2022-0001, CVE-2024-2201 / CWE-1303) is a speculative ' +
+      'execution side-channel attack that bypasses hardware mitigations for Spectre v2, including Intel\'s Enhanced ' +
+      'Indirect Branch Restricted Speculation (eIBRS) and ARM\'s CSV2. The Branch History Buffer (BHB) — a CPU ' +
+      'structure recording the direction and target of recent branches — is shared across privilege levels and not ' +
+      'cleared on user-to-kernel transitions even with eIBRS enabled. The attacker executes a crafted sequence of ' +
+      'branches in user mode to populate the BHB with a specific collision pattern, then performs a syscall. In ' +
+      'kernel mode, when the CPU encounters an indirect branch (e.g., a function pointer dispatch), the poisoned ' +
+      'BHB steers the branch predictor to select a disclosure gadget — a snippet of kernel code that speculatively ' +
+      'loads data from an attacker-chosen address and encodes it into the cache via a dependent access. The attacker ' +
+      'then uses Flush+Reload from user space to extract the cached data byte by byte. VUSec researchers demonstrated ' +
+      'leaking arbitrary kernel memory at 3.5 kB/sec on Intel CPUs from Skylake through Alder Lake. Native BHI ' +
+      '(CVE-2024-2201) proved that even without eBPF JIT, sufficient native gadgets exist in the kernel for full ' +
+      'exploitation, rendering FineIBT and privileged-eBPF-disable mitigations insufficient. Mitigations include ' +
+      'BHI_DIS_S on newer CPUs and costly software BHB-clearing loops on syscall entry (~10% overhead). ' +
+      'In the assembly, the movl instructions build the BHB pollution pattern — each cmpl/je pair records a ' +
+      'taken-or-not-taken outcome into the branch history shift register; the carefully chosen sequence aliases with ' +
+      'the kernel\'s indirect branch predictor entry, and the final addl encodes the speculatively accessed secret ' +
+      'into a cache line offset for Flush+Reload extraction.',
+    code:
+`# CVE pattern: BHB poisoning bypasses eIBRS to leak kernel memory
+class BranchHistoryBuffer:
+    def __init__(self, depth):
+        self.depth = depth
+        self.history = 0
+        self.entries = 0
+        self.poisoned = 0
+
+    def record_branch(self, taken):
+        self.history = self.history * 2
+        if taken > 0:
+            self.history = self.history + 1
+        self.entries = self.entries + 1
+        return self.history
+
+class SpeculativeEngine:
+    def __init__(self, eibrs_on):
+        self.eibrs = eibrs_on
+        self.predicted = 0
+        self.gadget_hit = 0
+        self.leaked = 0
+
+    def predict_indirect(self, bhb):
+        self.predicted = bhb.history
+        return self.predicted
+
+    def exec_disclosure_gadget(self, secret):
+        self.gadget_hit = 1
+        self.leaked = secret * 64
+        return self.leaked
+
+class CacheChannel:
+    def __init__(self, lines):
+        self.lines = lines
+        self.probed = 0
+        self.extracted = 0
+
+    def flush_reload(self, encoded):
+        self.probed = encoded + self.lines
+        self.extracted = self.probed - self.lines
+        return self.extracted
+
+bhb = BranchHistoryBuffer(195)
+i = 0
+while i < 24:
+    taken = 1
+    if i > 11:
+        taken = 0
+    bhb.record_branch(taken)
+    i += 1
+bhb.poisoned = 1
+cpu = SpeculativeEngine(1)
+target = cpu.predict_indirect(bhb)
+secret = cpu.exec_disclosure_gadget(3735928559)
+cache = CacheChannel(64)
+leaked = cache.flush_reload(secret)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'je'],
+      description: 'cmpl/je pairs form the BHB pollution pattern — each taken-or-not-taken branch outcome shifts into the history register; the crafted sequence collides with the kernel\'s indirect branch predictor entry, steering speculative execution to a disclosure gadget that leaks privileged memory through dependent cache access',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
