@@ -9200,6 +9200,92 @@ print(leaked)
       description: 'cmpl/je pairs form the BHB pollution pattern — each taken-or-not-taken branch outcome shifts into the history register; the crafted sequence collides with the kernel\'s indirect branch predictor entry, steering speculative execution to a disclosure gadget that leaks privileged memory through dependent cache access',
     },
   },
+  {
+    id: 'slam-lam-spectre',
+    name: 'SLAM ADDRESS MASKING',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Attacker exploits CPU Linear Address Masking to bypass canonicality checks and speculatively chase kernel pointers through unmasked gadgets, leaking arbitrary privileged memory via address-translation side channels.',
+    explanation:
+      'SLAM (Spectre based on Linear Address Masking, CVE-2020-12965 / CWE-1303) is a transient execution attack ' +
+      'discovered by VUSec researchers at Vrije Universiteit Amsterdam, presented at IEEE S&P 2024. It targets a new ' +
+      'class of Spectre disclosure gadgets — unmasked gadgets — that become exploitable when CPUs implement address ' +
+      'masking features: Intel Linear Address Masking (LAM), AMD Upper Address Ignore (UAI), or ARM Top Byte Ignore ' +
+      '(TBI). These features allow software to store metadata (tags, type bits) in the upper bits of 64-bit pointers ' +
+      'by relaxing the canonical address check that normally faults on non-canonical addresses. SLAM shows this ' +
+      'relaxation dramatically expands the Spectre attack surface: the attacker crafts a pointer whose upper bits ' +
+      'encode a chosen value while the lower bits point into kernel memory. During speculative execution, the CPU ' +
+      'skips the canonicality check (or a microarchitectural race lets the masking resolve before the fault), allowing ' +
+      'a pointer-chasing gadget — a double dereference pattern ptr -> *ptr -> **ptr — to speculatively load a ' +
+      'kernel secret and encode it into the address-translation cache. Unlike classical Flush+Reload on data caches, ' +
+      'SLAM uses an address-translation-based covert channel (probing TLB/page-table entries), which bypasses ' +
+      'Supervisor Mode Access Prevention (SMAP) mitigations that block userland data-cache probes of kernel lines. ' +
+      'VUSec demonstrated leaking the root password hash from /etc/shadow in kernel memory within 30 seconds on AMD ' +
+      'Zen 2 CPUs (which already support a form of address masking via CVE-2020-12965) and showed the attack applies ' +
+      'to future Intel (LAM, 4- and 5-level paging), AMD (UAI, 5-level paging), and ARM (TBI) processors. All ' +
+      'existing Spectre v2 mitigations (retpoline, eIBRS, IBPB) are insufficient because SLAM exploits Spectre v1-' +
+      'class conditional branch misprediction on the canonicality/bounds check, not indirect branch injection. Linux ' +
+      'maintainers responded by disabling LAM by default in the kernel. ' +
+      'In the assembly, movl stores the tagged pointer with metadata in the upper bits; the speculative addl ' +
+      'dereferences through the pointer-chase chain — each dependent load fans out into a TLB probe, and the final ' +
+      'imull encodes the leaked secret into a page-aligned offset for the address-translation covert channel extraction.',
+    code:
+`# CVE pattern: LAM unmasked gadgets leak kernel memory via speculative pointer chasing
+class LinearAddressMasker:
+    def __init__(self, bits):
+        self.mask_bits = bits
+        self.canonical = 1
+        self.masked_ptr = 0
+        self.unmasked = 0
+
+    def mask_upper(self, addr, tag):
+        self.masked_ptr = addr + tag * 256
+        return self.masked_ptr
+
+    def check_canonical(self, addr):
+        self.canonical = 1
+        self.unmasked = addr
+        return self.canonical
+
+class SpecGadget:
+    def __init__(self):
+        self.ptr = 0
+        self.deref1 = 0
+        self.deref2 = 0
+        self.leaked = 0
+
+    def pointer_chase(self, secret_addr, offset):
+        self.ptr = secret_addr
+        self.deref1 = self.ptr + offset
+        self.deref2 = self.deref1 * 64
+        self.leaked = self.deref2
+        return self.leaked
+
+class TLBChannel:
+    def __init__(self, entries):
+        self.entries = entries
+        self.probed = 0
+        self.extracted = 0
+
+    def evict_reload(self, encoded):
+        self.probed = encoded + self.entries
+        self.extracted = self.probed - self.entries
+        return self.extracted
+
+lam = LinearAddressMasker(63)
+tagged = lam.mask_upper(4096, 42)
+ok = lam.check_canonical(tagged)
+gadget = SpecGadget()
+secret = gadget.pointer_chase(tagged, 3735928559)
+tlb = TLBChannel(512)
+leaked = tlb.evict_reload(secret)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'imull'],
+      description: 'movl stores the LAM-tagged pointer with attacker-controlled metadata in the upper bits; addl speculatively dereferences through the pointer-chase chain — each dependent load bypasses the relaxed canonicality check — and imull encodes the leaked kernel secret into a page-aligned offset for address-translation covert channel extraction, bypassing SMAP by probing TLB entries instead of data cache lines',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
