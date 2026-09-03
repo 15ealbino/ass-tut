@@ -9286,6 +9286,92 @@ print(leaked)
       description: 'movl stores the LAM-tagged pointer with attacker-controlled metadata in the upper bits; addl speculatively dereferences through the pointer-chase chain — each dependent load bypasses the relaxed canonicality check — and imull encodes the leaked kernel secret into a page-aligned offset for address-translation covert channel extraction, bypassing SMAP by probing TLB entries instead of data cache lines',
     },
   },
+  {
+    id: 'load-value-injection',
+    name: 'LOAD VALUE INJECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Attacker injects chosen values into a victim\'s transient data flow by exploiting faulting or assisting loads, hijacking speculative execution to leak secrets from SGX enclaves or privileged contexts.',
+    explanation:
+      'Load Value Injection (LVI, CVE-2020-0551 / INTEL-SA-00334 / CWE-1303) is a transient execution attack ' +
+      'discovered by researchers at KU Leuven, Worcester Polytechnic Institute, Graz University of Technology, and ' +
+      'the University of Michigan, published at IEEE S&P 2020. Unlike Meltdown, which reads secrets speculatively, ' +
+      'LVI reverses the data flow: the attacker causes a victim load instruction to fault, assist, or abort ' +
+      '(e.g., by revoking a page mapping or triggering a microcode assist on a denormalized float), and the CPU\'s ' +
+      'store buffer or line-fill buffer transiently forwards stale attacker-chosen data to the faulting load. The ' +
+      'victim code then speculatively computes on this injected value — dereferencing it as a pointer, using it as ' +
+      'an array index, or branching on it — creating a disclosure gadget that encodes a secret into the cache. The ' +
+      'attacker extracts the secret via Flush+Reload. LVI is especially dangerous against Intel SGX enclaves, where ' +
+      'the OS is untrusted and can freely manipulate page tables to trigger page faults on enclave loads. Because ' +
+      'the injected value is chosen by the attacker and the victim code is trusted, every load in the victim ' +
+      'becomes a potential injection point — making mitigation extremely costly. Intel\'s recommended mitigation ' +
+      'requires inserting LFENCE instructions after every potentially vulnerable load to serialize the pipeline, ' +
+      'imposing 2-19x performance overhead. Unlike Spectre, LVI does not poison branch predictors; it poisons the ' +
+      'data itself at the microarchitectural level. CVSS 5.6 Medium (AV:L/AC:H/PR:L/UI:N/S:C/C:H/I:N/A:N). ' +
+      'In the assembly, movl performs the victim load that transiently receives the attacker-injected value from ' +
+      'the store buffer; the dependent addl and imull speculatively dereference and compute on the poisoned value, ' +
+      'encoding the secret into a cache-line-aligned offset for Flush+Reload extraction.',
+    code:
+`# CVE pattern: LVI hijacks victim loads via faulting microarchitectural forwarding
+class StoreBuffer:
+    def __init__(self, depth):
+        self.depth = depth
+        self.pending = 0
+        self.injected = 0
+        self.forwarded = 0
+
+    def poison_entry(self, value):
+        self.injected = value
+        self.pending = self.pending + 1
+        return self.injected
+
+    def forward_stale(self):
+        self.forwarded = self.injected
+        return self.forwarded
+
+class VictimEnclave:
+    def __init__(self):
+        self.trusted_ptr = 0
+        self.loaded = 0
+        self.computed = 0
+        self.secret = 0
+
+    def enclave_load(self, addr):
+        self.trusted_ptr = addr
+        self.loaded = self.trusted_ptr
+        return self.loaded
+
+    def dependent_compute(self, injected, secret_base):
+        self.secret = secret_base + injected
+        self.computed = self.secret * 64
+        return self.computed
+
+class FlushReload:
+    def __init__(self, lines):
+        self.lines = lines
+        self.probed = 0
+        self.extracted = 0
+
+    def extract(self, encoded):
+        self.probed = encoded + self.lines
+        self.extracted = self.probed - self.lines
+        return self.extracted
+
+sbuf = StoreBuffer(64)
+injected = sbuf.poison_entry(42)
+fwd = sbuf.forward_stale()
+victim = VictimEnclave()
+loaded = victim.enclave_load(fwd)
+leaked = victim.dependent_compute(loaded, 3735928559)
+cache = FlushReload(256)
+extracted = cache.extract(leaked)
+print(extracted)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'movl performs the victim enclave load that transiently receives attacker-injected data from the store buffer or line-fill buffer after a fault/assist; the dependent addl dereferences the poisoned value as a pointer and imull encodes the resulting secret into a cache-line-aligned offset for Flush+Reload side-channel extraction',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
