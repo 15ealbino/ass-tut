@@ -9372,6 +9372,95 @@ print(extracted)
       description: 'movl performs the victim enclave load that transiently receives attacker-injected data from the store buffer or line-fill buffer after a fault/assist; the dependent addl dereferences the poisoned value as a pointer and imull encodes the resulting secret into a cache-line-aligned offset for Flush+Reload side-channel extraction',
     },
   },
+  {
+    id: 'dirty-decrypt',
+    name: 'DIRTY DECRYPT',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker exploits a missing copy-on-write guard in the kernel\'s RxGK decryption path to corrupt the page cache of privileged SUID binaries and escalate to root.',
+    explanation:
+      'DirtyDecrypt (CVE-2026-31635 / CWE-787) is a local privilege escalation vulnerability in the Linux kernel\'s ' +
+      'AF_RXRPC networking stack, discovered by the Zellic and V12 security team in May 2026. The flaw resides in ' +
+      'rxgk_decrypt_skb(), which performs an in-place AES-CBC decryption on network packet data without first ' +
+      'ensuring the underlying pages have been copied-on-write. Because an inverted bounds check accepts oversized ' +
+      'RESPONSE authenticators, the decryption transform writes attacker-controlled ciphertext directly into page ' +
+      'cache pages that may be shared with privileged files — such as SUID-root binaries, /etc/shadow, or ' +
+      '/etc/sudoers. The attacker opens a readable SUID binary (populating the page cache), then sends a crafted ' +
+      'RxGK packet whose decrypted payload overwrites chosen bytes in the cached pages. When the kernel later ' +
+      'executes the corrupted SUID binary, the attacker\'s payload runs as root. Unlike DirtyPipe (CVE-2022-0847), ' +
+      'which abused pipe buffer flags, DirtyDecrypt abuses the cryptographic subsystem\'s failure to isolate its ' +
+      'working memory from the shared page cache — a missing copy-on-write guard that turns an unauthenticated ' +
+      'network transform into an arbitrary page-cache write primitive. The vulnerability affects distributions with ' +
+      'CONFIG_RXGK enabled (Fedora, Arch Linux, openSUSE Tumbleweed). CVSS 7.5 High. Proof-of-concept exploit code ' +
+      'was publicly released, achieving reliable root from an unprivileged local user. ' +
+      'In the assembly, movl stores the oversized authenticator length that passes the inverted bounds check; addl ' +
+      'advances the write offset into the shared page cache region, and the subsequent movl performs the in-place ' +
+      'decryption write that corrupts the privileged file\'s cached pages without triggering copy-on-write.',
+    code:
+`# CVE pattern: DirtyDecrypt page-cache write via missing COW guard in rxgk decrypt
+class PageCache:
+    def __init__(self, pages):
+        self.pages = pages
+        self.shared = 0
+        self.written = 0
+        self.cow_guard = 0
+
+    def map_file(self, file_id):
+        self.shared = file_id
+        self.cow_guard = 0
+        return self.shared
+
+    def write_page(self, offset, data):
+        self.written = offset + data
+        return self.written
+
+class RxgkDecrypt:
+    def __init__(self):
+        self.auth_len = 0
+        self.max_len = 0
+        self.accepted = 0
+        self.decrypted = 0
+
+    def check_bounds(self, auth_len, max_len):
+        self.auth_len = auth_len
+        self.max_len = max_len
+        self.accepted = self.auth_len + self.max_len
+        return self.accepted
+
+    def decrypt_inplace(self, cache_offset, payload):
+        self.decrypted = cache_offset + payload
+        return self.decrypted
+
+class SuidExploit:
+    def __init__(self):
+        self.target = 0
+        self.corrupted = 0
+        self.escalated = 0
+
+    def corrupt_binary(self, page_val, payload):
+        self.corrupted = page_val + payload
+        return self.corrupted
+
+    def execute_suid(self, corrupted):
+        self.escalated = corrupted * 1
+        return self.escalated
+
+cache = PageCache(4096)
+mapped = cache.map_file(1000)
+rxgk = RxgkDecrypt()
+accepted = rxgk.check_bounds(8192, 256)
+written = rxgk.decrypt_inplace(mapped, 3735928559)
+cache_write = cache.write_page(mapped, written)
+suid = SuidExploit()
+corrupted = suid.corrupt_binary(cache_write, 42)
+root = suid.execute_suid(corrupted)
+print(root)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the oversized authenticator length that passes the inverted bounds check in rxgk_decrypt_skb; addl advances the write offset into the shared page cache region and the subsequent movl performs the in-place decryption write that corrupts the privileged SUID binary\'s cached pages without triggering copy-on-write, enabling local privilege escalation to root',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
