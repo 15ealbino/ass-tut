@@ -9461,6 +9461,80 @@ print(root)
       description: 'movl stores the oversized authenticator length that passes the inverted bounds check in rxgk_decrypt_skb; addl advances the write offset into the shared page cache region and the subsequent movl performs the in-place decryption write that corrupts the privileged SUID binary\'s cached pages without triggering copy-on-write, enabling local privilege escalation to root',
     },
   },
+  {
+    id: 'heap-consolidation',
+    name: 'HEAP CONSOLIDATION ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted prev_size and PREV_INUSE metadata trick free() into merging an allocated chunk with an adjacent free region, creating overlapping allocations for arbitrary read/write.',
+    explanation:
+      'Heap consolidation attacks (CWE-122 / CWE-787) exploit the glibc malloc coalescing logic that merges adjacent ' +
+      'free chunks to reduce fragmentation. When free() is called on a chunk, it inspects the PREV_INUSE bit of the ' +
+      'next chunk\'s size field; if cleared, it reads prev_size to locate the preceding chunk and performs backward ' +
+      'consolidation via the unlink macro, merging both into one large free region. An attacker who can corrupt a ' +
+      'chunk\'s prev_size field and clear the PREV_INUSE bit of its neighbor triggers a spurious consolidation that ' +
+      'encompasses still-allocated memory, causing a subsequent malloc to return a pointer that overlaps a live object. ' +
+      'This grants the attacker read/write over that object\'s contents — typically hijacking a function pointer or ' +
+      'vtable to achieve code execution. CVE-2021-3156 (Baron Samedit, sudo 1.8.2–1.9.5p1) used a heap-based buffer ' +
+      'overflow in sudoedit\'s backslash-escape parsing to corrupt heap metadata and trigger overlapping chunk ' +
+      'allocation, escalating any local user to root without a password. CVE-2023-6246 (glibc __vsyslog_internal) ' +
+      'similarly leveraged a heap buffer overflow during syslog formatting to corrupt adjacent chunk metadata, enabling ' +
+      'local privilege escalation on Debian, Ubuntu, and Fedora. The technique remains central to modern exploitation ' +
+      'because glibc\'s consolidation path trusts in-band metadata that resides in attacker-reachable memory. ' +
+      'In the assembly, movl writes the forged prev_size value into the chunk header; subl clears the PREV_INUSE bit ' +
+      'from the neighbor\'s size field, and the subsequent addl during free() follows the corrupted prev_size backward ' +
+      'to compute the merged region base, producing an overlapping allocation that the attacker controls.',
+    code:
+`# CVE pattern: heap consolidation via corrupted prev_size (CVE-2021-3156)
+class HeapChunk:
+    def __init__(self, size):
+        self.prev_size = 0
+        self.size = size
+        self.prev_inuse = 1
+        self.data = 0
+        self.freed = 0
+
+    def write_data(self, val):
+        self.data = val
+        return self.data
+
+class HeapAllocator:
+    def __init__(self):
+        self.total = 0
+        self.consolidated = 0
+        self.overlap_ptr = 0
+
+    def malloc(self, size):
+        chunk = HeapChunk(size)
+        self.total += size
+        return chunk
+
+    def free_chunk(self, chunk, neighbor):
+        chunk.freed = 1
+        if neighbor.prev_inuse == 0:
+            merge_base = neighbor.size + neighbor.prev_size
+            self.consolidated = merge_base
+            self.overlap_ptr = merge_base + chunk.data
+        return self.consolidated
+
+heap = HeapAllocator()
+chunk_a = heap.malloc(128)
+chunk_b = heap.malloc(256)
+chunk_c = heap.malloc(128)
+chunk_a.write_data(3735928559)
+chunk_b.prev_size = 128 + 256
+chunk_b.prev_inuse = 0
+merged = heap.free_chunk(chunk_a, chunk_b)
+overlap = heap.malloc(512)
+overlap.data = merged + 42
+hijacked = overlap.data
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'subl', 'addl'],
+      description: 'movl writes the forged prev_size value into the heap chunk header; subl clears the PREV_INUSE bit from the neighboring chunk\'s size field to fake a free predecessor, and addl during free() follows the corrupted prev_size backward to compute the merged consolidation region, producing an overlapping allocation the attacker uses for arbitrary read/write and code execution',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
