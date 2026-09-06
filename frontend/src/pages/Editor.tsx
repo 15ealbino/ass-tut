@@ -9535,6 +9535,104 @@ print(hijacked)
       description: 'movl writes the forged prev_size value into the heap chunk header; subl clears the PREV_INUSE bit from the neighboring chunk\'s size field to fake a free predecessor, and addl during free() follows the corrupted prev_size backward to compute the merged consolidation region, producing an overlapping allocation the attacker uses for arbitrary read/write and code execution',
     },
   },
+  {
+    id: 'mte-tag-bypass',
+    name: 'MTE TAG BYPASS',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Speculative execution or page use-after-free bypasses ARM Memory Tagging Extension tag checks, defeating hardware memory safety to enable arbitrary kernel code execution.',
+    explanation:
+      'ARM Memory Tagging Extension (MTE), introduced in ARMv8.5-A, assigns 4-bit color tags to every 16-byte ' +
+      'memory granule and checks them on every load and store, providing probabilistic detection of use-after-free ' +
+      'and buffer overflow at the hardware level — an attacker has only a 1-in-16 chance of guessing the correct ' +
+      'tag. However, two independent lines of research have shown MTE can be fully defeated. CVE-2025-0072 (Arm ' +
+      'Mali GPU Valhall and 5th-Gen driver, r29p0 through r53p0) exploits a use-after-free where the GPU driver ' +
+      'maps freed pages into user space via vmf_insert_pfn_prot; because user-space memory mappings bypass MTE ' +
+      'tag checks on physical page access, the attacker reads and writes freed kernel pages without triggering a ' +
+      'tag mismatch, reusing them as page table global directories (PGD) for GPU contexts to achieve arbitrary ' +
+      'kernel read/write and code execution on Pixel 7, 8, and 9 devices. Separately, the TikTag research (2024) ' +
+      'demonstrated that speculative execution leaks MTE tags from arbitrary addresses via cache timing side ' +
+      'channels: TikTag-v1 exploits branch predictor and prefetcher speculation shrinkage, while TikTag-v2 abuses ' +
+      'store-to-load forwarding, both leaking tags with over 95 percent success in under 4 seconds, reducing the ' +
+      '1-in-16 brute-force to a deterministic bypass. Once the tag is known, the attacker crafts pointers with ' +
+      'matching tags, turning any memory corruption primitive into a reliable exploit. In the assembly, movl ' +
+      'performs the speculative memory probe that loads through the guessed tag; cmpl compares the measured cache ' +
+      'timing against the side-channel threshold to infer whether the tag matched; and the subsequent movl writes ' +
+      'the forged tagged pointer that bypasses MTE validation to access freed memory.',
+    code:
+`# CVE pattern: MTE tag bypass via speculation side-channel (CVE-2025-0072 / TikTag)
+class MemoryGranule:
+    def __init__(self, addr, tag):
+        self.addr = addr
+        self.tag = tag
+        self.data = 0
+        self.freed = 0
+
+    def set_data(self, val):
+        self.data = val
+        return self.data
+
+class MTEAllocator:
+    def __init__(self):
+        self.next_tag = 1
+        self.total = 0
+        self.leaked_tag = 0
+
+    def alloc(self, addr):
+        tag = self.next_tag
+        self.next_tag += 1
+        if self.next_tag > 15:
+            self.next_tag = 1
+        granule = MemoryGranule(addr, tag)
+        self.total += 1
+        return granule
+
+    def free(self, granule):
+        granule.freed = 1
+        return granule.tag
+
+    def check_tag(self, ptr_tag, granule):
+        if ptr_tag == granule.tag:
+            return 1
+        return 0
+
+class SpeculativeProbe:
+    def __init__(self):
+        self.cache_hit = 0
+        self.threshold = 50
+        self.probes = 0
+
+    def tiktag_v1(self, guess, target):
+        self.probes += 1
+        timing = 100 - (guess * 6)
+        if timing < self.threshold:
+            self.cache_hit = 1
+            return guess
+        self.cache_hit = 0
+        return 0
+
+mte = MTEAllocator()
+victim = mte.alloc(4096)
+victim.set_data(3735928559)
+secret_tag = mte.free(victim)
+probe = SpeculativeProbe()
+leaked = 0
+i = 1
+while i < 16:
+    result = probe.tiktag_v1(i, victim)
+    if result == secret_tag:
+        leaked = result
+        break
+    i += 1
+valid = mte.check_tag(leaked, victim)
+forged_access = victim.data * valid
+print(forged_access)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl performs the speculative memory access that probes the MTE tag via cache timing; cmpl compares the measured access latency against the side-channel threshold to determine whether the guessed tag matches the freed granule\'s tag, and the subsequent movl writes the forged tagged pointer that bypasses MTE validation to read or write freed memory without triggering a tag-check fault',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
