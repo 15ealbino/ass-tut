@@ -10403,9 +10403,9 @@ export default function EditorPage() {
               MEM:: {formatMemory(result.memory_summary.memory_totals)}
             </span>
           )}
-          {result.branch_summary?.branch_totals && formatBranches(result.branch_summary.branch_totals) && (
+          {result.branch_sense_summary?.branch_totals && formatBranches(result.branch_sense_summary.branch_totals) && (
             <span
-              title={`Branch map — conditional jumps by sense: ${formatBranches(result.branch_summary.branch_totals)}. x86 has parallel SIGNED (jl/jle/jg/jge) and UNSIGNED (jb/jbe/ja/jae) jumps that test the same compare. This transpiler emits all-int C, so gcc emits SIGNED branches — an UNSIGNED branch here would mean a comparison was treated as unsigned, the classic bug that lets a negative length slip past a bounds check.`}
+              title={`Branch map — conditional jumps by sense: ${formatBranches(result.branch_sense_summary.branch_totals)}. x86 has parallel SIGNED (jl/jle/jg/jge) and UNSIGNED (jb/jbe/ja/jae) jumps that test the same compare. This transpiler emits all-int C, so gcc emits SIGNED branches — an UNSIGNED branch here would mean a comparison was treated as unsigned, the classic bug that lets a negative length slip past a bounds check.`}
               style={{
                 fontSize: 9,
                 fontWeight: 700,
@@ -10420,7 +10420,7 @@ export default function EditorPage() {
                 cursor: 'help',
               }}
             >
-              BRANCH:: {formatBranches(result.branch_summary.branch_totals)}
+              BRANCH:: {formatBranches(result.branch_sense_summary.branch_totals)}
             </span>
           )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (
@@ -10463,8 +10463,8 @@ export default function EditorPage() {
             const memTitle = formatMemory(mapping.memory_counts)
               ? ` — mem: ${formatMemory(mapping.memory_counts)}`
               : ''
-            const branchTitle = formatBranches(mapping.branch_counts)
-              ? ` — branch: ${formatBranches(mapping.branch_counts)}`
+            const branchTitle = formatBranches(mapping.branch_sense_counts)
+              ? ` — branch: ${formatBranches(mapping.branch_sense_counts)}`
               : ''
             return (
               <button

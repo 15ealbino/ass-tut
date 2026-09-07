@@ -26,7 +26,7 @@ x86 has **two parallel families** of conditional jumps that read the *same*
 
 It reports two things:
 
-- **Per Python line** — a `branch_counts` map with only the nonzero senses, e.g.
+- **Per Python line** — a `branch_sense_counts` map with only the nonzero senses, e.g.
   `{ "signed": 1, "unconditional": 1 }`.
 - **Program-wide** — a `branch_totals` map, same senses summed across every line
   (empty when the program has no jumps).
@@ -84,7 +84,7 @@ The `for` line compiles (at `gcc -O0 -m32`) to roughly:
         jle     .L3             # SIGNED jump-if-less-or-equal back into the body
 ```
 
-The `for` line's `branch_counts` is `{ "signed": 1, "unconditional": 1 }`. The
+The `for` line's `branch_sense_counts` is `{ "signed": 1, "unconditional": 1 }`. The
 `jle` is signed because `i` is an `int`; if you ever saw `jbe` here instead, the
 loop counter was being compared as `unsigned` — the classic off-by-one /
 wrap-around bug source.
@@ -96,7 +96,7 @@ stack, and memory passes, and runs over the **same** filtered display assembly
 they all consume (the `.loc`-driven `py_line → [asm_line]` map built in
 `_parse_asm_line_map` / `build_line_map`).
 
-- **`classify_branch(mnemonic)`** maps a lowercased mnemonic to exactly one of
+- **`classify_branch_sense(mnemonic)`** maps a lowercased mnemonic to exactly one of
   `"signed"`, `"unsigned"`, `"equality"`, `"unconditional"`, `"other"`
   (overflow/parity jumps), or `None` for any non-jump instruction. Matching is
   **exact-set**, not prefix-based like the mix/glossary tables: jump mnemonics
@@ -104,20 +104,20 @@ they all consume (the `.loc`-driven `py_line → [asm_line]` map built in
   `jne` and `jnb`), so a prefix scan would mis-sort them. The signed, unsigned,
   and equality sets are asserted **disjoint** by a unit test — blurring signed
   and unsigned is the very bug the feature exists to expose.
-- **`analyze_branches(line_map, asm_lines)`** walks each line's mapped asm lines,
+- **`analyze_branch_senses(line_map, asm_lines)`** walks each line's mapped asm lines,
   classifies each instruction's first token, and accumulates per-line
-  `branch_counts` and a program-wide `branch_totals`. Both drop zero senses and
-  order keys by a stable `_BRANCH_ORDER`, mirroring the zero-omitting
+  `branch_sense_counts` and a program-wide `branch_totals`. Both drop zero senses and
+  order keys by a stable `_BRANCH_SENSE_ORDER`, mirroring the zero-omitting
   instruction-mix maps. It mutates `line_map` in place and does not touch any
   field written by the earlier passes.
 
 The result is surfaced through:
 
-- `backend/app/schemas.py` — `LineMapping.branch_counts`, a `BranchSummary`
-  model, and `CompileResponse.branch_summary` (`Optional`, `None` for the
+- `backend/app/schemas.py` — `LineMapping.branch_sense_counts`, a `BranchSenseSummary`
+  model, and `CompileResponse.branch_sense_summary` (`Optional`, `None` for the
   pyghidra pipeline, which has no per-line `.loc` map).
-- `frontend/src/api.ts` — the mirrored `branch_counts` / `BranchSummary` /
-  `branch_summary` types.
+- `frontend/src/api.ts` — the mirrored `branch_sense_counts` / `BranchSenseSummary` /
+  `branch_sense_summary` types.
 - `frontend/src/pages/Editor.tsx` — `formatBranches()` plus the `BRANCH::`
   legend chip and per-line tooltip annotation.
 
@@ -138,7 +138,7 @@ and program-wide.
 - The `loop`/`loope`/`jecxz` family (gcc `-O0` never emits it for this
   transpiler's code; classified `other` if ever seen, not specially handled).
 - Per-line branch analysis for the **pyghidra** pipeline — like every other
-  per-line pass, it has no `.loc` line map, so `branch_summary` is `None` there.
+  per-line pass, it has no `.loc` line map, so `branch_sense_summary` is `None` there.
 
 ## Running the tests
 
@@ -150,7 +150,7 @@ SECRET_KEY=test-secret pytest tests/test_branch_map.py -q
 
 The suite has two layers, mirroring `test_memory_traffic.py`:
 
-- **Unit tests** for `classify_branch` and `analyze_branches` run everywhere —
+- **Unit tests** for `classify_branch_sense` and `analyze_branch_senses` run everywhere —
   they need no compiler.
 - **End-to-end `/compile` tests** exercise the real transpiler + gcc pipeline and
   assert the branch signal reaches the API response (a loop yields signed and no

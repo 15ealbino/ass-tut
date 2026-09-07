@@ -651,12 +651,12 @@ _UNSIGNED_JUMPS = frozenset({
 _OTHER_JUMPS = frozenset({"jo", "jno", "jp", "jpe", "jnp", "jpo"})
 
 # Stable display / serialisation order for the branch-sense maps.
-_BRANCH_ORDER = {
+_BRANCH_SENSE_ORDER = {
     "signed": 0, "unsigned": 1, "equality": 2, "unconditional": 3, "other": 4,
 }
 
 
-def classify_branch(mnemonic: str) -> str | None:
+def classify_branch_sense(mnemonic: str) -> str | None:
     """Classify an x86 jump mnemonic by the *sense* of the branch it takes.
 
     `mnemonic` is the lowercased first whitespace-separated token of an
@@ -682,26 +682,30 @@ def classify_branch(mnemonic: str) -> str | None:
     return None
 
 
-def _ordered_branch_map(counts: Dict[str, int]) -> Dict[str, int]:
+def _ordered_branch_sense_map(counts: Dict[str, int]) -> Dict[str, int]:
     """Return `counts` with zero entries dropped and keys in display order."""
     return {
         sense: counts[sense]
-        for sense in sorted(counts, key=lambda s: _BRANCH_ORDER.get(s, 99))
+        for sense in sorted(counts, key=lambda s: _BRANCH_SENSE_ORDER.get(s, 99))
         if counts[sense] > 0
     }
 
 
-def analyze_branches(
+def analyze_branch_senses(
     line_map: Dict[int, dict],
     asm_lines: List[str],
 ) -> dict:
-    """Annotate each ``line_map`` entry with a ``branch_counts`` map and return a
-    program-wide summary ``{"branch_totals": {sense: count, ...}}``. Mutates
-    ``line_map`` in place.
+    """Annotate each ``line_map`` entry with a ``branch_sense_counts`` map and
+    return a program-wide summary ``{"branch_totals": {sense: count, ...}}``.
+    Mutates ``line_map`` in place.
+
+    Named ``*_sense*`` to coexist with the separate branch-flow-map pass
+    (``analyze_branches`` / ``LineMapping.branches``), which classifies jumps by
+    direction rather than signed/unsigned sense.
 
     ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
     stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` and
-    the other per-line passes). Per line, ``branch_counts`` carries only the
+    the other per-line passes). Per line, ``branch_sense_counts`` carries only the
     nonzero senses in display order (mirroring the zero-omitting instruction
     mix); ``branch_totals`` is the same, summed across every line — empty when
     the program has no jumps at all.
@@ -714,13 +718,13 @@ def analyze_branches(
             if 1 <= asm_no <= len(asm_lines):
                 text = asm_lines[asm_no - 1].strip()
                 mnemonic = text.split(None, 1)[0].lower() if text else ""
-                sense = classify_branch(mnemonic)
+                sense = classify_branch_sense(mnemonic)
                 if sense is not None:
                     counts[sense] = counts.get(sense, 0) + 1
                     totals[sense] = totals.get(sense, 0) + 1
-        mapping["branch_counts"] = _ordered_branch_map(counts)
+        mapping["branch_sense_counts"] = _ordered_branch_sense_map(counts)
 
-    return {"branch_totals": _ordered_branch_map(totals)}
+    return {"branch_totals": _ordered_branch_sense_map(totals)}
 
 
 def _classify_mnemonic(mnemonic: str) -> str | None:
@@ -891,7 +895,7 @@ async def compile_python(python_source: str) -> dict:
     # Classify each Python line's conditional jumps by sense (signed / unsigned /
     # equality / unconditional) — the signed-vs-unsigned distinction that decides
     # whether a bounds check is safe. Independent of the passes above.
-    branch_summary = analyze_branches(line_map, asm_lines)
+    branch_sense_summary = analyze_branch_senses(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
 
@@ -906,6 +910,6 @@ async def compile_python(python_source: str) -> dict:
         "register_summary": register_summary,
         "stack_summary": stack_summary,
         "memory_summary": memory_summary,
-        "branch_summary": branch_summary,
+        "branch_sense_summary": branch_sense_summary,
         "asm_glossary": asm_glossary,
     }

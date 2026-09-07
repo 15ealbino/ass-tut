@@ -42,12 +42,13 @@ class LineMapping(BaseModel):
     # by direction. Only nonzero of {"loads", "stores"} are present. Empty for the
     # pyghidra pipeline, which computes no per-line memory traffic.
     memory_counts: Dict[str, int] = Field(default_factory=dict)
-    # Branch-condition map: how this line's conditional jumps split by sense
+    # Branch-sense map: how this line's conditional jumps split by sense
     # ("signed", "unsigned", "equality", "unconditional", "other") — the
     # signed-vs-unsigned distinction that decides whether a comparison is safe.
     # Only nonzero senses are present. Empty for the pyghidra pipeline, which
-    # computes no per-line branch map.
-    branch_counts: Dict[str, int] = Field(default_factory=dict)
+    # computes no per-line branch map. (Named `*_sense*` to coexist with the
+    # separate branch-flow-map's `branches` field, which classifies by direction.)
+    branch_sense_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class Hotspot(BaseModel):
@@ -89,12 +90,13 @@ class MemorySummary(BaseModel):
     memory_totals: Dict[str, int] = Field(default_factory=lambda: {"loads": 0, "stores": 0})
 
 
-class BranchSummary(BaseModel):
-    # Program-wide branch-condition map: each branch sense
+class BranchSenseSummary(BaseModel):
+    # Program-wide branch-sense map: each branch sense
     # ("signed" / "unsigned" / "equality" / "unconditional" / "other") mapped to
     # the number of conditional/unconditional jumps of that sense, in stable
     # display order with zero senses omitted. Empty when the program has no
-    # jumps at all.
+    # jumps at all. (Distinct from the branch-flow-map's BranchSummary, which
+    # tallies jump direction — forward/backward/etc.)
     branch_totals: Dict[str, int] = Field(default_factory=dict)
 
 
@@ -136,7 +138,7 @@ class CompileResponse(BaseModel):
     # traffic).
     memory_summary: Optional[MemorySummary] = None
     # Present for the transpile pipeline; None for pyghidra (no per-line branch map).
-    branch_summary: Optional[BranchSummary] = None
+    branch_sense_summary: Optional[BranchSenseSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)

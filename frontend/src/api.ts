@@ -50,10 +50,11 @@ export interface LineMapping {
   // Memory traffic: how many memory reads (loads) and writes (stores) this
   // line's asm performs. Only nonzero of {loads, stores} are present.
   memory_counts?: Record<string, number>
-  // Branch-condition map: how this line's conditional jumps split by sense
+  // Branch-sense map: how this line's conditional jumps split by sense
   // (signed / unsigned / equality / unconditional / other). Only nonzero senses
   // are present. The signed-vs-unsigned split is the comparison-safety signal.
-  branch_counts?: Record<string, number>
+  // Named `*_sense*` to coexist with the branch-flow-map's `branches` field.
+  branch_sense_counts?: Record<string, number>
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
@@ -87,7 +88,7 @@ export interface MemorySummary {
   memory_totals: Record<string, number>
 }
 
-export interface BranchSummary {
+export interface BranchSenseSummary {
   // Program-wide branch-condition map: each branch sense (signed / unsigned /
   // equality / unconditional / other) mapped to the number of jumps of that
   // sense, in stable display order with zero senses omitted.
@@ -119,7 +120,7 @@ export interface CompileResponse {
   stack_summary?: StackSummary | null
   memory_summary?: MemorySummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
-  branch_summary?: BranchSummary | null
+  branch_sense_summary?: BranchSenseSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
 }
