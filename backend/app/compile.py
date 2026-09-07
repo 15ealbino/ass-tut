@@ -613,6 +613,116 @@ def analyze_memory_traffic(
     return {"memory_totals": {"loads": total_loads, "stores": total_stores}}
 
 
+# ── Branch-condition map (signed vs unsigned) ───────────────────────────────
+#
+# The instruction mix lumps every jump into a single "branch" bucket; the
+# glossary describes a conditional jump generically as "taken only when the
+# flags satisfy the condition". Neither says the one thing that matters most
+# when you read a comparison in a disassembly: is the branch SIGNED or UNSIGNED?
+#
+# x86 has two parallel families of conditional jumps that test the SAME cmp:
+#   signed    jl / jle / jg / jge   (SF/OF ordering)      — for `int`-style values
+#   unsigned  jb / jbe / ja / jae   (CF ordering)         — for `unsigned`/pointer
+# plus equality (je / jne, sense-neutral) and the unconditional `jmp`.
+#
+# The lesson this teaches (mission pillar 2 — spotting vulnerable asm and the
+# bug behind it): picking the wrong family is a textbook vulnerability. A signed
+# length compared with an unsigned branch (or an `unsigned` bound compared with a
+# signed one) lets a negative value read as huge — or a huge value read as
+# negative — and slip straight past a bounds check. This transpiler emits
+# all-`int` C, so gcc emits the SIGNED family; seeing "2 signed" next to a Python
+# `if a < b` makes that concrete, and trains the eye to notice the day an
+# UNSIGNED branch shows up where a signed one was intended. (Pillar 1: it also
+# makes control flow legible — which `if`/`while`/`for` produced which jumps.)
+#
+# Classified by exact mnemonic (jumps are short, and exact-set matching avoids
+# the prefix-shadowing hazards of the mix/glossary tables — e.g. "jns" vs "js").
+_EQUALITY_JUMPS = frozenset({"je", "jz", "jne", "jnz"})
+_SIGNED_JUMPS = frozenset({
+    "jl", "jnge", "jle", "jng", "jg", "jnle", "jge", "jnl", "js", "jns",
+})
+_UNSIGNED_JUMPS = frozenset({
+    "jb", "jnae", "jc", "jbe", "jna", "ja", "jnbe", "jae", "jnb", "jnc",
+})
+# Overflow / parity jumps: real conditional branches, but neither signed-ordering
+# nor unsigned-ordering nor equality. gcc -O0 does not emit them for this
+# transpiler's integer code, but they are classified rather than dropped so an
+# unexpected one is never silently miscounted as "not a branch".
+_OTHER_JUMPS = frozenset({"jo", "jno", "jp", "jpe", "jnp", "jpo"})
+
+# Stable display / serialisation order for the branch-sense maps.
+_BRANCH_ORDER = {
+    "signed": 0, "unsigned": 1, "equality": 2, "unconditional": 3, "other": 4,
+}
+
+
+def classify_branch(mnemonic: str) -> str | None:
+    """Classify an x86 jump mnemonic by the *sense* of the branch it takes.
+
+    `mnemonic` is the lowercased first whitespace-separated token of an
+    instruction line (e.g. "jl", "jne", "jmp"). Returns one of
+    "signed" / "unsigned" / "equality" / "unconditional" / "other" for a jump,
+    or None for any mnemonic that is not a jump (so non-branch instructions are
+    ignored rather than bucketed).
+
+    Unlike the prefix tables used elsewhere in this module, matching is exact:
+    jump mnemonics are short and their prefixes overlap ("j" is a prefix of them
+    all, "jn" of both "jne" and "jnb"), so a prefix scan would mis-sort them.
+    """
+    if mnemonic == "jmp":
+        return "unconditional"
+    if mnemonic in _EQUALITY_JUMPS:
+        return "equality"
+    if mnemonic in _SIGNED_JUMPS:
+        return "signed"
+    if mnemonic in _UNSIGNED_JUMPS:
+        return "unsigned"
+    if mnemonic in _OTHER_JUMPS:
+        return "other"
+    return None
+
+
+def _ordered_branch_map(counts: Dict[str, int]) -> Dict[str, int]:
+    """Return `counts` with zero entries dropped and keys in display order."""
+    return {
+        sense: counts[sense]
+        for sense in sorted(counts, key=lambda s: _BRANCH_ORDER.get(s, 99))
+        if counts[sense] > 0
+    }
+
+
+def analyze_branches(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``branch_counts`` map and return a
+    program-wide summary ``{"branch_totals": {sense: count, ...}}``. Mutates
+    ``line_map`` in place.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` and
+    the other per-line passes). Per line, ``branch_counts`` carries only the
+    nonzero senses in display order (mirroring the zero-omitting instruction
+    mix); ``branch_totals`` is the same, summed across every line — empty when
+    the program has no jumps at all.
+    """
+    totals: Dict[str, int] = {}
+    for mapping in line_map.values():
+        counts: Dict[str, int] = {}
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if 1 <= asm_no <= len(asm_lines):
+                text = asm_lines[asm_no - 1].strip()
+                mnemonic = text.split(None, 1)[0].lower() if text else ""
+                sense = classify_branch(mnemonic)
+                if sense is not None:
+                    counts[sense] = counts.get(sense, 0) + 1
+                    totals[sense] = totals.get(sense, 0) + 1
+        mapping["branch_counts"] = _ordered_branch_map(counts)
+
+    return {"branch_totals": _ordered_branch_map(totals)}
+
+
 def _classify_mnemonic(mnemonic: str) -> str | None:
     """Return the cost flag for an x86 mnemonic, or None if it is unremarkable.
 
@@ -778,6 +888,10 @@ async def compile_python(python_source: str) -> dict:
     # Split each Python line's memory movement into loads vs stores. Independent
     # of the passes above; runs over the same already-mapped display asm.
     memory_summary = analyze_memory_traffic(line_map, asm_lines)
+    # Classify each Python line's conditional jumps by sense (signed / unsigned /
+    # equality / unconditional) — the signed-vs-unsigned distinction that decides
+    # whether a bounds check is safe. Independent of the passes above.
+    branch_summary = analyze_branches(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
 
@@ -792,5 +906,6 @@ async def compile_python(python_source: str) -> dict:
         "register_summary": register_summary,
         "stack_summary": stack_summary,
         "memory_summary": memory_summary,
+        "branch_summary": branch_summary,
         "asm_glossary": asm_glossary,
     }
