@@ -9633,6 +9633,93 @@ print(forged_access)
       description: 'movl performs the speculative memory access that probes the MTE tag via cache timing; cmpl compares the measured access latency against the side-channel threshold to determine whether the guessed tag matches the freed granule\'s tag, and the subsequent movl writes the forged tagged pointer that bypasses MTE validation to read or write freed memory without triggering a tag-check fault',
     },
   },
+  {
+    id: 'retbleed',
+    name: 'RETBLEED',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Speculative execution through return instructions bypasses retpoline mitigations to leak arbitrary kernel memory from unprivileged user space.',
+    explanation:
+      'Retbleed (CVE-2022-29900 for AMD, CVE-2022-29901 for Intel), discovered by ETH Zurich researchers in 2022, ' +
+      'demonstrates that return instructions can be exploited for speculative code execution, defeating the retpoline ' +
+      'mitigation that the industry deployed after Spectre v2. Retpoline replaced indirect jumps and calls with ' +
+      'return instructions under the assumption that returns could not be speculatively mispredicted in an exploitable ' +
+      'way — Retbleed proved this assumption wrong. On Intel Skylake and later processors, the Return Stack Buffer ' +
+      '(RSB) that predicts return targets has a finite depth; when deep or crafted call chains cause it to underflow, ' +
+      'the CPU silently falls back to the Branch Target Buffer (BTB) for the prediction, re-enabling the same ' +
+      'Spectre-BTB injection that retpoline was designed to block. On AMD Zen 1 and Zen 2 processors, the attack is ' +
+      'even more fundamental: Branch Type Confusion (CVE-2022-23825) causes the predictor to treat return instructions ' +
+      'as indirect branches outright, allowing an attacker to poison the BTB from user space and redirect kernel returns ' +
+      'to attacker-chosen gadgets. During the speculative window before the CPU detects the misprediction, transient ' +
+      'instructions execute a Spectre-style disclosure gadget that indexes a probe array by a secret byte, encoding the ' +
+      'value into the cache. The attacker then uses Flush+Reload to measure cache line access times and recover the ' +
+      'secret one byte at a time. Because the attack targets kernel return instructions, it can leak /etc/shadow hashes, ' +
+      'cryptographic keys, and any data reachable through kernel address space. In the assembly, callq pushes a return ' +
+      'address onto both the hardware stack and the RSB; repeated pop operations drain the RSB depth to zero; the ret ' +
+      'instruction then falls back to the BTB for its prediction, and the transient movl encodes the secret byte into a ' +
+      'cache-line offset that the attacker recovers via timing.',
+    code:
+`# CVE pattern: Retbleed RSB underflow speculation (CVE-2022-29900 / CVE-2022-29901)
+class ReturnStackBuffer:
+    def __init__(self):
+        self.depth = 0
+        self.predicted = 0
+
+    def push(self, addr):
+        self.depth += 1
+        self.predicted = addr
+        return self.depth
+
+    def pop(self):
+        if self.depth > 0:
+            self.depth -= 1
+        return self.predicted
+
+class BranchTargetBuffer:
+    def __init__(self):
+        self.target = 0
+        self.trained = 0
+
+    def train(self, src, dst):
+        self.target = dst
+        self.trained += 1
+        return self.trained
+
+    def predict_fallback(self):
+        return self.target
+
+class Retpoline:
+    def __init__(self):
+        self.bypassed = 0
+        self.caught = 0
+
+    def trap(self, target):
+        self.caught += 1
+        return 0
+
+rsb = ReturnStackBuffer()
+btb = BranchTargetBuffer()
+wall = Retpoline()
+secret_byte = 42
+btb.train(4096, 8192)
+rsb.push(4096)
+rsb.pop()
+if rsb.depth == 0:
+    wall.bypassed = 1
+    spec_target = btb.predict_fallback()
+else:
+    spec_target = rsb.pop()
+leaked = 0
+if wall.bypassed == 1:
+    cache_line = secret_byte * 256
+    leaked = cache_line
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['ret', 'callq'],
+      description: 'callq pushes a return address onto the hardware stack and the Return Stack Buffer; when the RSB is drained to zero depth, ret falls back to the Branch Target Buffer for its prediction — the same BTB an attacker poisoned from user space — and the transient movl following the misspeculated ret encodes the secret byte into a cache-line offset recoverable via Flush+Reload',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
