@@ -9720,6 +9720,94 @@ print(leaked)
       description: 'callq pushes a return address onto the hardware stack and the Return Stack Buffer; when the RSB is drained to zero depth, ret falls back to the Branch Target Buffer for its prediction — the same BTB an attacker poisoned from user space — and the transient movl following the misspeculated ret encodes the secret byte into a cache-line offset recoverable via Flush+Reload',
     },
   },
+  {
+    id: 'aepic-leak',
+    name: 'AEPIC LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Reading undefined APIC MMIO register ranges on Intel CPUs architecturally returns stale microarchitectural data, leaking SGX enclave secrets without any side channel.',
+    explanation:
+      'AEPIC Leak (CVE-2022-21233), disclosed by researchers at Sapienza University of Rome, TU Graz, and Amazon ' +
+      'Web Services in August 2022, is the first CPU vulnerability that architecturally leaks sensitive data from ' +
+      'the microarchitecture without relying on any side channel such as cache timing. On Intel CPUs based on the ' +
+      'Sunny Cove microarchitecture (10th, 11th, and 12th generation), the memory-mapped I/O (MMIO) page of the ' +
+      'local Advanced Programmable Interrupt Controller (xAPIC) contains register ranges that the architecture ' +
+      'defines as reserved or undefined. When a privileged OS-level read targets one of these undefined offsets, ' +
+      'the CPU does not return zero — instead, it returns whatever stale data the internal interconnect last ' +
+      'carried through the cache-line-sized buffer shared between the APIC and the L2 cache. Because Intel SGX ' +
+      'enclaves execute on the same physical core and their data transits through the same internal buffers, an ' +
+      'attacker with ring-0 access can force enclave data into the APIC line buffer using a technique called ' +
+      'Enclave Shaking (repeatedly interrupting the enclave at precise points) combined with Cache Line Freezing ' +
+      '(evicting all other cache lines so only the target line remains). Each MMIO read then returns 4 bytes of ' +
+      'stale enclave data — enough to dump the entire enclave memory in under one second. The researchers used ' +
+      'this to extract AES-NI keys and RSA private keys from Intel IPP, as well as SGX sealing keys and remote ' +
+      'attestation keys, completely defeating SGX confidentiality guarantees. Unlike Spectre or Meltdown, the ' +
+      'leak is deterministic and noise-free because the data is returned by a normal architectural load, not ' +
+      'inferred from timing. In the assembly, movl reads from the MMIO-mapped APIC page at a reserved offset; ' +
+      'the CPU fills the result register with stale data from the internal line buffer rather than an ' +
+      'architecturally correct zero, and each iteration of the scanning loop leaks the next 4-byte chunk.',
+    code:
+`# CVE pattern: AEPIC Leak MMIO stale data read (CVE-2022-21233)
+class ApicRegisters:
+    def __init__(self):
+        self.base = 0
+        self.stale_data = 0
+        self.mapped = 0
+
+    def map_mmio(self, addr):
+        self.base = addr
+        self.mapped = 1
+        return self.base
+
+    def read_undefined(self, offset):
+        self.stale_data = offset * 73
+        return self.stale_data
+
+class SgxEnclave:
+    def __init__(self):
+        self.sealed_key = 0
+        self.loaded = 0
+        self.epc_base = 0
+
+    def load_secret(self, key):
+        self.sealed_key = key
+        self.loaded = 1
+        self.epc_base = 4096
+        return self.epc_base
+
+    def attest(self):
+        return self.sealed_key
+
+class CacheLineFreezer:
+    def __init__(self):
+        self.frozen = 0
+        self.target = 0
+
+    def freeze(self, line_addr):
+        self.target = line_addr
+        self.frozen = 1
+        return self.frozen
+
+apic = ApicRegisters()
+enclave = SgxEnclave()
+freezer = CacheLineFreezer()
+enclave.load_secret(3735928559)
+apic.map_mmio(4276092928)
+freezer.freeze(enclave.epc_base)
+leaked = 0
+i = 0
+while i < 16:
+    stale = apic.read_undefined(i * 16)
+    if stale > 0:
+        leaked += stale
+    i += 1
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl reads from the MMIO-mapped xAPIC page at a reserved register offset; the CPU returns stale microarchitectural data from the internal line buffer instead of zero, and the addl accumulates each leaked 4-byte chunk as the loop iterates over undefined APIC register ranges',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
