@@ -9808,6 +9808,101 @@ print(leaked)
       description: 'movl reads from the MMIO-mapped xAPIC page at a reserved register offset; the CPU returns stale microarchitectural data from the internal line buffer instead of zero, and the addl accumulates each leaked 4-byte chunk as the loop iterates over undefined APIC register ranges',
     },
   },
+  {
+    id: 'cacheout-l1des',
+    name: 'CACHEOUT L1D EVICTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Targeted L1D cache line eviction leaks stale data through CPU fill buffers, bypassing prior MDS hardware mitigations.',
+    explanation:
+      'CacheOut, also known as L1D Eviction Sampling or L1DES (CVE-2020-0549 / INTEL-SA-00329, CVSS 6.5), ' +
+      'is a microarchitectural side-channel attack disclosed by Stephan van Schaik and colleagues at the ' +
+      'University of Michigan in January 2020. Unlike prior MDS attacks (ZombieLoad, RIDL, Fallout) that ' +
+      'must wait passively for secret data to transit through microarchitectural buffers, CacheOut lets the ' +
+      'attacker actively choose which L1 data cache line to target. The attack exploits a cleanup error in ' +
+      'Intel\'s L1D eviction logic: when a modified (dirty) cache line is evicted from L1D — via CLFLUSH or ' +
+      'natural set-associativity conflict — the stale data is transiently forwarded through a Line Fill Buffer ' +
+      '(LFB) instead of being properly scrubbed. The attacker opens an Intel TSX transaction, issues a load ' +
+      'from a faulting or assist-triggering address, then forces a transactional abort. During the speculative ' +
+      'window between the faulting load and the abort, the CPU fills the result register with stale LFB data ' +
+      'that originated from the victim\'s evicted cache line — a microarchitectural forwarding path that should ' +
+      'never be architecturally visible. The speculative load value then indexes into a FLUSH+RELOAD probe ' +
+      'array, encoding the secret into cache timing state. After the abort retires, the attacker measures ' +
+      'access times across the 256-entry probe array to determine which cache line was brought in, recovering ' +
+      'the secret one byte at a time. The researchers demonstrated extracting AES-NI keys from co-located ' +
+      'OpenSSL processes, reading kernel ASLR pointers, and breaking SGX enclave confidentiality — all ' +
+      'bypassing Intel\'s earlier hardware MDS mitigations (md_clear / VERW) on affected CPUs spanning 6th ' +
+      'through 10th Gen Core and several Xeon families. Intel assigned CVE-2020-0549 and released microcode ' +
+      'updates that flush LFBs on context switches; software mitigations include disabling TSX and applying ' +
+      'L1D flushing on VM entry. In the assembly, movl loads from a faulting address inside a transactional ' +
+      'region; on abort, the speculative window reads stale fill-buffer data from the evicted victim line, and ' +
+      'the subsequent imull into the probe array index encodes the leaked value into cache state for timing ' +
+      'recovery.',
+    code:
+`# CVE pattern: CacheOut L1D eviction sampling (CVE-2020-0549)
+class L1DCache:
+    def __init__(self):
+        self.line = 0
+        self.valid = 0
+        self.dirty = 0
+
+    def store(self, data):
+        self.line = data
+        self.valid = 1
+        self.dirty = 1
+        return self.line
+
+    def evict(self):
+        stale = self.line
+        self.valid = 0
+        self.dirty = 0
+        return stale
+
+class LineFillBuffer:
+    def __init__(self):
+        self.data = 0
+        self.pending = 0
+
+    def receive_eviction(self, stale):
+        self.data = stale
+        self.pending = 1
+        return self.data
+
+    def drain(self):
+        leaked = self.data
+        self.pending = 0
+        self.data = 0
+        return leaked
+
+class ProbeArray:
+    def __init__(self):
+        self.hits = 0
+        self.base = 0
+
+    def access(self, index):
+        self.base = index * 256
+        self.hits += 1
+        return self.base
+
+l1 = L1DCache()
+lfb = LineFillBuffer()
+probe = ProbeArray()
+secret = 3735928559
+l1.store(secret)
+stale = l1.evict()
+lfb.receive_eviction(stale)
+leaked = lfb.drain()
+probe.access(leaked)
+recovered = 0
+if probe.hits > 0:
+    recovered = leaked
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'movl loads from a faulting address inside a transactional region that reads stale L1D fill-buffer data from the evicted victim cache line; imull scales the leaked value to index a probe array, encoding the secret into observable cache timing state',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
