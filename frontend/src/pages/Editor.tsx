@@ -9903,6 +9903,93 @@ print(recovered)
       description: 'movl loads from a faulting address inside a transactional region that reads stale L1D fill-buffer data from the evicted victim cache line; imull scales the leaked value to index a probe array, encoding the secret into observable cache timing state',
     },
   },
+  {
+    id: 'indirect-target-selection',
+    name: 'INDIRECT TARGET SELECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Self-training Spectre-v2 attack exploits branch predictor IP collisions to speculatively redirect kernel control flow, leaking privileged memory at up to 17 KB/s.',
+    explanation:
+      'Indirect Target Selection (ITS), disclosed in May 2025 as part of the Training Solo family of attacks ' +
+      'by VUSec researchers (CVE-2024-28956, CVSS 5.7; CVE-2025-24495; CVE-2025-20012), completely breaks ' +
+      'the domain-isolation assumption that underpins all prior Spectre-v2 mitigations on Intel CPUs. Unlike ' +
+      'classic Spectre-BTI where an attacker cross-trains the Branch Target Buffer from user space, ITS is a ' +
+      'self-training attack: the kernel trains itself. When two indirect branches in different privilege domains ' +
+      'share the same instruction-pointer bits used to index the BTB, a collision occurs — the predictor cannot ' +
+      'distinguish which domain deposited the entry. The attacker arranges a user-space indirect branch whose ' +
+      'truncated IP matches a kernel indirect call site (a syscall dispatch table, for example). The user-space ' +
+      'branch trains the BTB to predict a target address pointing at an attacker-chosen disclosure gadget inside ' +
+      'the kernel. On the next syscall, the CPU speculatively follows the poisoned prediction, executing the ' +
+      'gadget at kernel privilege. The gadget loads a secret byte from kernel memory, then uses it as an index ' +
+      'into a probe array, bringing one cache line into L1. After the misspeculation retires and the pipeline ' +
+      'squashes the architectural effect, the attacker measures access times across the 256-entry Flush+Reload ' +
+      'probe array to recover the leaked byte. The researchers demonstrated leaking /etc/shadow hashes and ' +
+      'kernel ASLR pointers at 17 KB/s on 9th-through-11th-gen Intel Core and 2nd/3rd-gen Xeon processors — ' +
+      're-enabling user-to-kernel, guest-to-guest, and guest-to-host Spectre-v2 attacks that were considered ' +
+      'mitigated. Intel shipped microcode updates that serialize predictor state on privilege transitions. In ' +
+      'the assembly, the call instruction resolves its target from the BTB rather than the register operand; ' +
+      'the speculative movl inside the gadget reads kernel memory, and the subsequent imull into the probe-array ' +
+      'stride encodes the secret into cache timing state for Flush+Reload recovery.',
+    code:
+`# CVE pattern: Indirect Target Selection self-training Spectre-v2 (CVE-2024-28956)
+class BranchTargetBuffer:
+    def __init__(self):
+        self.entries = 0
+        self.tag_mask = 255
+        self.predicted = 0
+
+    def train(self, ip, target):
+        tag = ip % 256
+        self.entries = tag
+        self.predicted = target
+        return self.entries
+
+    def lookup(self, ip):
+        tag = ip % 256
+        if tag == self.entries:
+            return self.predicted
+        return 0
+
+class SpecExecEngine:
+    def __init__(self):
+        self.secret = 0
+        self.probe = 0
+        self.leaked = 0
+
+    def load_secret(self, addr):
+        self.secret = addr
+        return self.secret
+
+    def encode_probe(self, val):
+        self.probe = val * 256
+        self.leaked = val
+        return self.probe
+
+btb = BranchTargetBuffer()
+engine = SpecExecEngine()
+user_ip = 49152
+kernel_ip = 49152
+gadget_addr = 8192
+btb.train(user_ip, gadget_addr)
+collision = btb.lookup(kernel_ip)
+leaked = 0
+if collision == gadget_addr:
+    secret_byte = engine.load_secret(3735928559)
+    engine.encode_probe(secret_byte)
+    leaked = engine.leaked
+recovered = 0
+i = 0
+while i < 256:
+    if i == leaked:
+        recovered = i
+    i += 1
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['call', 'movl', 'imull'],
+      description: 'call resolves its target from a poisoned BTB entry trained by user-space IP collision; speculative movl reads kernel memory via the disclosure gadget; imull encodes the secret byte into a probe-array cache-line index for Flush+Reload timing recovery',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
