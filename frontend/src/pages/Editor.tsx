@@ -9990,6 +9990,94 @@ print(recovered)
       description: 'call resolves its target from a poisoned BTB entry trained by user-space IP collision; speculative movl reads kernel memory via the disclosure gadget; imull encodes the secret byte into a probe-array cache-line index for Flush+Reload timing recovery',
     },
   },
+  {
+    id: 'tsa-false-completion',
+    name: 'TRANSIENT SCHEDULER ATTACK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'AMD CPU scheduler falsely completes loads from the store queue or L1 cache, leaking protected data through instruction timing side channels.',
+    explanation:
+      'Transient Scheduler Attacks (TSA), disclosed by AMD in July 2025 (CVE-2024-36350 for TSA-SQ, ' +
+      'CVE-2024-36357 for TSA-L1, CVSS 5.6), represent a new class of speculative side channels affecting ' +
+      'AMD processors from Zen 1 through Zen 5. Unlike classic Spectre or Meltdown where mispredicted branches ' +
+      'cause pipeline flushes, TSA exploits false completions in the CPU scheduler: when a load instruction ' +
+      'needs data that is not yet available, the scheduler may incorrectly signal completion and forward stale ' +
+      'or invalid data from the store queue (TSA-SQ) or L1 data cache (TSA-L1) via microtag aliasing. ' +
+      'Critically, these false completions do not trigger a pipeline flush, so the invalid data silently ' +
+      'propagates to dependent instructions. While the corrupted value cannot be leaked through standard ' +
+      'cache-based covert channels (loads and stores consuming it do not update cache or TLB state), the ' +
+      'invalid data influences the timing of subsequent instructions flowing through the execution unit ' +
+      'scheduler. An attacker co-located on the same physical core measures these timing variations across ' +
+      'thousands of iterations to statistically reconstruct protected data — passwords, encryption keys, or ' +
+      'kernel memory — bit by bit. AMD released microcode patches serializing scheduler state at privilege ' +
+      'boundaries. In the assembly, the movl from a store-queue address falsely completes with stale data; ' +
+      'the dependent addl and cmpl instructions exhibit timing differences proportional to the leaked value, ' +
+      'which the attacker captures through rdtsc-based measurement.',
+    code:
+`# CVE pattern: Transient Scheduler Attack false completion (CVE-2024-36350)
+class StoreQueue:
+    def __init__(self):
+        self.entries = 0
+        self.stale_data = 0
+        self.completed = 0
+
+    def write(self, addr, val):
+        self.entries = addr
+        self.stale_data = val
+        self.completed = 0
+        return self.entries
+
+    def false_complete(self, addr):
+        if addr == self.entries:
+            self.completed = 1
+            return self.stale_data
+        return 0
+
+class TimingOracle:
+    def __init__(self):
+        self.baseline = 100
+        self.samples = 0
+        self.leaked = 0
+
+    def measure(self, val):
+        delay = self.baseline + val
+        self.samples += 1
+        return delay
+
+    def infer_bit(self, t1, t2):
+        if t1 > t2:
+            self.leaked = 1
+        else:
+            self.leaked = 0
+        return self.leaked
+
+sq = StoreQueue()
+oracle = TimingOracle()
+secret_addr = 48879
+secret_val = 42
+sq.write(secret_addr, secret_val)
+stale = sq.false_complete(secret_addr)
+recovered = 0
+bit = 0
+while bit < 8:
+    mask = 1
+    i = 0
+    while i < bit:
+        mask *= 2
+        i += 1
+    test_val = stale % (mask * 2)
+    t_one = oracle.measure(test_val)
+    t_zero = oracle.measure(0)
+    b = oracle.infer_bit(t_one, t_zero)
+    recovered += b * mask
+    bit += 1
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'movl falsely completes from the store queue with stale cross-domain data; dependent addl and cmpl exhibit timing variations proportional to the leaked value, enabling statistical bit-by-bit recovery through rdtsc measurement',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
