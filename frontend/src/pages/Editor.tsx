@@ -10078,6 +10078,94 @@ print(recovered)
       description: 'movl falsely completes from the store queue with stale cross-domain data; dependent addl and cmpl exhibit timing variations proportional to the leaked value, enabling statistical bit-by-bit recovery through rdtsc measurement',
     },
   },
+  {
+    id: 'process-hollowing',
+    name: 'PROCESS HOLLOWING',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker creates a legitimate process in suspended state, unmaps its code, injects shellcode, and resumes — executing malicious code under a trusted identity.',
+    explanation:
+      'Process hollowing (MITRE ATT&CK T1055.012 / CWE-912) creates a legitimate process — such as ' +
+      'svchost.exe or explorer.exe — in a suspended state via CreateProcess(CREATE_SUSPENDED), then unmaps ' +
+      'its original code sections with NtUnmapViewOfSection, writes attacker-controlled shellcode into the ' +
+      'freed address space with WriteProcessMemory, patches the thread context to point at the new entry ' +
+      'point via SetThreadContext, and resumes execution with ResumeThread. The malicious code now runs ' +
+      'under the identity, PID, security token, and command line of the legitimate process — invisible to ' +
+      'process-listing tools, application whitelists, and signature-based detection. ' +
+      'Observed in 39+ threat groups and malware families: APT41\'s PLUSINJECT component (May 2025) hollowed ' +
+      'system processes to deploy the TOUGHPROGRESS C2 framework via Google Calendar; Turla\'s Carbon backdoor ' +
+      'hollows svchost.exe for persistent kernel-level access; Emotet, TrickBot, and DarkGate all use process ' +
+      'hollowing as their primary defense-evasion mechanism. CVE-2024-21412 (Windows SmartScreen bypass, CVSS ' +
+      '8.1) was chained with process hollowing by DarkGate operators in a zero-day campaign — the SmartScreen ' +
+      'bypass delivered a fake MSI installer that sideloaded a DLL performing process hollowing to inject the ' +
+      'final payload. The technique bypasses DEP (injected code runs in the victim\'s allocated sections), ' +
+      'ASLR (the attacker controls the replacement image base), and application whitelisting (the host process ' +
+      'is a signed system binary). ' +
+      'In the assembly, movl stores the original entry_point into the process image\'s stack slot; ' +
+      'unmap_sections\'s movl zeroes it out; inject_payload\'s movl overwrites the same offset with the ' +
+      'shellcode address (0xDEADBEEF) — no cmpl integrity check validates that the process image has been ' +
+      'tampered with before resume\'s addl combines the hijacked entry_point with the stack_base for execution.',
+    code:
+`# CVE pattern: process suspended, hollowed, shellcode injected — stealth exec
+class ProcessImage:
+    def __init__(self, entry_point, stack_base, pid):
+        self.entry_point = entry_point
+        self.stack_base = stack_base
+        self.pid = pid
+        self.suspended = 0
+        self.code_size = 4096
+        self.integrity = entry_point * 31
+
+    def suspend(self):
+        self.suspended = 1
+        return self.suspended
+
+    def unmap_sections(self):
+        self.entry_point = 0
+        self.code_size = 0
+        self.integrity = 0
+        return self.entry_point
+
+    def inject_payload(self, shellcode, new_entry):
+        self.entry_point = new_entry
+        self.code_size = shellcode
+        return self.entry_point
+
+    def resume(self):
+        self.suspended = 0
+        result = self.entry_point + self.stack_base
+        return result
+
+class HollowEngine:
+    def __init__(self, shellcode):
+        self.shellcode = shellcode
+        self.sc_entry = shellcode + 256
+        self.injected = 0
+
+    def hollow_and_inject(self, proc):
+        proc.suspend()
+        proc.unmap_sections()
+        proc.inject_payload(self.shellcode, self.sc_entry)
+        self.injected += 1
+        return proc.resume()
+
+    def verify(self, proc):
+        result = proc.entry_point + self.injected
+        return result
+
+svchost = ProcessImage(4196352, 8388608, 1337)
+explorer = ProcessImage(4198400, 8388608, 2674)
+engine = HollowEngine(3735928559)
+hijacked = engine.hollow_and_inject(svchost)
+hijacked2 = engine.hollow_and_inject(explorer)
+leaked = engine.verify(explorer)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the legitimate entry_point (0x400000) into the process image stack slot; unmap_sections\'s movl zeroes it; inject_payload\'s movl overwrites the same offset with the shellcode address (0xDEADBEEF + 256) — no cmpl integrity check validates the process image before resume\'s addl combines the hijacked entry_point with stack_base, executing attacker code under the legitimate process\'s identity and security token',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
