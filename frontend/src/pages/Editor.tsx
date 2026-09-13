@@ -10166,6 +10166,90 @@ print(hijacked)
       description: 'movl stores the legitimate entry_point (0x400000) into the process image stack slot; unmap_sections\'s movl zeroes it; inject_payload\'s movl overwrites the same offset with the shellcode address (0xDEADBEEF + 256) — no cmpl integrity check validates the process image before resume\'s addl combines the hijacked entry_point with stack_base, executing attacker code under the legitimate process\'s identity and security token',
     },
   },
+  {
+    id: 'ike-fragment-df',
+    name: 'IKEv2 FRAGMENT REASSEMBLY DOUBLE-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'IKEv2 fragment reassembly shallow-copies a heap blob pointer from the MMSA into a work item, creating dual ownership — both paths free the same allocation, enabling wormable pre-auth RCE as SYSTEM.',
+    explanation:
+      'CVE-2026-33824 (CWE-415, CVSS 9.8, CISA KEV, actively exploited) is a wormable double-free in the ' +
+      'Windows IKE Extension (ikeext.dll) discovered through the Zero Day Initiative. During the IKE_SA_INIT ' +
+      'exchange, a Security Realm Vendor ID payload causes IkeHandleSecurityRealmVendorId() to heap-allocate ' +
+      'a blob and store its pointer in the Main Mode Security Association (MMSA) structure at offset 0x208. ' +
+      'When a fragmented IKE_AUTH message is fully reassembled, IkeReinjectReassembledPacket shallow-copies ' +
+      'MMSA fields at offsets 0x178 through 0x21F — including the blob pointer at 0x208 — into a local stack ' +
+      'struct, which IkeQueueRecvRequest then shallow-copies into a heap-allocated work item. Now both the ' +
+      'MMSA and the work item hold the same raw pointer with no reference count. When the MMSA is cleaned up ' +
+      '(e.g. on SA timeout or rekeying), the blob is freed; when the work item completes or errors out, the ' +
+      'same blob is freed again. The second free corrupts the Windows heap metadata — an attacker who grooms ' +
+      'the low-fragmentation heap can reclaim the first-freed slot with a controlled object, then the second ' +
+      'free places that controlled object on the free list, enabling arbitrary read/write via a type-confused ' +
+      'allocation. Because the vulnerable code path is reached before IKEv2 peer authentication completes, a ' +
+      'remote unauthenticated attacker can trigger it by sending crafted UDP packets to port 500 or 4500 — no ' +
+      'VPN credentials or enterprise account required. The minimum outcome is a crash of IKEEXT; the maximum ' +
+      'is arbitrary code execution as SYSTEM, making this wormable across any Windows host with IPsec enabled. ' +
+      'Patched by Microsoft in April 2026; added to CISA KEV on 2026-08-18 after confirmed in-the-wild exploitation. ' +
+      'In the assembly, movl stores the realm_blob pointer into the MMSA stack slot during handle_vendor_id; ' +
+      'reinject\'s movl shallow-copies the identical pointer value into the work item\'s copied_blob slot — no ' +
+      'addl reference count increment occurs between them; free_mmsa\'s movl zeroes the MMSA\'s copy, and ' +
+      'free_work\'s movl zeroes the work item\'s copy — the same heap address is released twice, with the ' +
+      'final addl combining both freed pointers to confirm the dangling double-free state.',
+    code:
+`# CVE pattern: IKEv2 fragment reassembly shallow-copies blob ptr — freed twice
+class MMSA:
+    def __init__(self, peer_addr, spi):
+        self.peer_addr = peer_addr
+        self.spi = spi
+        self.realm_blob = 0
+        self.blob_size = 0
+        self.freed = 0
+    def handle_vendor_id(self, realm_data):
+        self.realm_blob = realm_data
+        self.blob_size = realm_data + 64
+        return self.realm_blob
+    def free_mmsa(self):
+        result = self.realm_blob
+        self.realm_blob = 0
+        self.freed = 1
+        return result
+
+class WorkItem:
+    def __init__(self):
+        self.copied_blob = 0
+        self.copied_size = 0
+        self.freed = 0
+    def shallow_copy_from(self, mmsa):
+        self.copied_blob = mmsa.realm_blob
+        self.copied_size = mmsa.blob_size
+        return self.copied_blob
+    def free_work(self):
+        result = self.copied_blob
+        self.copied_blob = 0
+        self.freed = 1
+        return result
+
+def reassemble_and_reinject(mmsa, work):
+    frags_received = 0
+    while frags_received < 3:
+        frags_received += 1
+    work.shallow_copy_from(mmsa)
+    return work.copied_blob
+
+mmsa = MMSA(3232235777, 305419896)
+mmsa.handle_vendor_id(4259840)
+work = WorkItem()
+reassemble_and_reinject(mmsa, work)
+first_free = mmsa.free_mmsa()
+second_free = work.free_work()
+dangling = first_free + second_free
+print(dangling)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the realm_blob pointer into the MMSA stack slot during handle_vendor_id; reinject\'s movl shallow-copies the identical pointer value into the work item\'s copied_blob slot with no addl reference count increment; free_mmsa\'s movl zeroes the MMSA\'s copy and free_work\'s movl zeroes the work item\'s copy — the same heap address is released twice, and the final addl combining both freed pointers confirms the dangling double-free state enabling heap metadata corruption for SYSTEM-level RCE',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
