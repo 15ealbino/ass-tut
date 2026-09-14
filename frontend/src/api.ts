@@ -50,6 +50,18 @@ export interface LineMapping {
   // Memory traffic: how many memory reads (loads) and writes (stores) this
   // line's asm performs. Only nonzero of {loads, stores} are present.
   memory_counts?: Record<string, number>
+  // Control-flow branch map: the jump instructions this line's asm emits, in
+  // stream order, each with its target label and direction (back = loop back-edge,
+  // forward = skip). Empty for lines that emit no jumps.
+  branches?: BranchEdge[]
+}
+
+export interface BranchEdge {
+  // One jump instruction emitted for a Python line.
+  mnemonic: string   // jump opcode as emitted, e.g. "jle", "jmp"
+  target: string     // target operand: a label like ".L2", or "*%eax" (indirect)
+  direction: string  // "back" (loop back-edge) | "forward" (skip) | "indirect" | "unknown"
+  conditional: boolean // false for jmp; true for je/jne/… and loop
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
@@ -83,6 +95,19 @@ export interface MemorySummary {
   memory_totals: Record<string, number>
 }
 
+export interface BranchSummary {
+  // Program-wide control-flow branch map.
+  //   total_jumps — jump instructions emitted (mapped to Python lines).
+  //   conditional / unconditional — split of total_jumps by kind (sums to total).
+  //   back_edges — jumps to an earlier address: loop back-edges (≈ loop count).
+  //   forward_edges — jumps to a later address: if/else/break skip-forward flow.
+  total_jumps: number
+  conditional: number
+  unconditional: number
+  back_edges: number
+  forward_edges: number
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -107,6 +132,8 @@ export interface CompileResponse {
   // Present for the transpile pipeline; absent/null for pyghidra.
   stack_summary?: StackSummary | null
   memory_summary?: MemorySummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  branch_summary?: BranchSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
 }
