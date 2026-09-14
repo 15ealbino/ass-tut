@@ -145,7 +145,7 @@ and program-wide.
 ```bash
 cd backend
 pip install -r requirements.txt
-SECRET_KEY=test-secret pytest tests/test_branch_map.py -q
+SECRET_KEY=test-secret pytest tests/test_branch_sense_map.py -q
 ```
 
 The suite has two layers, mirroring `test_memory_traffic.py`:
