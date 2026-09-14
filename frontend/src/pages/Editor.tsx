@@ -10250,6 +10250,71 @@ print(dangling)
       description: 'movl stores the realm_blob pointer into the MMSA stack slot during handle_vendor_id; reinject\'s movl shallow-copies the identical pointer value into the work item\'s copied_blob slot with no addl reference count increment; free_mmsa\'s movl zeroes the MMSA\'s copy and free_work\'s movl zeroes the work item\'s copy — the same heap address is released twice, and the final addl combining both freed pointers confirms the dangling double-free state enabling heap metadata corruption for SYSTEM-level RCE',
     },
   },
+  {
+    id: 'fastbin-dup',
+    name: 'FASTBIN DUPLICATION ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Double-freeing a fastbin-sized chunk tricks malloc into returning the same allocation twice, enabling arbitrary write and code execution.',
+    explanation:
+      'The fastbin duplication attack (CWE-415) exploits a double-free on chunks small enough to land in ' +
+      'glibc\'s fastbin free lists (up to 0x80 bytes on 64-bit systems). Because the fastbin is a singly-linked ' +
+      'LIFO list and early glibc versions only checked whether the chunk being freed was identical to the list ' +
+      'head, an attacker could free chunk A, free chunk B (bypassing the head check), then free A again — placing ' +
+      'A on the fastbin twice. The next three malloc() calls of that size return A, B, then A again; the attacker ' +
+      'writes a target address into the first returned copy of A\'s fd field, so a subsequent allocation returns ' +
+      'a fake chunk at the chosen address, granting an arbitrary write primitive. Real-world exploitation of this ' +
+      'class includes CVE-2025-8058 (glibc regcomp double-free affecting versions 2.4 through 2.41, where a ' +
+      'failed memory allocation during regex compilation double-frees an internal buffer) and CVE-2017-9047 ' +
+      '(libxml2 fastbin corruption via crafted XML). Since glibc 2.29, tcache bins gained a key field to detect ' +
+      'double-frees, but fastbins themselves lacked this mitigation until glibc 2.33\'s pointer mangling, meaning ' +
+      'older versions and applications that bypass tcache remain fully exposed. The typical endgame before glibc ' +
+      '2.34 was overwriting __malloc_hook or __free_hook with a one-gadget address; post-2.34 attackers pivot to ' +
+      'FSOP or _IO_list_all corruption. In the assembly, the first free\'s movl stores chunk A\'s address into ' +
+      'the fastbin head; the second free of A re-links the same pointer via movl, creating a cycle in the list; ' +
+      'malloc\'s subsequent movl reads the corrupted fd from the duplicated entry, and the attacker\'s addl ' +
+      'computes the target offset — returning a fake chunk at the chosen location for arbitrary write to hijack ' +
+      'control flow.',
+    code:
+`# CVE pattern: fastbin double-free — malloc returns same chunk twice
+class FastbinList:
+    def __init__(self):
+        self.head = 0
+        self.count = 0
+
+    def free_chunk(self, addr):
+        self.head = addr
+        self.count += 1
+        return self.head
+
+    def alloc_chunk(self):
+        result = self.head
+        self.count -= 1
+        return result
+
+def fastbin_dup_attack():
+    fbin = FastbinList()
+    chunk_a = 1048576
+    chunk_b = 2097152
+    fbin.free_chunk(chunk_a)
+    fbin.free_chunk(chunk_b)
+    fbin.free_chunk(chunk_a)
+    alloc1 = fbin.alloc_chunk()
+    target_addr = 7340032
+    fake_fd = alloc1 + target_addr
+    alloc2 = fbin.alloc_chunk()
+    alloc3 = fbin.alloc_chunk()
+    hijacked = alloc3 + fake_fd
+    return hijacked
+
+result = fastbin_dup_attack()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores chunk A\'s address into the fastbin head on the first free; the second free of A re-links the identical pointer via movl creating a cycle in the singly-linked LIFO list; malloc\'s movl reads the corrupted fd field from the duplicated entry, and the attacker\'s addl computes the target address offset — returning a fake chunk at the chosen location for arbitrary write',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
