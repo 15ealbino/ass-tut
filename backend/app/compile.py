@@ -613,6 +613,181 @@ def analyze_memory_traffic(
     return {"memory_totals": {"loads": total_loads, "stores": total_stores}}
 
 
+# ── Control-flow branch map ─────────────────────────────────────────────────
+#
+# The register/stack/memory passes describe WHERE a Python line's data lives and
+# moves. The branch map describes WHERE CONTROL GOES: the jump instructions each
+# Python line emits, each jump's target label, and — the educational payload —
+# whether it jumps BACKWARD or FORWARD.
+#
+# The lessons this teaches:
+#   * Pillar 1 (make the mapping concrete): Python control flow has no `goto`, so
+#     it is easy to forget that at the machine level `for`, `while`, `if`, `break`
+#     and `continue` are ALL just conditional jumps. A `for`/`while` loop compiles
+#     to a BACKWARD jump — a "back-edge" to an earlier address — that is literally
+#     how the CPU repeats work. An `if`/`elif`/`else`, a `break`, and the
+#     short-circuit in `and`/`or` compile to FORWARD jumps that skip over code.
+#     Seeing "jle → .L4 (loop)" next to a `while` line makes that concrete.
+#   * Pillar 2 / reverse-engineering: recovering the loop and branch structure
+#     from a flat list of instructions is a day-one RE task. Back-edges are how a
+#     disassembler (and a human) find loops; forward conditional jumps are the
+#     if/else skeleton. The count of back-edges is, in effect, the number of loops
+#     in the program — a structural summary you can read straight off the asm.
+#
+# gcc -O0 emits labels at column 0 (`.L2:`) and jumps as indented instructions
+# (`jle .L3`). Direction is decided purely by position in the emitted stream: a
+# jump whose target label is defined at or before the jump is a back-edge, one
+# whose target comes later is a forward skip — exactly the comparison a reader
+# does by eye. Only `j*`/`loop*` jumps are collected; `call` is function-call
+# overhead (already covered by the cost/mix passes), not intra-function control
+# flow, so it is deliberately excluded.
+
+# A label definition line in the filtered display asm: a bare label token
+# followed by a colon (e.g. ".L2:", "main:"), emitted by gcc at column 0. The
+# token allows the leading `.`, `$`, digits, and word characters gcc uses.
+_LABEL_DEF_RE = re.compile(r"^(?P<label>[.\w$]+):$")
+
+
+def _jump_kind(mnemonic: str) -> str | None:
+    """Classify a mnemonic as a jump, or None if it is not one.
+
+    Returns ``"uncond"`` for the unconditional ``jmp`` (and size-suffixed forms),
+    ``"cond"`` for every conditional jump (``je``/``jne``/``jl``/``jle``/… and the
+    ``loop``/``loope``/``loopne`` family, which branch on ``%ecx``), and ``None``
+    otherwise. Matched by prefix so size suffixes are covered; ``jmp`` is checked
+    before the generic ``j`` catch-all. No non-jump x86 mnemonic begins with
+    ``j``, so the catch-all never misfires.
+    """
+    if mnemonic.startswith("jmp"):
+        return "uncond"
+    if mnemonic.startswith("loop"):
+        return "cond"
+    if mnemonic.startswith("j"):
+        return "cond"
+    return None
+
+
+def _collect_labels(asm_lines: List[str]) -> Dict[str, int]:
+    """Map each label name to the 1-indexed display-asm line where it is defined.
+
+    ``asm_lines`` is the filtered display assembly (same 1-indexing the line_map
+    uses). If a label were somehow defined twice, the first definition wins — the
+    address a reader reaches first — but gcc emits each label once.
+    """
+    labels: Dict[str, int] = {}
+    for i, line in enumerate(asm_lines, start=1):
+        m = _LABEL_DEF_RE.match(line.strip())
+        if m:
+            labels.setdefault(m.group("label"), i)
+    return labels
+
+
+def _branch_at(text: str, asm_no: int, labels: Dict[str, int]) -> dict | None:
+    """Describe the jump on one assembly line, or None if it is not a jump.
+
+    ``text`` is a raw display-asm line, ``asm_no`` its 1-indexed position, and
+    ``labels`` the label→line map from :func:`_collect_labels`. Returns
+    ``{"mnemonic", "target", "direction", "conditional"}`` where ``direction`` is:
+
+    * ``"back"``    — the target label is at or before this jump (a loop back-edge);
+    * ``"forward"`` — the target label is later in the stream (skips code);
+    * ``"indirect"``— a computed target (``jmp *%eax``), which has no static
+      direction; the transpiler's supported subset never emits one, but it is
+      handled so the map never mislabels it;
+    * ``"unknown"`` — a label target not defined in the emitted asm (defensive;
+      does not occur for intra-function gcc output).
+    """
+    stripped = text.strip()
+    if not stripped or stripped.startswith(".") or stripped.endswith(":"):
+        return None
+    parts = stripped.split(None, 1)
+    mnemonic = parts[0].lower()
+    kind = _jump_kind(mnemonic)
+    if kind is None:
+        return None
+    # A jump carries a single operand; be defensive about a trailing comment/comma.
+    operand = parts[1].strip() if len(parts) > 1 else ""
+    target = operand.split(",", 1)[0].strip()
+
+    if not target:
+        direction = "unknown"
+    elif target.startswith("*"):
+        direction = "indirect"
+    else:
+        target_line = labels.get(target)
+        if target_line is None:
+            direction = "unknown"
+        elif target_line <= asm_no:
+            direction = "back"
+        else:
+            direction = "forward"
+
+    return {
+        "mnemonic": mnemonic,
+        "target": target,
+        "direction": direction,
+        "conditional": kind == "cond",
+    }
+
+
+def analyze_branches(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``branches`` list (the jumps that
+    line's assembly emits, in stream order) and return a program-wide branch
+    summary. Mutates ``line_map`` in place.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` and
+    the other per-line passes). Each ``branches`` element is the dict returned by
+    :func:`_branch_at`. The summary is::
+
+        {
+          "total_jumps":    <number of jump instructions mapped to Python lines>,
+          "conditional":    <of those, conditional jumps (je/jne/…/loop)>,
+          "unconditional":  <of those, unconditional jmp>,
+          "back_edges":     <jumps whose target is at/before them — loop back-edges>,
+          "forward_edges":  <jumps whose target is later — skip-forward control flow>,
+        }
+
+    ``conditional + unconditional == total_jumps`` always. ``back_edges +
+    forward_edges`` may be less than ``total_jumps`` in the rare indirect/unknown
+    cases (which the transpiler's supported subset does not produce). ``back_edges``
+    is, in effect, the number of loops in the program.
+    """
+    labels = _collect_labels(asm_lines)
+    total = conditional = unconditional = back = forward = 0
+    for mapping in line_map.values():
+        branches: List[dict] = []
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if not (1 <= asm_no <= len(asm_lines)):
+                continue
+            edge = _branch_at(asm_lines[asm_no - 1], asm_no, labels)
+            if edge is None:
+                continue
+            branches.append(edge)
+            total += 1
+            if edge["conditional"]:
+                conditional += 1
+            else:
+                unconditional += 1
+            if edge["direction"] == "back":
+                back += 1
+            elif edge["direction"] == "forward":
+                forward += 1
+        mapping["branches"] = branches
+
+    return {
+        "total_jumps": total,
+        "conditional": conditional,
+        "unconditional": unconditional,
+        "back_edges": back,
+        "forward_edges": forward,
+    }
+
+
 def _classify_mnemonic(mnemonic: str) -> str | None:
     """Return the cost flag for an x86 mnemonic, or None if it is unremarkable.
 
@@ -778,6 +953,10 @@ async def compile_python(python_source: str) -> dict:
     # Split each Python line's memory movement into loads vs stores. Independent
     # of the passes above; runs over the same already-mapped display asm.
     memory_summary = analyze_memory_traffic(line_map, asm_lines)
+    # Map each Python line's control flow: the jumps it emits and whether they go
+    # backward (loop back-edge) or forward (skip). Another independent pass over
+    # the same already-mapped display asm.
+    branch_summary = analyze_branches(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
 
@@ -792,5 +971,6 @@ async def compile_python(python_source: str) -> dict:
         "register_summary": register_summary,
         "stack_summary": stack_summary,
         "memory_summary": memory_summary,
+        "branch_summary": branch_summary,
         "asm_glossary": asm_glossary,
     }

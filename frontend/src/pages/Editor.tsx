@@ -3,7 +3,7 @@ import { python } from '@codemirror/lang-python'
 import { oneDark } from '@codemirror/theme-one-dark'
 import type { EditorView } from '@codemirror/view'
 import { useState, useRef } from 'react'
-import { compile, CompileMethod, CompileResponse, GlossaryEntry, LineMapping } from '../api'
+import { compile, BranchEdge, BranchSummary, CompileMethod, CompileResponse, GlossaryEntry, LineMapping } from '../api'
 import CodePane from '../components/CodePane'
 import AsmPane, { AsmLineInfo } from '../components/AsmPane'
 
@@ -70,6 +70,36 @@ function formatMemory(counts?: Record<string, number>): string {
   const parts: string[] = []
   if ((counts.loads ?? 0) > 0) parts.push(`${counts.loads} ld`)
   if ((counts.stores ?? 0) > 0) parts.push(`${counts.stores} st`)
+  return parts.join(' · ')
+}
+
+// ─── Control-flow branch-map presentation ───────────────────────────────────
+// Backend reports the jumps each Python line emits and whether each goes
+// BACKWARD (a loop back-edge — how for/while repeat) or FORWARD (skipping code —
+// how if/elif/else, break and short-circuit and/or bail out). Rendered as the
+// BRANCH summary chip and per-line tooltips.
+const BRANCH_DIR_LABEL: Record<string, string> = {
+  back: 'loop',
+  forward: 'fwd',
+  indirect: 'indirect',
+  unknown: '?',
+}
+
+// Render a line's jumps as "jmp→.L2 fwd · jl→.L4 loop".
+function formatBranches(branches?: BranchEdge[]): string {
+  if (!branches || branches.length === 0) return ''
+  return branches
+    .map(b => `${b.mnemonic}→${b.target} ${BRANCH_DIR_LABEL[b.direction] ?? b.direction}`)
+    .join(' · ')
+}
+
+// Render the program-wide branch summary as "4 jmp · 1 loop · 3 fwd" for the
+// BRANCH chip, dropping the loop/fwd parts when zero.
+function formatBranchSummary(summary?: BranchSummary | null): string {
+  if (!summary || summary.total_jumps === 0) return ''
+  const parts = [`${summary.total_jumps} jmp`]
+  if (summary.back_edges > 0) parts.push(`${summary.back_edges} loop`)
+  if (summary.forward_edges > 0) parts.push(`${summary.forward_edges} fwd`)
   return parts.join(' · ')
 }
 
@@ -11048,6 +11078,26 @@ export default function EditorPage() {
               MEM:: {formatMemory(result.memory_summary.memory_totals)}
             </span>
           )}
+          {formatBranchSummary(result.branch_summary) && (
+            <span
+              title={`Control-flow branch map — jump instructions and their direction: ${formatBranchSummary(result.branch_summary)}. A BACKWARD jump (loop) targets an earlier address — that is how 'for'/'while' repeat, so the back-edge count is effectively the number of loops. A FORWARD jump skips over code — how if/elif/else, break and short-circuit and/or bail out. Recovering these back-edges and skips from a flat instruction stream is a core reverse-engineering skill.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              BRANCH:: {formatBranchSummary(result.branch_summary)}
+            </span>
+          )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (
             <span
               title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
@@ -11088,6 +11138,9 @@ export default function EditorPage() {
             const memTitle = formatMemory(mapping.memory_counts)
               ? ` — mem: ${formatMemory(mapping.memory_counts)}`
               : ''
+            const branchTitle = formatBranches(mapping.branches)
+              ? ` — branch: ${formatBranches(mapping.branches)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -11108,7 +11161,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${memTitle}${flagTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${memTitle}${branchTitle}${flagTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (

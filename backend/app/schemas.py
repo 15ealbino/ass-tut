@@ -13,6 +13,23 @@ class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
+class BranchEdge(BaseModel):
+    # One jump instruction emitted for a Python line.
+    #   mnemonic    — the jump opcode as emitted (e.g. "jle", "jmp").
+    #   target      — the jump's target operand: a label like ".L2", or "*%eax"
+    #                 for an indirect jump.
+    #   direction   — "back" (target is at/before this jump → a loop back-edge),
+    #                 "forward" (target is later → skipping code, e.g. if/break),
+    #                 "indirect" (a computed target, no static direction), or
+    #                 "unknown" (target label not found in the emitted asm).
+    #   conditional — False for the unconditional `jmp`; True for every conditional
+    #                 jump (je/jne/jl/…) and the `loop` family.
+    mnemonic: str
+    target: str
+    direction: str
+    conditional: bool
+
+
 class LineMapping(BaseModel):
     c_lines: List[int]
     asm_lines: List[int]
@@ -42,6 +59,11 @@ class LineMapping(BaseModel):
     # by direction. Only nonzero of {"loads", "stores"} are present. Empty for the
     # pyghidra pipeline, which computes no per-line memory traffic.
     memory_counts: Dict[str, int] = Field(default_factory=dict)
+    # Control-flow branch map: the jump instructions this Python line's assembly
+    # emits, in stream order, each with its target label and direction (a
+    # "back"-ward jump is a loop back-edge; a "forward" jump skips code). Empty for
+    # lines that emit no jumps and for the pyghidra pipeline.
+    branches: List[BranchEdge] = Field(default_factory=list)
 
 
 class Hotspot(BaseModel):
@@ -83,6 +105,25 @@ class MemorySummary(BaseModel):
     memory_totals: Dict[str, int] = Field(default_factory=lambda: {"loads": 0, "stores": 0})
 
 
+class BranchSummary(BaseModel):
+    # Program-wide control-flow branch map.
+    #   total_jumps    — number of jump instructions emitted (mapped to Python
+    #                    lines).
+    #   conditional / unconditional — split of total_jumps by jump kind
+    #                    (always sums to total_jumps).
+    #   back_edges     — jumps whose target is at/before them: loop back-edges,
+    #                    in effect the number of loops in the program.
+    #   forward_edges  — jumps whose target is later: skip-forward control flow
+    #                    (if/elif/else, break, short-circuit and/or). back_edges +
+    #                    forward_edges may trail total_jumps only for the rare
+    #                    indirect/unknown jump the supported subset never emits.
+    total_jumps: int = 0
+    conditional: int = 0
+    unconditional: int = 0
+    back_edges: int = 0
+    forward_edges: int = 0
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -120,6 +161,8 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line memory
     # traffic).
     memory_summary: Optional[MemorySummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line branch map).
+    branch_summary: Optional[BranchSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
