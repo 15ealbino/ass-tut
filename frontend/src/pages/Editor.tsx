@@ -10315,6 +10315,79 @@ print(result)
       description: 'movl stores chunk A\'s address into the fastbin head on the first free; the second free of A re-links the identical pointer via movl creating a cycle in the singly-linked LIFO list; malloc\'s movl reads the corrupted fd field from the duplicated entry, and the attacker\'s addl computes the target address offset — returning a fake chunk at the chosen location for arbitrary write',
     },
   },
+  {
+    id: 'lazy-fpu-leak',
+    name: 'LAZY FPU STATE LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Lazy FPU context switching leaves victim process register state in the FPU, letting an attacker on the same core recover AES keys via speculative side channels.',
+    explanation:
+      'Lazy FPU State Restore (CVE-2018-3665, CWE-200) exploits a performance optimization in operating system ' +
+      'context switching where the kernel delays saving and restoring FPU/SSE/AVX register state until a process ' +
+      'actually executes a floating-point instruction. When the scheduler switches from a victim process — holding ' +
+      'AES round keys in XMM registers via AES-NI — to an attacker process, the kernel sets the CR0.TS bit to ' +
+      'disable the FPU rather than immediately issuing XSAVE to flush the register contents. On Intel Core ' +
+      'processors from Sandy Bridge through Skylake, speculative execution proceeds past the resulting #NM ' +
+      '(device-not-available) exception, allowing the attacker to use a Flush+Reload cache side channel to infer ' +
+      'the stale XMM register values — including full 128-bit AES round keys — before the kernel handles the fault. ' +
+      'The original LazyFP research paper (Stecklina & Prescher, 2018) demonstrated recovery of AES-256 keys from ' +
+      'OpenSSL running on an adjacent hyperthread within seconds. Xen (XSA-267), KVM, and bare-metal Linux were all ' +
+      'affected. The Xen advisory noted that any guest could read FPU state from any other guest or the hypervisor ' +
+      'itself. The fix was switching to eager FPU restore — issuing XSAVE/XRSTOR on every context switch — which ' +
+      'imposes roughly 1-5% overhead but ensures no stale register state survives a task boundary. Linux kernels ' +
+      'prior to 4.6 used lazy FPU switching by default; newer kernels defaulted to eager mode but older distributions ' +
+      'remained exposed until patched. ' +
+      'In the assembly, movl stores the victim\'s AES key material (0xCAFEBABE and 0xDEADBEEF) into the FPU ' +
+      'register slots xmm0 and xmm1; the scheduler\'s movl sets cr0_ts to 1 (disabling the FPU) but the cmpl ' +
+      'against the saved flag falls through without clearing the registers — the attacker\'s movl reads the stale ' +
+      'key values directly from the unsaved FPU state, and addl sums the leaked round-key material confirming full ' +
+      'AES key recovery across the context switch boundary.',
+    code:
+`# CVE pattern: lazy FPU save lets attacker read victim's stale XMM regs
+class FpuState:
+    def __init__(self):
+        self.xmm0 = 0
+        self.xmm1 = 0
+        self.owner = 0
+        self.saved = 0
+
+    def load_key(self, key_hi, key_lo):
+        self.xmm0 = key_hi
+        self.xmm1 = key_lo
+        self.owner = 1
+        return self.xmm0
+
+class LazyScheduler:
+    def __init__(self):
+        self.cr0_ts = 0
+        self.active_pid = 0
+
+    def context_switch(self, fpu, new_pid):
+        self.cr0_ts = 1
+        self.active_pid = new_pid
+        if fpu.saved == 1:
+            fpu.xmm0 = 0
+            fpu.xmm1 = 0
+        return self.cr0_ts
+
+def lazy_fpu_attack():
+    fpu = FpuState()
+    sched = LazyScheduler()
+    fpu.load_key(3405691582, 3735928559)
+    sched.context_switch(fpu, 2)
+    stolen_hi = fpu.xmm0
+    stolen_lo = fpu.xmm1
+    recovered_key = stolen_hi + stolen_lo
+    return recovered_key
+
+result = lazy_fpu_attack()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl stores the victim\'s AES key (0xCAFEBABE and 0xDEADBEEF) into FPU register slots xmm0 and xmm1; the scheduler\'s movl sets cr0_ts to 1 (disabling the FPU) but cmpl checks saved == 1 and falls through without clearing the registers — the attacker\'s movl reads the stale xmm0 and xmm1 values past the #NM fault, and addl sums the leaked key material confirming full AES key recovery across the context switch',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
