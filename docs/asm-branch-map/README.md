@@ -118,7 +118,7 @@ The result is surfaced through:
   pyghidra pipeline, which has no per-line `.loc` map).
 - `frontend/src/api.ts` — the mirrored `branch_sense_counts` / `BranchSenseSummary` /
   `branch_sense_summary` types.
-- `frontend/src/pages/Editor.tsx` — `formatBranches()` plus the `BRANCH::`
+- `frontend/src/pages/Editor.tsx` — `formatBranchSenses()` plus the `BRANCH::`
   legend chip and per-line tooltip annotation.
 
 A conditional jump still counts toward `asm_count` and the `branch`
