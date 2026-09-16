@@ -10388,6 +10388,85 @@ print(result)
       description: 'movl stores the victim\'s AES key (0xCAFEBABE and 0xDEADBEEF) into FPU register slots xmm0 and xmm1; the scheduler\'s movl sets cr0_ts to 1 (disabling the FPU) but cmpl checks saved == 1 and falls through without clearing the registers — the attacker\'s movl reads the stale xmm0 and xmm1 values past the #NM fault, and addl sums the leaked key material confirming full AES key recovery across the context switch',
     },
   },
+  {
+    id: 'entrysign-forgery',
+    name: 'ENTRYSIGN MICROCODE FORGERY',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'AMD microcode signature verification uses AES-CMAC with a publicly known NIST example key instead of a secure hash, letting a local attacker forge valid signatures and load arbitrary microcode.',
+    explanation:
+      'EntrySign (CVE-2024-56161, CVSS 7.2) exploits a fundamental cryptographic design flaw in AMD\'s microcode ' +
+      'patch loader present across all Zen 1 through Zen 5 processors. AMD\'s ROM-resident signature verification ' +
+      'uses AES-CMAC — a message authentication code requiring a secret key — as if it were a collision-resistant ' +
+      'hash function. Worse, the AES key used across all affected processors is the publicly documented example key ' +
+      'from NIST Special Publication 800-38B (the AES-CMAC specification), meaning any attacker who reads the ' +
+      'standard can compute valid CMAC tags for arbitrary payloads. The verification pipeline works as follows: the ' +
+      'CPU compares a hash of the embedded public RSA key against a reference burned into silicon, then verifies an ' +
+      'RSA signature over the CMAC tag of the patch body — but since the attacker knows the CMAC key, they can ' +
+      'compute the correct tag for any crafted microcode, making the RSA layer irrelevant. Discovered by Google ' +
+      'security researchers (Josh Eads, Kristoffer Janke, Eduardo Vela Nava, Tavis Ormandy, Matteo Rizzo), the flaw ' +
+      'allows a local administrator to load unsigned microcode that alters CPU instruction behavior, breaks AMD ' +
+      'SEV-SNP confidential VM guarantees, and undermines hardware root-of-trust. While the malicious microcode does ' +
+      'not survive a power cycle, it persists across warm reboots and can silently modify cryptographic instructions ' +
+      'or security checks during the session. AMD expanded the advisory in April 2025 to include Zen 5 processors. ' +
+      'In the assembly, movl stores the known NIST CMAC key into the verifier\'s key slots, and the attacker\'s ' +
+      'imull computes the forged tag using the same key — cmpl then compares the forged tag against the expected ' +
+      'value and finds them equal, causing the conditional movl to set the privilege level to 0 (ring 0) and ' +
+      'the final movl to load the malicious patch into the active microcode slot.',
+    code:
+`# CVE pattern: microcode signature uses known key, enabling forgery
+class CmacVerifier:
+    def __init__(self):
+        self.key_lo = 42
+        self.key_hi = 17
+        self.verified = 0
+
+    def weak_mac(self, data):
+        tag = data * self.key_lo
+        tag = tag + self.key_hi
+        return tag
+
+    def check_sig(self, patch_data, signature):
+        expected = self.weak_mac(patch_data)
+        if expected == signature:
+            self.verified = 1
+        else:
+            self.verified = 0
+        return self.verified
+
+class PatchLoader:
+    def __init__(self):
+        self.active_patch = 0
+        self.priv_level = 3
+
+    def apply_patch(self, verifier, patch, sig):
+        ok = verifier.check_sig(patch, sig)
+        if ok == 1:
+            self.active_patch = patch
+            self.priv_level = 0
+        return ok
+
+def entrysign_forge():
+    v = CmacVerifier()
+    loader = PatchLoader()
+    known_key_lo = v.key_lo
+    known_key_hi = v.key_hi
+    evil_patch = 777
+    forged_tag = evil_patch * known_key_lo
+    forged_tag = forged_tag + known_key_hi
+    loader.apply_patch(v, evil_patch, forged_tag)
+    stolen_priv = loader.priv_level
+    print(stolen_priv)
+    return stolen_priv
+
+result = entrysign_forge()
+print(result)
+`,
+    badAsm: {
+      patterns: ['imull', 'cmpl'],
+      description: 'movl stores the NIST example CMAC key (42 and 17) into the verifier\'s key_lo and key_hi fields; the attacker\'s imull multiplies the malicious patch value by the known key_lo and addl adds key_hi to compute the forged tag — cmpl then compares forged_tag against the expected CMAC and finds them equal, causing the conditional movl to set priv_level to 0 (ring 0 microcode execution) and the final movl to load the evil patch into the active_patch slot',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
