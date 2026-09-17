@@ -10467,6 +10467,92 @@ print(result)
       description: 'movl stores the NIST example CMAC key (42 and 17) into the verifier\'s key_lo and key_hi fields; the attacker\'s imull multiplies the malicious patch value by the known key_lo and addl adds key_hi to compute the forged tag — cmpl then compares forged_tag against the expected CMAC and finds them equal, causing the conditional movl to set priv_level to 0 (ring 0 microcode execution) and the final movl to load the evil patch into the active_patch slot',
     },
   },
+  {
+    id: 'alpc-heap-overflow',
+    name: 'ALPC HEAP OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Crafted ALPC message overflows a fixed-size ACL heap buffer, corrupting the adjacent process token to escalate from AppContainer sandbox to SYSTEM.',
+    explanation:
+      'ALPC Heap Overflow (CVE-2026-85880 / CWE-122, CVSS 7.8) targets a boundary error in the Windows kernel\'s ' +
+      'RtlpCreateServerAcl function within the Advanced Local Procedure Call (ALPC) subsystem — the fundamental IPC ' +
+      'mechanism used by every Windows process for high-speed cross-privilege communication. When a client sends a ' +
+      'crafted ALPC message, the function allocates a fixed-size heap buffer for the server ACL (Access Control List) ' +
+      'but copies the attacker-controlled message data without validating that the input length fits within the ' +
+      'allocation. The excess bytes overflow into the adjacent heap object — critically, the process token structure ' +
+      'that stores the caller\'s privilege level, integrity label, and sandbox state. By corrupting the token\'s ' +
+      'privilege field to SYSTEM (0) and clearing the AppContainer sandbox flag, the attacker\'s low-privilege ' +
+      'process gains unrestricted kernel-level access. The vulnerability was actively exploited as a zero-day before ' +
+      'Microsoft\'s September 2026 Patch Tuesday and was weaponized in real attack chains to escape Chrome\'s renderer ' +
+      'sandbox — a crafted web page could chain a renderer RCE with this ALPC overflow to achieve full SYSTEM code ' +
+      'execution with no user interaction. CISA added CVE-2026-85880 to its Known Exploited Vulnerabilities catalog ' +
+      'immediately. Every Windows version from Server 2012 through Windows 11 was affected. ' +
+      'In the assembly, movl stores the ACL payload values into consecutive stack slots representing the fixed heap ' +
+      'buffer; the while loop\'s cmpl compares the iteration counter against msg_len (6) rather than the buffer ' +
+      'capacity (4), so iterations i=4 and i=5 execute movl writes past the buffer boundary into the adjacent token ' +
+      'structure — setting priv_level to 0 (SYSTEM) and sandboxed to 0, completing the privilege escalation.',
+    code:
+`# CVE pattern: ALPC heap overflow — RtlpCreateServerAcl copies past buffer bounds
+class AclBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.slot3 = 0
+
+class ProcessToken:
+    def __init__(self):
+        self.priv_level = 3
+        self.integrity = 4096
+        self.sandboxed = 1
+
+class AlpcPort:
+    def __init__(self):
+        self.acl = AclBuffer(4)
+        self.adj_token = ProcessToken()
+
+    def create_server_acl(self, payload, msg_len):
+        i = 0
+        while i < msg_len:
+            if i == 0:
+                self.acl.slot0 = payload
+            elif i == 1:
+                self.acl.slot1 = payload + 1
+            elif i == 2:
+                self.acl.slot2 = payload + 2
+            elif i == 3:
+                self.acl.slot3 = payload + 3
+            elif i == 4:
+                self.adj_token.priv_level = 0
+            elif i == 5:
+                self.adj_token.sandboxed = 0
+            i += 1
+        return i
+
+    def query_token(self):
+        return self.adj_token.priv_level
+
+def exploit_alpc():
+    port = AlpcPort()
+    before = port.query_token()
+    port.create_server_acl(1094795585, 6)
+    after = port.query_token()
+    escaped = 0
+    if after == 0:
+        escaped = 1
+    print(before)
+    print(after)
+    return escaped
+
+result = exploit_alpc()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl stores ACL payload values (0x41414141 and offsets) into consecutive stack slots representing the fixed 4-slot heap buffer; the while loop\'s cmpl compares the iteration counter against msg_len (6) instead of the buffer capacity (4) — iterations i=4 and i=5 execute movl writes past the buffer boundary into the adjacent ProcessToken, setting priv_level to 0 (SYSTEM) and sandboxed to 0, completing the sandbox escape and privilege escalation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
