@@ -10553,6 +10553,93 @@ print(result)
       description: 'movl stores ACL payload values (0x41414141 and offsets) into consecutive stack slots representing the fixed 4-slot heap buffer; the while loop\'s cmpl compares the iteration counter against msg_len (6) instead of the buffer capacity (4) — iterations i=4 and i=5 execute movl writes past the buffer boundary into the adjacent ProcessToken, setting priv_level to 0 (SYSTEM) and sandboxed to 0, completing the sandbox escape and privilege escalation',
     },
   },
+  {
+    id: 'house-of-einherjar',
+    name: 'HOUSE OF EINHERJAR',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'A single null byte overflow clears the PREV_IN_USE flag on an adjacent heap chunk, triggering backward consolidation into attacker-controlled memory.',
+    explanation:
+      'House of Einherjar (CVE-2023-6779 / CWE-122, presented by Hiroki Matsukuma at CODE BLUE 2016) is a heap ' +
+      'exploitation technique that weaponizes the smallest possible corruption — a single null byte overflow — into ' +
+      'a full arbitrary-write primitive. The attacker overflows exactly one byte from a heap chunk into the metadata ' +
+      'header of the adjacent chunk, zeroing the PREV_IN_USE bit in its size field. Simultaneously, the attacker ' +
+      'crafts a fake prev_size value that points backward to attacker-controlled memory (a "fake chunk"). When the ' +
+      'adjacent chunk is freed, glibc\'s consolidation logic reads the now-clear PREV_IN_USE flag and trusts the ' +
+      'fake prev_size to locate the "previous" chunk — landing on the attacker\'s crafted region. The allocator ' +
+      'merges these regions into one large free chunk. The next malloc() call returns a pointer overlapping the fake ' +
+      'chunk\'s memory, giving the attacker read/write control over that region. In real exploits, this overlapping ' +
+      'allocation is used to corrupt tcache metadata, __free_hook, or vtable pointers, achieving arbitrary code ' +
+      'execution. CVE-2023-6779 demonstrated this exact pattern: an off-by-one null byte in glibc\'s ' +
+      '__vsyslog_internal() triggered backward consolidation that overlapped attacker data, enabling root privilege ' +
+      'escalation on every major Linux distribution running glibc 2.37 through 2.39. CVE-2023-6246 exploited a ' +
+      'related heap overflow in the same syslog codepath. ' +
+      'In the assembly, the while loop\'s cmpl checks the iteration counter against length (5), but chunk_a only ' +
+      'has 4 data slots (slot0–slot3); at i=4 the movl writes 0 into chunk_b\'s in_use field — the null byte ' +
+      'overflow — and sets prev_size to 192, simulating the backward consolidation setup that hijacks the next ' +
+      'allocation to overlap the fake chunk.',
+    code:
+`# CVE pattern: House of Einherjar — null byte clears PREV_IN_USE, fake consolidation
+class HeapChunk:
+    def __init__(self, size, in_use):
+        self.prev_size = 0
+        self.size = size
+        self.in_use = in_use
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.slot3 = 0
+class HeapState:
+    def __init__(self):
+        self.chunk_a = HeapChunk(64, 1)
+        self.chunk_b = HeapChunk(128, 1)
+        self.fake = HeapChunk(64, 1)
+        self.merged = 0
+        self.hijacked = 0
+    def write_overflow(self, payload, length):
+        i = 0
+        while i < length:
+            if i == 0:
+                self.chunk_a.slot0 = payload
+            elif i == 1:
+                self.chunk_a.slot1 = payload + 1
+            elif i == 2:
+                self.chunk_a.slot2 = payload + 2
+            elif i == 3:
+                self.chunk_a.slot3 = payload + 3
+            elif i == 4:
+                self.chunk_b.in_use = 0
+                self.chunk_b.prev_size = 192
+            i += 1
+        return i
+    def free_consolidate(self):
+        if self.chunk_b.in_use == 0:
+            self.merged = 1
+            self.fake.slot0 = 0
+        return self.merged
+    def alloc_overlap(self):
+        if self.merged == 1:
+            self.fake.slot0 = 3735928559
+            self.hijacked = 1
+        return self.hijacked
+def exploit():
+    heap = HeapState()
+    before = heap.chunk_b.in_use
+    heap.write_overflow(1094795585, 5)
+    after = heap.chunk_b.in_use
+    heap.free_consolidate()
+    heap.alloc_overlap()
+    print(before)
+    print(after)
+    return heap.hijacked
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'The while loop\'s cmpl checks the iteration counter against length (5), but chunk_a only has 4 data slots; at i=4 the movl writes 0 into chunk_b\'s in_use field — the null byte overflow — and sets prev_size to 192, triggering backward consolidation that gives the attacker an overlapping allocation over the fake chunk\'s memory',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
