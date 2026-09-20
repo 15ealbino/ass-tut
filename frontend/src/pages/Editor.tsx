@@ -10640,6 +10640,92 @@ print(result)
       description: 'The while loop\'s cmpl checks the iteration counter against length (5), but chunk_a only has 4 data slots; at i=4 the movl writes 0 into chunk_b\'s in_use field — the null byte overflow — and sets prev_size to 192, triggering backward consolidation that gives the attacker an overlapping allocation over the fake chunk\'s memory',
     },
   },
+  {
+    id: 'buffer-overread',
+    name: 'BUFFER OVER-READ',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'A missing bounds check lets an attacker read past a buffer into adjacent memory, leaking secrets such as private keys and session tokens.',
+    explanation:
+      'Buffer over-read (CWE-125) is the vulnerability class behind Heartbleed (CVE-2014-0160), one of the most ' +
+      'devastating information-disclosure bugs in internet history. The flaw occurs when code trusts an attacker-supplied ' +
+      'length field instead of the actual data size, causing a read that extends past the buffer boundary into adjacent ' +
+      'memory. In the Heartbleed case, OpenSSL\'s TLS heartbeat handler echoed back as many bytes as the client claimed ' +
+      'to have sent — up to 64 KB — without verifying the claim matched the real payload. Each malicious heartbeat ' +
+      'request leaked a window of heap memory that could contain private keys, passwords, session cookies, and other ' +
+      'secrets, all without leaving any trace in server logs. The same pattern recurs in CVE-2024-12085 (rsync), where ' +
+      'a manipulated checksum length caused byte-by-byte leakage of uninitialized stack contents, which when combined ' +
+      'with CVE-2024-12084 (heap overflow) enabled full remote code execution. Unlike buffer overflows that corrupt ' +
+      'memory to hijack control flow, over-reads silently exfiltrate data — the program keeps running normally while ' +
+      'the attacker harvests secrets. Mitigations include strict length validation before any memcpy/read, compiler ' +
+      'flags like -ftrivial-auto-var-init=zero to zero uninitialized buffers, and AddressSanitizer which detects ' +
+      'out-of-bounds reads at runtime. In the assembly below, the while loop\'s cmpl compares the iteration counter ' +
+      'against claimed_len (5) rather than buf.length (2); when i >= 2, the movl instructions read from the adjacent ' +
+      'SecretRegion\'s fields — the over-read — leaking key material the caller should never see.',
+    code:
+`# CVE pattern: Heartbleed-style buffer over-read — missing bounds check leaks adjacent memory
+class Buffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.slot3 = 0
+        self.length = 0
+class SecretRegion:
+    def __init__(self):
+        self.key0 = 3735929054
+        self.key1 = 3405691582
+        self.key2 = 3131961357
+        self.key3 = 305419896
+def write_payload(buf, data, size):
+    if size > buf.capacity:
+        size = buf.capacity
+    i = 0
+    while i < size:
+        if i == 0:
+            buf.slot0 = data
+        elif i == 1:
+            buf.slot1 = data + 1
+        i += 1
+    buf.length = size
+    return size
+def heartbeat_echo(buf, secret, claimed_len):
+    leaked = 0
+    i = 0
+    while i < claimed_len:
+        if i < buf.length:
+            if i == 0:
+                leaked = buf.slot0
+            elif i == 1:
+                leaked = buf.slot1
+        else:
+            offset = i - buf.length
+            if offset == 0:
+                leaked = secret.key0
+            elif offset == 1:
+                leaked = secret.key1
+            elif offset == 2:
+                leaked = secret.key2
+        i += 1
+    return leaked
+def exploit():
+    buf = Buffer(4)
+    secret = SecretRegion()
+    write_payload(buf, 65, 2)
+    safe = heartbeat_echo(buf, secret, 2)
+    print(safe)
+    leaked = heartbeat_echo(buf, secret, 5)
+    print(leaked)
+    return leaked
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'The while loop\'s cmpl compares the iteration counter against claimed_len (5) rather than buf.length (2); when i >= 2, the movl instructions read from the adjacent SecretRegion\'s key fields instead of Buffer slots — the over-read — silently leaking secret values the caller was never meant to access',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
