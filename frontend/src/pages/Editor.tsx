@@ -10420,7 +10420,7 @@ export default function EditorPage() {
                 cursor: 'help',
               }}
             >
-              BRANCH:: {formatBranchSenses(result.branch_sense_summary.branch_totals)}
+              SENSE:: {formatBranchSenses(result.branch_sense_summary.branch_totals)}
             </span>
           )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (

@@ -53,7 +53,7 @@ reverse engineer must learn to catch. Seeing `2 signed` next to a Python
 1. Write Python in the editor and compile (the default `transpile` pipeline).
 2. Look at the **TRACE** legend bar along the bottom, after the existing chips
    (`COST::`, `MIX::`, `REGS::`, `MEM::`):
-   - A new `BRANCH:: N signed · N eq …` chip shows the program's jumps by sense.
+   - A new `SENSE:: N signed · N eq …` chip shows the program's jumps by sense.
    - Hover it for the full signed-vs-unsigned explanation.
    - Hover any per-line chip: its tooltip now includes `branch: N signed …`
      alongside the instruction count, mix, registers, memory, and flags.
@@ -118,7 +118,7 @@ The result is surfaced through:
   pyghidra pipeline, which has no per-line `.loc` map).
 - `frontend/src/api.ts` — the mirrored `branch_sense_counts` / `BranchSenseSummary` /
   `branch_sense_summary` types.
-- `frontend/src/pages/Editor.tsx` — `formatBranchSenses()` plus the `BRANCH::`
+- `frontend/src/pages/Editor.tsx` — `formatBranchSenses()` plus the `SENSE::`
   legend chip and per-line tooltip annotation.
 
 A conditional jump still counts toward `asm_count` and the `branch`
