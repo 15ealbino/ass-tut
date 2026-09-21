@@ -84,6 +84,34 @@ function formatGlossary(entries?: GlossaryEntry[]): string {
     .join('\n')
 }
 
+// ─── Arithmetic strength-hint presentation ─────────────────────────────────
+// Backend flags arithmetic whose asm the compiler strength-reduces (a
+// power-of-two multiply/divide becomes a shift / bitwise AND) or genuinely
+// cannot (a runtime divisor stays a real idiv). The marker is the compact glyph
+// shown next to a flagged line in the TRACE legend; the label names the kind in
+// tooltips. Order matches the backend's stable kind order.
+const HINT_ORDER = ['mul-pow2', 'div-pow2', 'div-var'] as const
+const HINT_MARKER: Record<string, string> = {
+  'mul-pow2': '≪',   // multiply reduced to a left shift
+  'div-pow2': '≫',   // divide reduced to a right shift / AND
+  'div-var': '÷',    // a genuine, costly idiv
+}
+const HINT_LABEL: Record<string, string> = {
+  'mul-pow2': 'power-of-two multiply → shift',
+  'div-pow2': 'power-of-two divide → shift/AND',
+  'div-var': 'runtime divisor → idiv (costly)',
+}
+
+// Render a hint-count map as "power-of-two multiply → shift 2 · ..." in the
+// stable HINT_ORDER, skipping kinds the backend already omitted.
+function formatHintTotals(totals?: Record<string, number>): string {
+  if (!totals) return ''
+  return HINT_ORDER
+    .filter(k => (totals[k] ?? 0) > 0)
+    .map(k => `${HINT_LABEL[k] ?? k} ${totals[k]}`)
+    .join(' · ')
+}
+
 // ─── Vulnerability catalogue ───────────────────────────────────────────────
 
 interface Vuln {
@@ -11484,6 +11512,26 @@ export default function EditorPage() {
               GLOSSARY:: {result.asm_glossary.length} OPS
             </span>
           )}
+          {result.strength_summary?.hint_totals && formatHintTotals(result.strength_summary.hint_totals) && (
+            <span
+              title={`Strength hints — arithmetic the compiler rewrites vs. what it can't: ${formatHintTotals(result.strength_summary.hint_totals)}. Even at -O0 a power-of-two multiply/divide is strength-reduced to a shift (or a bitwise AND for %), so no imul/idiv appears; only a divide by a runtime value stays a real, costly idiv. Click a flagged line below to see which.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              HINTS:: {result.strength_summary.hints.length}
+            </span>
+          )}
           {result.python_lines.map((line, i) => {
             const pyLine = i + 1
             const mapping = result.line_map[pyLine] as LineMapping | undefined
@@ -11503,6 +11551,10 @@ export default function EditorPage() {
               : ''
             const memTitle = formatMemory(mapping.memory_counts)
               ? ` — mem: ${formatMemory(mapping.memory_counts)}`
+              : ''
+            const hints = mapping.strength_hints ?? []
+            const hintTitle = hints.length
+              ? `\n${hints.map(h => `⚡ ${HINT_LABEL[h.kind] ?? h.kind}: ${h.message}`).join('\n')}`
               : ''
             return (
               <button
@@ -11524,7 +11576,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${memTitle}${flagTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${memTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
@@ -11536,6 +11588,14 @@ export default function EditorPage() {
                     style={{ color: 'var(--red)', marginLeft: 3, fontWeight: 700 }}
                   >
                     {FLAG_MARKER[f] ?? '!'}
+                  </span>
+                ))}
+                {hints.map(h => (
+                  <span
+                    key={h.kind}
+                    style={{ color: 'var(--cyan)', marginLeft: 3, fontWeight: 700 }}
+                  >
+                    {HINT_MARKER[h.kind] ?? '⚡'}
                   </span>
                 ))}
               </button>

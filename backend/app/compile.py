@@ -12,6 +12,7 @@ from functools import partial
 from typing import Dict, List, Set, Tuple
 
 from app.asm_glossary import build_asm_glossary
+from app.strength import analyze_strength
 from app.transpiler import TranspileError, build_line_map, transpile
 
 logger = logging.getLogger(__name__)
@@ -780,6 +781,12 @@ async def compile_python(python_source: str) -> dict:
     memory_summary = analyze_memory_traffic(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
+    # Source-level arithmetic strength hints: annotate each Python line whose
+    # arithmetic the compiler strength-reduces (a power-of-two multiply/divide
+    # becomes a shift / bitwise AND, even at -O0) or genuinely cannot (a runtime
+    # divisor stays a real idiv). Keyed off the Python source (not the asm), so
+    # it runs over the same line_map without needing the display asm.
+    strength_summary = analyze_strength(line_map, python_source)
 
     return {
         "python_lines": lines,
@@ -793,4 +800,5 @@ async def compile_python(python_source: str) -> dict:
         "stack_summary": stack_summary,
         "memory_summary": memory_summary,
         "asm_glossary": asm_glossary,
+        "strength_summary": strength_summary,
     }

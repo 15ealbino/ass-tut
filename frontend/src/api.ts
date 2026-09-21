@@ -50,6 +50,31 @@ export interface LineMapping {
   // Memory traffic: how many memory reads (loads) and writes (stores) this
   // line's asm performs. Only nonzero of {loads, stores} are present.
   memory_counts?: Record<string, number>
+  // Arithmetic strength hints: source-level notes for this line whose arithmetic
+  // the compiler strength-reduces (a power-of-two multiply/divide → shift / AND)
+  // or cannot (a runtime divisor → a real idiv). Empty when nothing fires.
+  strength_hints?: StrengthHint[]
+}
+
+export interface StrengthHint {
+  // "mul-pow2" | "div-pow2" | "div-var" — a stable label for grouping / marking.
+  kind: string
+  // Plain-English note tying the Python construct to the assembly it becomes.
+  message: string
+}
+
+export interface StrengthSummaryEntry {
+  py_line: number
+  kind: string
+  message: string
+}
+
+export interface StrengthSummary {
+  // Program-wide arithmetic strength hints. hint_totals maps each kind to the
+  // number of lines carrying it (ordered mul-pow2, div-pow2, div-var; zeros
+  // omitted); hints lists every flagged line, ordered by (py_line, kind).
+  hint_totals: Record<string, number>
+  hints: StrengthSummaryEntry[]
 }
 
 export interface Hotspot { py_line: number; asm_count: number; flags: string[] }
@@ -109,6 +134,9 @@ export interface CompileResponse {
   memory_summary?: MemorySummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
+  // Source-level arithmetic strength hints (transpile pipeline); null/absent for
+  // pyghidra, which has no per-line Python→asm mapping to hang hints off.
+  strength_summary?: StrengthSummary | null
 }
 
 export type CompileMethod = 'transpile' | 'pyghidra'
