@@ -142,11 +142,13 @@ def hint_for_binop(node: ast.BinOp) -> Optional[Tuple[str, str]]:
             return (
                 KIND_DIV_POW2,
                 f"Division/modulo by {n} is a power of two (2**{k}). Even at -O0 "
-                f"the compiler avoids the costly `idiv`: `//` becomes an "
-                f"arithmetic shift `sar ${k}` plus a small sign-bias fixup "
-                f"(signed division is not a bare shift for negative values), and "
-                f"`%` becomes a bitwise `and ${n - 1}` after that fixup. Look for "
-                f"the shifts in the asm — there is no `idiv`.",
+                f"the compiler avoids the costly `idiv`: `/` and `//` (both "
+                f"integer division in this transpiler, where every value is an "
+                f"int) become an arithmetic shift `sar ${k}` plus a small "
+                f"sign-bias fixup (signed division is not a bare shift for "
+                f"negative values), and `%` becomes a bitwise `and ${n - 1}` "
+                f"after that fixup. Look for the shifts in the asm — there is no "
+                f"`idiv`.",
             )
         # A non-constant divisor is the one case gcc cannot strength-reduce: a
         # genuine idiv. A non-power-of-two *constant* divisor (e.g. `a // 3`) is

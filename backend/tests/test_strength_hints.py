@@ -151,6 +151,14 @@ def test_div_pow2_message_names_shift_and_bitwise_and():
     assert "no `idiv`" in message
 
 
+def test_div_pow2_message_covers_both_slash_operators():
+    # The same div-pow2 hint fires for `/` and `//` (this transpiler treats both
+    # as int division), so the message must name both, not just `//`.
+    _, message = hint_for_binop(_binop("n / 4"))
+    assert "`/`" in message
+    assert "`//`" in message
+
+
 def test_div_var_message_names_idiv():
     _, message = hint_for_binop(_binop("a / b"))
     assert "idiv" in message
