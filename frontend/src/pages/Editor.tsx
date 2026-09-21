@@ -10726,6 +10726,84 @@ print(result)
       description: 'The while loop\'s cmpl compares the iteration counter against claimed_len (5) rather than buf.length (2); when i >= 2, the movl instructions read from the adjacent SecretRegion\'s key fields instead of Buffer slots — the over-read — silently leaking secret values the caller was never meant to access',
     },
   },
+  {
+    id: 'func-ptr-hijack',
+    name: 'FUNCTION POINTER HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'A buffer overflow overwrites a stored function pointer, redirecting execution to an attacker-controlled address when the pointer is later invoked.',
+    explanation:
+      'Function pointer hijacking (CWE-787 leading to CWE-822) is the foundational control-flow attack behind ' +
+      'many of the most impactful kernel exploits of 2024-2025. An adjacent buffer overflow, heap overflow, or ' +
+      'use-after-free corrupts a function pointer stored in a data structure, and when the program later dispatches ' +
+      'through that pointer, execution diverts to an attacker-chosen address — typically a ROP pivot or shellcode. ' +
+      'While vtable hijacking, GOT overwrite, and FSOP vtable corruption are specialized instances of this ' +
+      'pattern, the general case covers any stored callback: kernel file_operations, socket ops, ' +
+      'pipe_buf_operations, event handler tables, and plugin dispatch structures. CVE-2024-50264 (Linux vsock ' +
+      'transport UAF, Pwnie Award 2025 for Best Privilege Escalation) exploited a dangling callback pointer in ' +
+      'the vsock transport layer — after the structure was freed and reallocated with attacker-controlled data, ' +
+      'invoking the stale callback dispatched through the corrupted pointer to overwrite a page table entry and ' +
+      'redirect BPF JIT code for full kernel execution. CVE-2021-22555 (Linux Netfilter setsockopt heap overflow) ' +
+      'corrupted an adjacent msg_msg structure\'s callback pointer to pivot to a ROP chain and achieve root. ' +
+      'CVE-2025-37947 (ksmbd out-of-bounds write) used unchecked stream positioning in ksmbd_vfs_stream_write() ' +
+      'to overflow past XATTR_SIZE_MAX, corrupting kernel object callback pointers on adjacent heap pages for ' +
+      'reliable local privilege escalation. The pattern is universal: the attacker controls data adjacent to or ' +
+      'overlapping a function pointer, writes through the boundary, and waits for the dispatcher to call through ' +
+      'the corrupted value. In the assembly below, movl loads the handler\'s callback field into a register; after ' +
+      'the overflow write, this field holds the attacker\'s payload address (0xDEADBEEF + 4) rather than the ' +
+      'legitimate handler address 4096 — addl combines the corrupted callback with the also-overwritten priority ' +
+      'field, producing a fully attacker-controlled dispatch target.',
+    code:
+`# CVE pattern: buffer overflow corrupts stored callback pointer for control-flow hijack
+class EventHandler:
+    def __init__(self):
+        self.buf0 = 0
+        self.buf1 = 0
+        self.buf2 = 0
+        self.buf3 = 0
+        self.callback = 4096
+        self.priority = 1
+def invoke_handler(eh):
+    addr = eh.callback
+    result = addr + eh.priority
+    return result
+def write_data(eh, data, count):
+    i = 0
+    while i < count:
+        if i == 0:
+            eh.buf0 = data
+        elif i == 1:
+            eh.buf1 = data + 1
+        elif i == 2:
+            eh.buf2 = data + 2
+        elif i == 3:
+            eh.buf3 = data + 3
+        elif i == 4:
+            eh.callback = data + i
+        elif i == 5:
+            eh.priority = data + i
+        i += 1
+    return count
+def exploit():
+    eh = EventHandler()
+    legit = invoke_handler(eh)
+    print(legit)
+    write_data(eh, 65, 4)
+    safe = invoke_handler(eh)
+    print(safe)
+    payload = 3735928559
+    write_data(eh, payload, 6)
+    hijacked = invoke_handler(eh)
+    print(hijacked)
+    return hijacked
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads handler.callback from the struct into a register; after overflow_write pushes 6 elements past the 4-slot buffer, this field holds 0xDEADBEEF + 4 instead of 4096 — addl combines the corrupted callback with the also-overwritten priority field, producing a fully attacker-controlled value that would redirect any indirect call or dispatch through this handler',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
