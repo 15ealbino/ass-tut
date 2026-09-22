@@ -9122,6 +9122,1699 @@ print(result)
       description: 'movl stores the maple node\'s vma_start and vma_end fields during construction; expand_stack\'s movl zeros the gap and rcu_free\'s movl clears all fields — but lookup_vma\'s addl still sums vma_start + vma_end from the same stack offsets, now containing attacker-sprayed values (0xDEADBEEF, 0x400A00) from the recycled slab, achieving controlled read through the stale maple node pointer',
     },
   },
+  {
+    id: 'branch-history-injection',
+    name: 'BRANCH HISTORY INJECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Attacker poisons the CPU Branch History Buffer in user mode to steer kernel indirect branch predictions toward disclosure gadgets, leaking privileged memory via cache side channels.',
+    explanation:
+      'Branch History Injection (BHI / Spectre-BHB, CVE-2022-0001, CVE-2024-2201 / CWE-1303) is a speculative ' +
+      'execution side-channel attack that bypasses hardware mitigations for Spectre v2, including Intel\'s Enhanced ' +
+      'Indirect Branch Restricted Speculation (eIBRS) and ARM\'s CSV2. The Branch History Buffer (BHB) — a CPU ' +
+      'structure recording the direction and target of recent branches — is shared across privilege levels and not ' +
+      'cleared on user-to-kernel transitions even with eIBRS enabled. The attacker executes a crafted sequence of ' +
+      'branches in user mode to populate the BHB with a specific collision pattern, then performs a syscall. In ' +
+      'kernel mode, when the CPU encounters an indirect branch (e.g., a function pointer dispatch), the poisoned ' +
+      'BHB steers the branch predictor to select a disclosure gadget — a snippet of kernel code that speculatively ' +
+      'loads data from an attacker-chosen address and encodes it into the cache via a dependent access. The attacker ' +
+      'then uses Flush+Reload from user space to extract the cached data byte by byte. VUSec researchers demonstrated ' +
+      'leaking arbitrary kernel memory at 3.5 kB/sec on Intel CPUs from Skylake through Alder Lake. Native BHI ' +
+      '(CVE-2024-2201) proved that even without eBPF JIT, sufficient native gadgets exist in the kernel for full ' +
+      'exploitation, rendering FineIBT and privileged-eBPF-disable mitigations insufficient. Mitigations include ' +
+      'BHI_DIS_S on newer CPUs and costly software BHB-clearing loops on syscall entry (~10% overhead). ' +
+      'In the assembly, the movl instructions build the BHB pollution pattern — each cmpl/je pair records a ' +
+      'taken-or-not-taken outcome into the branch history shift register; the carefully chosen sequence aliases with ' +
+      'the kernel\'s indirect branch predictor entry, and the final addl encodes the speculatively accessed secret ' +
+      'into a cache line offset for Flush+Reload extraction.',
+    code:
+`# CVE pattern: BHB poisoning bypasses eIBRS to leak kernel memory
+class BranchHistoryBuffer:
+    def __init__(self, depth):
+        self.depth = depth
+        self.history = 0
+        self.entries = 0
+        self.poisoned = 0
+
+    def record_branch(self, taken):
+        self.history = self.history * 2
+        if taken > 0:
+            self.history = self.history + 1
+        self.entries = self.entries + 1
+        return self.history
+
+class SpeculativeEngine:
+    def __init__(self, eibrs_on):
+        self.eibrs = eibrs_on
+        self.predicted = 0
+        self.gadget_hit = 0
+        self.leaked = 0
+
+    def predict_indirect(self, bhb):
+        self.predicted = bhb.history
+        return self.predicted
+
+    def exec_disclosure_gadget(self, secret):
+        self.gadget_hit = 1
+        self.leaked = secret * 64
+        return self.leaked
+
+class CacheChannel:
+    def __init__(self, lines):
+        self.lines = lines
+        self.probed = 0
+        self.extracted = 0
+
+    def flush_reload(self, encoded):
+        self.probed = encoded + self.lines
+        self.extracted = self.probed - self.lines
+        return self.extracted
+
+bhb = BranchHistoryBuffer(195)
+i = 0
+while i < 24:
+    taken = 1
+    if i > 11:
+        taken = 0
+    bhb.record_branch(taken)
+    i += 1
+bhb.poisoned = 1
+cpu = SpeculativeEngine(1)
+target = cpu.predict_indirect(bhb)
+secret = cpu.exec_disclosure_gadget(3735928559)
+cache = CacheChannel(64)
+leaked = cache.flush_reload(secret)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'je'],
+      description: 'cmpl/je pairs form the BHB pollution pattern — each taken-or-not-taken branch outcome shifts into the history register; the crafted sequence collides with the kernel\'s indirect branch predictor entry, steering speculative execution to a disclosure gadget that leaks privileged memory through dependent cache access',
+    },
+  },
+  {
+    id: 'slam-lam-spectre',
+    name: 'SLAM ADDRESS MASKING',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Attacker exploits CPU Linear Address Masking to bypass canonicality checks and speculatively chase kernel pointers through unmasked gadgets, leaking arbitrary privileged memory via address-translation side channels.',
+    explanation:
+      'SLAM (Spectre based on Linear Address Masking, CVE-2020-12965 / CWE-1303) is a transient execution attack ' +
+      'discovered by VUSec researchers at Vrije Universiteit Amsterdam, presented at IEEE S&P 2024. It targets a new ' +
+      'class of Spectre disclosure gadgets — unmasked gadgets — that become exploitable when CPUs implement address ' +
+      'masking features: Intel Linear Address Masking (LAM), AMD Upper Address Ignore (UAI), or ARM Top Byte Ignore ' +
+      '(TBI). These features allow software to store metadata (tags, type bits) in the upper bits of 64-bit pointers ' +
+      'by relaxing the canonical address check that normally faults on non-canonical addresses. SLAM shows this ' +
+      'relaxation dramatically expands the Spectre attack surface: the attacker crafts a pointer whose upper bits ' +
+      'encode a chosen value while the lower bits point into kernel memory. During speculative execution, the CPU ' +
+      'skips the canonicality check (or a microarchitectural race lets the masking resolve before the fault), allowing ' +
+      'a pointer-chasing gadget — a double dereference pattern ptr -> *ptr -> **ptr — to speculatively load a ' +
+      'kernel secret and encode it into the address-translation cache. Unlike classical Flush+Reload on data caches, ' +
+      'SLAM uses an address-translation-based covert channel (probing TLB/page-table entries), which bypasses ' +
+      'Supervisor Mode Access Prevention (SMAP) mitigations that block userland data-cache probes of kernel lines. ' +
+      'VUSec demonstrated leaking the root password hash from /etc/shadow in kernel memory within 30 seconds on AMD ' +
+      'Zen 2 CPUs (which already support a form of address masking via CVE-2020-12965) and showed the attack applies ' +
+      'to future Intel (LAM, 4- and 5-level paging), AMD (UAI, 5-level paging), and ARM (TBI) processors. All ' +
+      'existing Spectre v2 mitigations (retpoline, eIBRS, IBPB) are insufficient because SLAM exploits Spectre v1-' +
+      'class conditional branch misprediction on the canonicality/bounds check, not indirect branch injection. Linux ' +
+      'maintainers responded by disabling LAM by default in the kernel. ' +
+      'In the assembly, movl stores the tagged pointer with metadata in the upper bits; the speculative addl ' +
+      'dereferences through the pointer-chase chain — each dependent load fans out into a TLB probe, and the final ' +
+      'imull encodes the leaked secret into a page-aligned offset for the address-translation covert channel extraction.',
+    code:
+`# CVE pattern: LAM unmasked gadgets leak kernel memory via speculative pointer chasing
+class LinearAddressMasker:
+    def __init__(self, bits):
+        self.mask_bits = bits
+        self.canonical = 1
+        self.masked_ptr = 0
+        self.unmasked = 0
+
+    def mask_upper(self, addr, tag):
+        self.masked_ptr = addr + tag * 256
+        return self.masked_ptr
+
+    def check_canonical(self, addr):
+        self.canonical = 1
+        self.unmasked = addr
+        return self.canonical
+
+class SpecGadget:
+    def __init__(self):
+        self.ptr = 0
+        self.deref1 = 0
+        self.deref2 = 0
+        self.leaked = 0
+
+    def pointer_chase(self, secret_addr, offset):
+        self.ptr = secret_addr
+        self.deref1 = self.ptr + offset
+        self.deref2 = self.deref1 * 64
+        self.leaked = self.deref2
+        return self.leaked
+
+class TLBChannel:
+    def __init__(self, entries):
+        self.entries = entries
+        self.probed = 0
+        self.extracted = 0
+
+    def evict_reload(self, encoded):
+        self.probed = encoded + self.entries
+        self.extracted = self.probed - self.entries
+        return self.extracted
+
+lam = LinearAddressMasker(63)
+tagged = lam.mask_upper(4096, 42)
+ok = lam.check_canonical(tagged)
+gadget = SpecGadget()
+secret = gadget.pointer_chase(tagged, 3735928559)
+tlb = TLBChannel(512)
+leaked = tlb.evict_reload(secret)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'imull'],
+      description: 'movl stores the LAM-tagged pointer with attacker-controlled metadata in the upper bits; addl speculatively dereferences through the pointer-chase chain — each dependent load bypasses the relaxed canonicality check — and imull encodes the leaked kernel secret into a page-aligned offset for address-translation covert channel extraction, bypassing SMAP by probing TLB entries instead of data cache lines',
+    },
+  },
+  {
+    id: 'load-value-injection',
+    name: 'LOAD VALUE INJECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Attacker injects chosen values into a victim\'s transient data flow by exploiting faulting or assisting loads, hijacking speculative execution to leak secrets from SGX enclaves or privileged contexts.',
+    explanation:
+      'Load Value Injection (LVI, CVE-2020-0551 / INTEL-SA-00334 / CWE-1303) is a transient execution attack ' +
+      'discovered by researchers at KU Leuven, Worcester Polytechnic Institute, Graz University of Technology, and ' +
+      'the University of Michigan, published at IEEE S&P 2020. Unlike Meltdown, which reads secrets speculatively, ' +
+      'LVI reverses the data flow: the attacker causes a victim load instruction to fault, assist, or abort ' +
+      '(e.g., by revoking a page mapping or triggering a microcode assist on a denormalized float), and the CPU\'s ' +
+      'store buffer or line-fill buffer transiently forwards stale attacker-chosen data to the faulting load. The ' +
+      'victim code then speculatively computes on this injected value — dereferencing it as a pointer, using it as ' +
+      'an array index, or branching on it — creating a disclosure gadget that encodes a secret into the cache. The ' +
+      'attacker extracts the secret via Flush+Reload. LVI is especially dangerous against Intel SGX enclaves, where ' +
+      'the OS is untrusted and can freely manipulate page tables to trigger page faults on enclave loads. Because ' +
+      'the injected value is chosen by the attacker and the victim code is trusted, every load in the victim ' +
+      'becomes a potential injection point — making mitigation extremely costly. Intel\'s recommended mitigation ' +
+      'requires inserting LFENCE instructions after every potentially vulnerable load to serialize the pipeline, ' +
+      'imposing 2-19x performance overhead. Unlike Spectre, LVI does not poison branch predictors; it poisons the ' +
+      'data itself at the microarchitectural level. CVSS 5.6 Medium (AV:L/AC:H/PR:L/UI:N/S:C/C:H/I:N/A:N). ' +
+      'In the assembly, movl performs the victim load that transiently receives the attacker-injected value from ' +
+      'the store buffer; the dependent addl and imull speculatively dereference and compute on the poisoned value, ' +
+      'encoding the secret into a cache-line-aligned offset for Flush+Reload extraction.',
+    code:
+`# CVE pattern: LVI hijacks victim loads via faulting microarchitectural forwarding
+class StoreBuffer:
+    def __init__(self, depth):
+        self.depth = depth
+        self.pending = 0
+        self.injected = 0
+        self.forwarded = 0
+
+    def poison_entry(self, value):
+        self.injected = value
+        self.pending = self.pending + 1
+        return self.injected
+
+    def forward_stale(self):
+        self.forwarded = self.injected
+        return self.forwarded
+
+class VictimEnclave:
+    def __init__(self):
+        self.trusted_ptr = 0
+        self.loaded = 0
+        self.computed = 0
+        self.secret = 0
+
+    def enclave_load(self, addr):
+        self.trusted_ptr = addr
+        self.loaded = self.trusted_ptr
+        return self.loaded
+
+    def dependent_compute(self, injected, secret_base):
+        self.secret = secret_base + injected
+        self.computed = self.secret * 64
+        return self.computed
+
+class FlushReload:
+    def __init__(self, lines):
+        self.lines = lines
+        self.probed = 0
+        self.extracted = 0
+
+    def extract(self, encoded):
+        self.probed = encoded + self.lines
+        self.extracted = self.probed - self.lines
+        return self.extracted
+
+sbuf = StoreBuffer(64)
+injected = sbuf.poison_entry(42)
+fwd = sbuf.forward_stale()
+victim = VictimEnclave()
+loaded = victim.enclave_load(fwd)
+leaked = victim.dependent_compute(loaded, 3735928559)
+cache = FlushReload(256)
+extracted = cache.extract(leaked)
+print(extracted)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'movl performs the victim enclave load that transiently receives attacker-injected data from the store buffer or line-fill buffer after a fault/assist; the dependent addl dereferences the poisoned value as a pointer and imull encodes the resulting secret into a cache-line-aligned offset for Flush+Reload side-channel extraction',
+    },
+  },
+  {
+    id: 'dirty-decrypt',
+    name: 'DIRTY DECRYPT',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker exploits a missing copy-on-write guard in the kernel\'s RxGK decryption path to corrupt the page cache of privileged SUID binaries and escalate to root.',
+    explanation:
+      'DirtyDecrypt (CVE-2026-31635 / CWE-787) is a local privilege escalation vulnerability in the Linux kernel\'s ' +
+      'AF_RXRPC networking stack, discovered by the Zellic and V12 security team in May 2026. The flaw resides in ' +
+      'rxgk_decrypt_skb(), which performs an in-place AES-CBC decryption on network packet data without first ' +
+      'ensuring the underlying pages have been copied-on-write. Because an inverted bounds check accepts oversized ' +
+      'RESPONSE authenticators, the decryption transform writes attacker-controlled ciphertext directly into page ' +
+      'cache pages that may be shared with privileged files — such as SUID-root binaries, /etc/shadow, or ' +
+      '/etc/sudoers. The attacker opens a readable SUID binary (populating the page cache), then sends a crafted ' +
+      'RxGK packet whose decrypted payload overwrites chosen bytes in the cached pages. When the kernel later ' +
+      'executes the corrupted SUID binary, the attacker\'s payload runs as root. Unlike DirtyPipe (CVE-2022-0847), ' +
+      'which abused pipe buffer flags, DirtyDecrypt abuses the cryptographic subsystem\'s failure to isolate its ' +
+      'working memory from the shared page cache — a missing copy-on-write guard that turns an unauthenticated ' +
+      'network transform into an arbitrary page-cache write primitive. The vulnerability affects distributions with ' +
+      'CONFIG_RXGK enabled (Fedora, Arch Linux, openSUSE Tumbleweed). CVSS 7.5 High. Proof-of-concept exploit code ' +
+      'was publicly released, achieving reliable root from an unprivileged local user. ' +
+      'In the assembly, movl stores the oversized authenticator length that passes the inverted bounds check; addl ' +
+      'advances the write offset into the shared page cache region, and the subsequent movl performs the in-place ' +
+      'decryption write that corrupts the privileged file\'s cached pages without triggering copy-on-write.',
+    code:
+`# CVE pattern: DirtyDecrypt page-cache write via missing COW guard in rxgk decrypt
+class PageCache:
+    def __init__(self, pages):
+        self.pages = pages
+        self.shared = 0
+        self.written = 0
+        self.cow_guard = 0
+
+    def map_file(self, file_id):
+        self.shared = file_id
+        self.cow_guard = 0
+        return self.shared
+
+    def write_page(self, offset, data):
+        self.written = offset + data
+        return self.written
+
+class RxgkDecrypt:
+    def __init__(self):
+        self.auth_len = 0
+        self.max_len = 0
+        self.accepted = 0
+        self.decrypted = 0
+
+    def check_bounds(self, auth_len, max_len):
+        self.auth_len = auth_len
+        self.max_len = max_len
+        self.accepted = self.auth_len + self.max_len
+        return self.accepted
+
+    def decrypt_inplace(self, cache_offset, payload):
+        self.decrypted = cache_offset + payload
+        return self.decrypted
+
+class SuidExploit:
+    def __init__(self):
+        self.target = 0
+        self.corrupted = 0
+        self.escalated = 0
+
+    def corrupt_binary(self, page_val, payload):
+        self.corrupted = page_val + payload
+        return self.corrupted
+
+    def execute_suid(self, corrupted):
+        self.escalated = corrupted * 1
+        return self.escalated
+
+cache = PageCache(4096)
+mapped = cache.map_file(1000)
+rxgk = RxgkDecrypt()
+accepted = rxgk.check_bounds(8192, 256)
+written = rxgk.decrypt_inplace(mapped, 3735928559)
+cache_write = cache.write_page(mapped, written)
+suid = SuidExploit()
+corrupted = suid.corrupt_binary(cache_write, 42)
+root = suid.execute_suid(corrupted)
+print(root)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the oversized authenticator length that passes the inverted bounds check in rxgk_decrypt_skb; addl advances the write offset into the shared page cache region and the subsequent movl performs the in-place decryption write that corrupts the privileged SUID binary\'s cached pages without triggering copy-on-write, enabling local privilege escalation to root',
+    },
+  },
+  {
+    id: 'heap-consolidation',
+    name: 'HEAP CONSOLIDATION ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted prev_size and PREV_INUSE metadata trick free() into merging an allocated chunk with an adjacent free region, creating overlapping allocations for arbitrary read/write.',
+    explanation:
+      'Heap consolidation attacks (CWE-122 / CWE-787) exploit the glibc malloc coalescing logic that merges adjacent ' +
+      'free chunks to reduce fragmentation. When free() is called on a chunk, it inspects the PREV_INUSE bit of the ' +
+      'next chunk\'s size field; if cleared, it reads prev_size to locate the preceding chunk and performs backward ' +
+      'consolidation via the unlink macro, merging both into one large free region. An attacker who can corrupt a ' +
+      'chunk\'s prev_size field and clear the PREV_INUSE bit of its neighbor triggers a spurious consolidation that ' +
+      'encompasses still-allocated memory, causing a subsequent malloc to return a pointer that overlaps a live object. ' +
+      'This grants the attacker read/write over that object\'s contents — typically hijacking a function pointer or ' +
+      'vtable to achieve code execution. CVE-2021-3156 (Baron Samedit, sudo 1.8.2–1.9.5p1) used a heap-based buffer ' +
+      'overflow in sudoedit\'s backslash-escape parsing to corrupt heap metadata and trigger overlapping chunk ' +
+      'allocation, escalating any local user to root without a password. CVE-2023-6246 (glibc __vsyslog_internal) ' +
+      'similarly leveraged a heap buffer overflow during syslog formatting to corrupt adjacent chunk metadata, enabling ' +
+      'local privilege escalation on Debian, Ubuntu, and Fedora. The technique remains central to modern exploitation ' +
+      'because glibc\'s consolidation path trusts in-band metadata that resides in attacker-reachable memory. ' +
+      'In the assembly, movl writes the forged prev_size value into the chunk header; subl clears the PREV_INUSE bit ' +
+      'from the neighbor\'s size field, and the subsequent addl during free() follows the corrupted prev_size backward ' +
+      'to compute the merged region base, producing an overlapping allocation that the attacker controls.',
+    code:
+`# CVE pattern: heap consolidation via corrupted prev_size (CVE-2021-3156)
+class HeapChunk:
+    def __init__(self, size):
+        self.prev_size = 0
+        self.size = size
+        self.prev_inuse = 1
+        self.data = 0
+        self.freed = 0
+
+    def write_data(self, val):
+        self.data = val
+        return self.data
+
+class HeapAllocator:
+    def __init__(self):
+        self.total = 0
+        self.consolidated = 0
+        self.overlap_ptr = 0
+
+    def malloc(self, size):
+        chunk = HeapChunk(size)
+        self.total += size
+        return chunk
+
+    def free_chunk(self, chunk, neighbor):
+        chunk.freed = 1
+        if neighbor.prev_inuse == 0:
+            merge_base = neighbor.size + neighbor.prev_size
+            self.consolidated = merge_base
+            self.overlap_ptr = merge_base + chunk.data
+        return self.consolidated
+
+heap = HeapAllocator()
+chunk_a = heap.malloc(128)
+chunk_b = heap.malloc(256)
+chunk_c = heap.malloc(128)
+chunk_a.write_data(3735928559)
+chunk_b.prev_size = 128 + 256
+chunk_b.prev_inuse = 0
+merged = heap.free_chunk(chunk_a, chunk_b)
+overlap = heap.malloc(512)
+overlap.data = merged + 42
+hijacked = overlap.data
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'subl', 'addl'],
+      description: 'movl writes the forged prev_size value into the heap chunk header; subl clears the PREV_INUSE bit from the neighboring chunk\'s size field to fake a free predecessor, and addl during free() follows the corrupted prev_size backward to compute the merged consolidation region, producing an overlapping allocation the attacker uses for arbitrary read/write and code execution',
+    },
+  },
+  {
+    id: 'mte-tag-bypass',
+    name: 'MTE TAG BYPASS',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Speculative execution or page use-after-free bypasses ARM Memory Tagging Extension tag checks, defeating hardware memory safety to enable arbitrary kernel code execution.',
+    explanation:
+      'ARM Memory Tagging Extension (MTE), introduced in ARMv8.5-A, assigns 4-bit color tags to every 16-byte ' +
+      'memory granule and checks them on every load and store, providing probabilistic detection of use-after-free ' +
+      'and buffer overflow at the hardware level — an attacker has only a 1-in-16 chance of guessing the correct ' +
+      'tag. However, two independent lines of research have shown MTE can be fully defeated. CVE-2025-0072 (Arm ' +
+      'Mali GPU Valhall and 5th-Gen driver, r29p0 through r53p0) exploits a use-after-free where the GPU driver ' +
+      'maps freed pages into user space via vmf_insert_pfn_prot; because user-space memory mappings bypass MTE ' +
+      'tag checks on physical page access, the attacker reads and writes freed kernel pages without triggering a ' +
+      'tag mismatch, reusing them as page table global directories (PGD) for GPU contexts to achieve arbitrary ' +
+      'kernel read/write and code execution on Pixel 7, 8, and 9 devices. Separately, the TikTag research (2024) ' +
+      'demonstrated that speculative execution leaks MTE tags from arbitrary addresses via cache timing side ' +
+      'channels: TikTag-v1 exploits branch predictor and prefetcher speculation shrinkage, while TikTag-v2 abuses ' +
+      'store-to-load forwarding, both leaking tags with over 95 percent success in under 4 seconds, reducing the ' +
+      '1-in-16 brute-force to a deterministic bypass. Once the tag is known, the attacker crafts pointers with ' +
+      'matching tags, turning any memory corruption primitive into a reliable exploit. In the assembly, movl ' +
+      'performs the speculative memory probe that loads through the guessed tag; cmpl compares the measured cache ' +
+      'timing against the side-channel threshold to infer whether the tag matched; and the subsequent movl writes ' +
+      'the forged tagged pointer that bypasses MTE validation to access freed memory.',
+    code:
+`# CVE pattern: MTE tag bypass via speculation side-channel (CVE-2025-0072 / TikTag)
+class MemoryGranule:
+    def __init__(self, addr, tag):
+        self.addr = addr
+        self.tag = tag
+        self.data = 0
+        self.freed = 0
+
+    def set_data(self, val):
+        self.data = val
+        return self.data
+
+class MTEAllocator:
+    def __init__(self):
+        self.next_tag = 1
+        self.total = 0
+        self.leaked_tag = 0
+
+    def alloc(self, addr):
+        tag = self.next_tag
+        self.next_tag += 1
+        if self.next_tag > 15:
+            self.next_tag = 1
+        granule = MemoryGranule(addr, tag)
+        self.total += 1
+        return granule
+
+    def free(self, granule):
+        granule.freed = 1
+        return granule.tag
+
+    def check_tag(self, ptr_tag, granule):
+        if ptr_tag == granule.tag:
+            return 1
+        return 0
+
+class SpeculativeProbe:
+    def __init__(self):
+        self.cache_hit = 0
+        self.threshold = 50
+        self.probes = 0
+
+    def tiktag_v1(self, guess, target):
+        self.probes += 1
+        timing = 100 - (guess * 6)
+        if timing < self.threshold:
+            self.cache_hit = 1
+            return guess
+        self.cache_hit = 0
+        return 0
+
+mte = MTEAllocator()
+victim = mte.alloc(4096)
+victim.set_data(3735928559)
+secret_tag = mte.free(victim)
+probe = SpeculativeProbe()
+leaked = 0
+i = 1
+while i < 16:
+    result = probe.tiktag_v1(i, victim)
+    if result == secret_tag:
+        leaked = result
+        break
+    i += 1
+valid = mte.check_tag(leaked, victim)
+forged_access = victim.data * valid
+print(forged_access)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl performs the speculative memory access that probes the MTE tag via cache timing; cmpl compares the measured access latency against the side-channel threshold to determine whether the guessed tag matches the freed granule\'s tag, and the subsequent movl writes the forged tagged pointer that bypasses MTE validation to read or write freed memory without triggering a tag-check fault',
+    },
+  },
+  {
+    id: 'retbleed',
+    name: 'RETBLEED',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Speculative execution through return instructions bypasses retpoline mitigations to leak arbitrary kernel memory from unprivileged user space.',
+    explanation:
+      'Retbleed (CVE-2022-29900 for AMD, CVE-2022-29901 for Intel), discovered by ETH Zurich researchers in 2022, ' +
+      'demonstrates that return instructions can be exploited for speculative code execution, defeating the retpoline ' +
+      'mitigation that the industry deployed after Spectre v2. Retpoline replaced indirect jumps and calls with ' +
+      'return instructions under the assumption that returns could not be speculatively mispredicted in an exploitable ' +
+      'way — Retbleed proved this assumption wrong. On Intel Skylake and later processors, the Return Stack Buffer ' +
+      '(RSB) that predicts return targets has a finite depth; when deep or crafted call chains cause it to underflow, ' +
+      'the CPU silently falls back to the Branch Target Buffer (BTB) for the prediction, re-enabling the same ' +
+      'Spectre-BTB injection that retpoline was designed to block. On AMD Zen 1 and Zen 2 processors, the attack is ' +
+      'even more fundamental: Branch Type Confusion (CVE-2022-23825) causes the predictor to treat return instructions ' +
+      'as indirect branches outright, allowing an attacker to poison the BTB from user space and redirect kernel returns ' +
+      'to attacker-chosen gadgets. During the speculative window before the CPU detects the misprediction, transient ' +
+      'instructions execute a Spectre-style disclosure gadget that indexes a probe array by a secret byte, encoding the ' +
+      'value into the cache. The attacker then uses Flush+Reload to measure cache line access times and recover the ' +
+      'secret one byte at a time. Because the attack targets kernel return instructions, it can leak /etc/shadow hashes, ' +
+      'cryptographic keys, and any data reachable through kernel address space. In the assembly, callq pushes a return ' +
+      'address onto both the hardware stack and the RSB; repeated pop operations drain the RSB depth to zero; the ret ' +
+      'instruction then falls back to the BTB for its prediction, and the transient movl encodes the secret byte into a ' +
+      'cache-line offset that the attacker recovers via timing.',
+    code:
+`# CVE pattern: Retbleed RSB underflow speculation (CVE-2022-29900 / CVE-2022-29901)
+class ReturnStackBuffer:
+    def __init__(self):
+        self.depth = 0
+        self.predicted = 0
+
+    def push(self, addr):
+        self.depth += 1
+        self.predicted = addr
+        return self.depth
+
+    def pop(self):
+        if self.depth > 0:
+            self.depth -= 1
+        return self.predicted
+
+class BranchTargetBuffer:
+    def __init__(self):
+        self.target = 0
+        self.trained = 0
+
+    def train(self, src, dst):
+        self.target = dst
+        self.trained += 1
+        return self.trained
+
+    def predict_fallback(self):
+        return self.target
+
+class Retpoline:
+    def __init__(self):
+        self.bypassed = 0
+        self.caught = 0
+
+    def trap(self, target):
+        self.caught += 1
+        return 0
+
+rsb = ReturnStackBuffer()
+btb = BranchTargetBuffer()
+wall = Retpoline()
+secret_byte = 42
+btb.train(4096, 8192)
+rsb.push(4096)
+rsb.pop()
+if rsb.depth == 0:
+    wall.bypassed = 1
+    spec_target = btb.predict_fallback()
+else:
+    spec_target = rsb.pop()
+leaked = 0
+if wall.bypassed == 1:
+    cache_line = secret_byte * 256
+    leaked = cache_line
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['ret', 'callq'],
+      description: 'callq pushes a return address onto the hardware stack and the Return Stack Buffer; when the RSB is drained to zero depth, ret falls back to the Branch Target Buffer for its prediction — the same BTB an attacker poisoned from user space — and the transient movl following the misspeculated ret encodes the secret byte into a cache-line offset recoverable via Flush+Reload',
+    },
+  },
+  {
+    id: 'aepic-leak',
+    name: 'AEPIC LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Reading undefined APIC MMIO register ranges on Intel CPUs architecturally returns stale microarchitectural data, leaking SGX enclave secrets without any side channel.',
+    explanation:
+      'AEPIC Leak (CVE-2022-21233), disclosed by researchers at Sapienza University of Rome, TU Graz, and Amazon ' +
+      'Web Services in August 2022, is the first CPU vulnerability that architecturally leaks sensitive data from ' +
+      'the microarchitecture without relying on any side channel such as cache timing. On Intel CPUs based on the ' +
+      'Sunny Cove microarchitecture (10th, 11th, and 12th generation), the memory-mapped I/O (MMIO) page of the ' +
+      'local Advanced Programmable Interrupt Controller (xAPIC) contains register ranges that the architecture ' +
+      'defines as reserved or undefined. When a privileged OS-level read targets one of these undefined offsets, ' +
+      'the CPU does not return zero — instead, it returns whatever stale data the internal interconnect last ' +
+      'carried through the cache-line-sized buffer shared between the APIC and the L2 cache. Because Intel SGX ' +
+      'enclaves execute on the same physical core and their data transits through the same internal buffers, an ' +
+      'attacker with ring-0 access can force enclave data into the APIC line buffer using a technique called ' +
+      'Enclave Shaking (repeatedly interrupting the enclave at precise points) combined with Cache Line Freezing ' +
+      '(evicting all other cache lines so only the target line remains). Each MMIO read then returns 4 bytes of ' +
+      'stale enclave data — enough to dump the entire enclave memory in under one second. The researchers used ' +
+      'this to extract AES-NI keys and RSA private keys from Intel IPP, as well as SGX sealing keys and remote ' +
+      'attestation keys, completely defeating SGX confidentiality guarantees. Unlike Spectre or Meltdown, the ' +
+      'leak is deterministic and noise-free because the data is returned by a normal architectural load, not ' +
+      'inferred from timing. In the assembly, movl reads from the MMIO-mapped APIC page at a reserved offset; ' +
+      'the CPU fills the result register with stale data from the internal line buffer rather than an ' +
+      'architecturally correct zero, and each iteration of the scanning loop leaks the next 4-byte chunk.',
+    code:
+`# CVE pattern: AEPIC Leak MMIO stale data read (CVE-2022-21233)
+class ApicRegisters:
+    def __init__(self):
+        self.base = 0
+        self.stale_data = 0
+        self.mapped = 0
+
+    def map_mmio(self, addr):
+        self.base = addr
+        self.mapped = 1
+        return self.base
+
+    def read_undefined(self, offset):
+        self.stale_data = offset * 73
+        return self.stale_data
+
+class SgxEnclave:
+    def __init__(self):
+        self.sealed_key = 0
+        self.loaded = 0
+        self.epc_base = 0
+
+    def load_secret(self, key):
+        self.sealed_key = key
+        self.loaded = 1
+        self.epc_base = 4096
+        return self.epc_base
+
+    def attest(self):
+        return self.sealed_key
+
+class CacheLineFreezer:
+    def __init__(self):
+        self.frozen = 0
+        self.target = 0
+
+    def freeze(self, line_addr):
+        self.target = line_addr
+        self.frozen = 1
+        return self.frozen
+
+apic = ApicRegisters()
+enclave = SgxEnclave()
+freezer = CacheLineFreezer()
+enclave.load_secret(3735928559)
+apic.map_mmio(4276092928)
+freezer.freeze(enclave.epc_base)
+leaked = 0
+i = 0
+while i < 16:
+    stale = apic.read_undefined(i * 16)
+    if stale > 0:
+        leaked += stale
+    i += 1
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl reads from the MMIO-mapped xAPIC page at a reserved register offset; the CPU returns stale microarchitectural data from the internal line buffer instead of zero, and the addl accumulates each leaked 4-byte chunk as the loop iterates over undefined APIC register ranges',
+    },
+  },
+  {
+    id: 'cacheout-l1des',
+    name: 'CACHEOUT L1D EVICTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Targeted L1D cache line eviction leaks stale data through CPU fill buffers, bypassing prior MDS hardware mitigations.',
+    explanation:
+      'CacheOut, also known as L1D Eviction Sampling or L1DES (CVE-2020-0549 / INTEL-SA-00329, CVSS 6.5), ' +
+      'is a microarchitectural side-channel attack disclosed by Stephan van Schaik and colleagues at the ' +
+      'University of Michigan in January 2020. Unlike prior MDS attacks (ZombieLoad, RIDL, Fallout) that ' +
+      'must wait passively for secret data to transit through microarchitectural buffers, CacheOut lets the ' +
+      'attacker actively choose which L1 data cache line to target. The attack exploits a cleanup error in ' +
+      'Intel\'s L1D eviction logic: when a modified (dirty) cache line is evicted from L1D — via CLFLUSH or ' +
+      'natural set-associativity conflict — the stale data is transiently forwarded through a Line Fill Buffer ' +
+      '(LFB) instead of being properly scrubbed. The attacker opens an Intel TSX transaction, issues a load ' +
+      'from a faulting or assist-triggering address, then forces a transactional abort. During the speculative ' +
+      'window between the faulting load and the abort, the CPU fills the result register with stale LFB data ' +
+      'that originated from the victim\'s evicted cache line — a microarchitectural forwarding path that should ' +
+      'never be architecturally visible. The speculative load value then indexes into a FLUSH+RELOAD probe ' +
+      'array, encoding the secret into cache timing state. After the abort retires, the attacker measures ' +
+      'access times across the 256-entry probe array to determine which cache line was brought in, recovering ' +
+      'the secret one byte at a time. The researchers demonstrated extracting AES-NI keys from co-located ' +
+      'OpenSSL processes, reading kernel ASLR pointers, and breaking SGX enclave confidentiality — all ' +
+      'bypassing Intel\'s earlier hardware MDS mitigations (md_clear / VERW) on affected CPUs spanning 6th ' +
+      'through 10th Gen Core and several Xeon families. Intel assigned CVE-2020-0549 and released microcode ' +
+      'updates that flush LFBs on context switches; software mitigations include disabling TSX and applying ' +
+      'L1D flushing on VM entry. In the assembly, movl loads from a faulting address inside a transactional ' +
+      'region; on abort, the speculative window reads stale fill-buffer data from the evicted victim line, and ' +
+      'the subsequent imull into the probe array index encodes the leaked value into cache state for timing ' +
+      'recovery.',
+    code:
+`# CVE pattern: CacheOut L1D eviction sampling (CVE-2020-0549)
+class L1DCache:
+    def __init__(self):
+        self.line = 0
+        self.valid = 0
+        self.dirty = 0
+
+    def store(self, data):
+        self.line = data
+        self.valid = 1
+        self.dirty = 1
+        return self.line
+
+    def evict(self):
+        stale = self.line
+        self.valid = 0
+        self.dirty = 0
+        return stale
+
+class LineFillBuffer:
+    def __init__(self):
+        self.data = 0
+        self.pending = 0
+
+    def receive_eviction(self, stale):
+        self.data = stale
+        self.pending = 1
+        return self.data
+
+    def drain(self):
+        leaked = self.data
+        self.pending = 0
+        self.data = 0
+        return leaked
+
+class ProbeArray:
+    def __init__(self):
+        self.hits = 0
+        self.base = 0
+
+    def access(self, index):
+        self.base = index * 256
+        self.hits += 1
+        return self.base
+
+l1 = L1DCache()
+lfb = LineFillBuffer()
+probe = ProbeArray()
+secret = 3735928559
+l1.store(secret)
+stale = l1.evict()
+lfb.receive_eviction(stale)
+leaked = lfb.drain()
+probe.access(leaked)
+recovered = 0
+if probe.hits > 0:
+    recovered = leaked
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'movl loads from a faulting address inside a transactional region that reads stale L1D fill-buffer data from the evicted victim cache line; imull scales the leaked value to index a probe array, encoding the secret into observable cache timing state',
+    },
+  },
+  {
+    id: 'indirect-target-selection',
+    name: 'INDIRECT TARGET SELECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Self-training Spectre-v2 attack exploits branch predictor IP collisions to speculatively redirect kernel control flow, leaking privileged memory at up to 17 KB/s.',
+    explanation:
+      'Indirect Target Selection (ITS), disclosed in May 2025 as part of the Training Solo family of attacks ' +
+      'by VUSec researchers (CVE-2024-28956, CVSS 5.7; CVE-2025-24495; CVE-2025-20012), completely breaks ' +
+      'the domain-isolation assumption that underpins all prior Spectre-v2 mitigations on Intel CPUs. Unlike ' +
+      'classic Spectre-BTI where an attacker cross-trains the Branch Target Buffer from user space, ITS is a ' +
+      'self-training attack: the kernel trains itself. When two indirect branches in different privilege domains ' +
+      'share the same instruction-pointer bits used to index the BTB, a collision occurs — the predictor cannot ' +
+      'distinguish which domain deposited the entry. The attacker arranges a user-space indirect branch whose ' +
+      'truncated IP matches a kernel indirect call site (a syscall dispatch table, for example). The user-space ' +
+      'branch trains the BTB to predict a target address pointing at an attacker-chosen disclosure gadget inside ' +
+      'the kernel. On the next syscall, the CPU speculatively follows the poisoned prediction, executing the ' +
+      'gadget at kernel privilege. The gadget loads a secret byte from kernel memory, then uses it as an index ' +
+      'into a probe array, bringing one cache line into L1. After the misspeculation retires and the pipeline ' +
+      'squashes the architectural effect, the attacker measures access times across the 256-entry Flush+Reload ' +
+      'probe array to recover the leaked byte. The researchers demonstrated leaking /etc/shadow hashes and ' +
+      'kernel ASLR pointers at 17 KB/s on 9th-through-11th-gen Intel Core and 2nd/3rd-gen Xeon processors — ' +
+      're-enabling user-to-kernel, guest-to-guest, and guest-to-host Spectre-v2 attacks that were considered ' +
+      'mitigated. Intel shipped microcode updates that serialize predictor state on privilege transitions. In ' +
+      'the assembly, the call instruction resolves its target from the BTB rather than the register operand; ' +
+      'the speculative movl inside the gadget reads kernel memory, and the subsequent imull into the probe-array ' +
+      'stride encodes the secret into cache timing state for Flush+Reload recovery.',
+    code:
+`# CVE pattern: Indirect Target Selection self-training Spectre-v2 (CVE-2024-28956)
+class BranchTargetBuffer:
+    def __init__(self):
+        self.entries = 0
+        self.tag_mask = 255
+        self.predicted = 0
+
+    def train(self, ip, target):
+        tag = ip % 256
+        self.entries = tag
+        self.predicted = target
+        return self.entries
+
+    def lookup(self, ip):
+        tag = ip % 256
+        if tag == self.entries:
+            return self.predicted
+        return 0
+
+class SpecExecEngine:
+    def __init__(self):
+        self.secret = 0
+        self.probe = 0
+        self.leaked = 0
+
+    def load_secret(self, addr):
+        self.secret = addr
+        return self.secret
+
+    def encode_probe(self, val):
+        self.probe = val * 256
+        self.leaked = val
+        return self.probe
+
+btb = BranchTargetBuffer()
+engine = SpecExecEngine()
+user_ip = 49152
+kernel_ip = 49152
+gadget_addr = 8192
+btb.train(user_ip, gadget_addr)
+collision = btb.lookup(kernel_ip)
+leaked = 0
+if collision == gadget_addr:
+    secret_byte = engine.load_secret(3735928559)
+    engine.encode_probe(secret_byte)
+    leaked = engine.leaked
+recovered = 0
+i = 0
+while i < 256:
+    if i == leaked:
+        recovered = i
+    i += 1
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['call', 'movl', 'imull'],
+      description: 'call resolves its target from a poisoned BTB entry trained by user-space IP collision; speculative movl reads kernel memory via the disclosure gadget; imull encodes the secret byte into a probe-array cache-line index for Flush+Reload timing recovery',
+    },
+  },
+  {
+    id: 'tsa-false-completion',
+    name: 'TRANSIENT SCHEDULER ATTACK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'AMD CPU scheduler falsely completes loads from the store queue or L1 cache, leaking protected data through instruction timing side channels.',
+    explanation:
+      'Transient Scheduler Attacks (TSA), disclosed by AMD in July 2025 (CVE-2024-36350 for TSA-SQ, ' +
+      'CVE-2024-36357 for TSA-L1, CVSS 5.6), represent a new class of speculative side channels affecting ' +
+      'AMD processors from Zen 1 through Zen 5. Unlike classic Spectre or Meltdown where mispredicted branches ' +
+      'cause pipeline flushes, TSA exploits false completions in the CPU scheduler: when a load instruction ' +
+      'needs data that is not yet available, the scheduler may incorrectly signal completion and forward stale ' +
+      'or invalid data from the store queue (TSA-SQ) or L1 data cache (TSA-L1) via microtag aliasing. ' +
+      'Critically, these false completions do not trigger a pipeline flush, so the invalid data silently ' +
+      'propagates to dependent instructions. While the corrupted value cannot be leaked through standard ' +
+      'cache-based covert channels (loads and stores consuming it do not update cache or TLB state), the ' +
+      'invalid data influences the timing of subsequent instructions flowing through the execution unit ' +
+      'scheduler. An attacker co-located on the same physical core measures these timing variations across ' +
+      'thousands of iterations to statistically reconstruct protected data — passwords, encryption keys, or ' +
+      'kernel memory — bit by bit. AMD released microcode patches serializing scheduler state at privilege ' +
+      'boundaries. In the assembly, the movl from a store-queue address falsely completes with stale data; ' +
+      'the dependent addl and cmpl instructions exhibit timing differences proportional to the leaked value, ' +
+      'which the attacker captures through rdtsc-based measurement.',
+    code:
+`# CVE pattern: Transient Scheduler Attack false completion (CVE-2024-36350)
+class StoreQueue:
+    def __init__(self):
+        self.entries = 0
+        self.stale_data = 0
+        self.completed = 0
+
+    def write(self, addr, val):
+        self.entries = addr
+        self.stale_data = val
+        self.completed = 0
+        return self.entries
+
+    def false_complete(self, addr):
+        if addr == self.entries:
+            self.completed = 1
+            return self.stale_data
+        return 0
+
+class TimingOracle:
+    def __init__(self):
+        self.baseline = 100
+        self.samples = 0
+        self.leaked = 0
+
+    def measure(self, val):
+        delay = self.baseline + val
+        self.samples += 1
+        return delay
+
+    def infer_bit(self, t1, t2):
+        if t1 > t2:
+            self.leaked = 1
+        else:
+            self.leaked = 0
+        return self.leaked
+
+sq = StoreQueue()
+oracle = TimingOracle()
+secret_addr = 48879
+secret_val = 42
+sq.write(secret_addr, secret_val)
+stale = sq.false_complete(secret_addr)
+recovered = 0
+bit = 0
+while bit < 8:
+    mask = 1
+    i = 0
+    while i < bit:
+        mask *= 2
+        i += 1
+    test_val = stale % (mask * 2)
+    t_one = oracle.measure(test_val)
+    t_zero = oracle.measure(0)
+    b = oracle.infer_bit(t_one, t_zero)
+    recovered += b * mask
+    bit += 1
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'movl falsely completes from the store queue with stale cross-domain data; dependent addl and cmpl exhibit timing variations proportional to the leaked value, enabling statistical bit-by-bit recovery through rdtsc measurement',
+    },
+  },
+  {
+    id: 'process-hollowing',
+    name: 'PROCESS HOLLOWING',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Attacker creates a legitimate process in suspended state, unmaps its code, injects shellcode, and resumes — executing malicious code under a trusted identity.',
+    explanation:
+      'Process hollowing (MITRE ATT&CK T1055.012 / CWE-912) creates a legitimate process — such as ' +
+      'svchost.exe or explorer.exe — in a suspended state via CreateProcess(CREATE_SUSPENDED), then unmaps ' +
+      'its original code sections with NtUnmapViewOfSection, writes attacker-controlled shellcode into the ' +
+      'freed address space with WriteProcessMemory, patches the thread context to point at the new entry ' +
+      'point via SetThreadContext, and resumes execution with ResumeThread. The malicious code now runs ' +
+      'under the identity, PID, security token, and command line of the legitimate process — invisible to ' +
+      'process-listing tools, application whitelists, and signature-based detection. ' +
+      'Observed in 39+ threat groups and malware families: APT41\'s PLUSINJECT component (May 2025) hollowed ' +
+      'system processes to deploy the TOUGHPROGRESS C2 framework via Google Calendar; Turla\'s Carbon backdoor ' +
+      'hollows svchost.exe for persistent kernel-level access; Emotet, TrickBot, and DarkGate all use process ' +
+      'hollowing as their primary defense-evasion mechanism. CVE-2024-21412 (Windows SmartScreen bypass, CVSS ' +
+      '8.1) was chained with process hollowing by DarkGate operators in a zero-day campaign — the SmartScreen ' +
+      'bypass delivered a fake MSI installer that sideloaded a DLL performing process hollowing to inject the ' +
+      'final payload. The technique bypasses DEP (injected code runs in the victim\'s allocated sections), ' +
+      'ASLR (the attacker controls the replacement image base), and application whitelisting (the host process ' +
+      'is a signed system binary). ' +
+      'In the assembly, movl stores the original entry_point into the process image\'s stack slot; ' +
+      'unmap_sections\'s movl zeroes it out; inject_payload\'s movl overwrites the same offset with the ' +
+      'shellcode address (0xDEADBEEF) — no cmpl integrity check validates that the process image has been ' +
+      'tampered with before resume\'s addl combines the hijacked entry_point with the stack_base for execution.',
+    code:
+`# CVE pattern: process suspended, hollowed, shellcode injected — stealth exec
+class ProcessImage:
+    def __init__(self, entry_point, stack_base, pid):
+        self.entry_point = entry_point
+        self.stack_base = stack_base
+        self.pid = pid
+        self.suspended = 0
+        self.code_size = 4096
+        self.integrity = entry_point * 31
+
+    def suspend(self):
+        self.suspended = 1
+        return self.suspended
+
+    def unmap_sections(self):
+        self.entry_point = 0
+        self.code_size = 0
+        self.integrity = 0
+        return self.entry_point
+
+    def inject_payload(self, shellcode, new_entry):
+        self.entry_point = new_entry
+        self.code_size = shellcode
+        return self.entry_point
+
+    def resume(self):
+        self.suspended = 0
+        result = self.entry_point + self.stack_base
+        return result
+
+class HollowEngine:
+    def __init__(self, shellcode):
+        self.shellcode = shellcode
+        self.sc_entry = shellcode + 256
+        self.injected = 0
+
+    def hollow_and_inject(self, proc):
+        proc.suspend()
+        proc.unmap_sections()
+        proc.inject_payload(self.shellcode, self.sc_entry)
+        self.injected += 1
+        return proc.resume()
+
+    def verify(self, proc):
+        result = proc.entry_point + self.injected
+        return result
+
+svchost = ProcessImage(4196352, 8388608, 1337)
+explorer = ProcessImage(4198400, 8388608, 2674)
+engine = HollowEngine(3735928559)
+hijacked = engine.hollow_and_inject(svchost)
+hijacked2 = engine.hollow_and_inject(explorer)
+leaked = engine.verify(explorer)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the legitimate entry_point (0x400000) into the process image stack slot; unmap_sections\'s movl zeroes it; inject_payload\'s movl overwrites the same offset with the shellcode address (0xDEADBEEF + 256) — no cmpl integrity check validates the process image before resume\'s addl combines the hijacked entry_point with stack_base, executing attacker code under the legitimate process\'s identity and security token',
+    },
+  },
+  {
+    id: 'ike-fragment-df',
+    name: 'IKEv2 FRAGMENT REASSEMBLY DOUBLE-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'IKEv2 fragment reassembly shallow-copies a heap blob pointer from the MMSA into a work item, creating dual ownership — both paths free the same allocation, enabling wormable pre-auth RCE as SYSTEM.',
+    explanation:
+      'CVE-2026-33824 (CWE-415, CVSS 9.8, CISA KEV, actively exploited) is a wormable double-free in the ' +
+      'Windows IKE Extension (ikeext.dll) discovered through the Zero Day Initiative. During the IKE_SA_INIT ' +
+      'exchange, a Security Realm Vendor ID payload causes IkeHandleSecurityRealmVendorId() to heap-allocate ' +
+      'a blob and store its pointer in the Main Mode Security Association (MMSA) structure at offset 0x208. ' +
+      'When a fragmented IKE_AUTH message is fully reassembled, IkeReinjectReassembledPacket shallow-copies ' +
+      'MMSA fields at offsets 0x178 through 0x21F — including the blob pointer at 0x208 — into a local stack ' +
+      'struct, which IkeQueueRecvRequest then shallow-copies into a heap-allocated work item. Now both the ' +
+      'MMSA and the work item hold the same raw pointer with no reference count. When the MMSA is cleaned up ' +
+      '(e.g. on SA timeout or rekeying), the blob is freed; when the work item completes or errors out, the ' +
+      'same blob is freed again. The second free corrupts the Windows heap metadata — an attacker who grooms ' +
+      'the low-fragmentation heap can reclaim the first-freed slot with a controlled object, then the second ' +
+      'free places that controlled object on the free list, enabling arbitrary read/write via a type-confused ' +
+      'allocation. Because the vulnerable code path is reached before IKEv2 peer authentication completes, a ' +
+      'remote unauthenticated attacker can trigger it by sending crafted UDP packets to port 500 or 4500 — no ' +
+      'VPN credentials or enterprise account required. The minimum outcome is a crash of IKEEXT; the maximum ' +
+      'is arbitrary code execution as SYSTEM, making this wormable across any Windows host with IPsec enabled. ' +
+      'Patched by Microsoft in April 2026; added to CISA KEV on 2026-08-18 after confirmed in-the-wild exploitation. ' +
+      'In the assembly, movl stores the realm_blob pointer into the MMSA stack slot during handle_vendor_id; ' +
+      'reinject\'s movl shallow-copies the identical pointer value into the work item\'s copied_blob slot — no ' +
+      'addl reference count increment occurs between them; free_mmsa\'s movl zeroes the MMSA\'s copy, and ' +
+      'free_work\'s movl zeroes the work item\'s copy — the same heap address is released twice, with the ' +
+      'final addl combining both freed pointers to confirm the dangling double-free state.',
+    code:
+`# CVE pattern: IKEv2 fragment reassembly shallow-copies blob ptr — freed twice
+class MMSA:
+    def __init__(self, peer_addr, spi):
+        self.peer_addr = peer_addr
+        self.spi = spi
+        self.realm_blob = 0
+        self.blob_size = 0
+        self.freed = 0
+    def handle_vendor_id(self, realm_data):
+        self.realm_blob = realm_data
+        self.blob_size = realm_data + 64
+        return self.realm_blob
+    def free_mmsa(self):
+        result = self.realm_blob
+        self.realm_blob = 0
+        self.freed = 1
+        return result
+
+class WorkItem:
+    def __init__(self):
+        self.copied_blob = 0
+        self.copied_size = 0
+        self.freed = 0
+    def shallow_copy_from(self, mmsa):
+        self.copied_blob = mmsa.realm_blob
+        self.copied_size = mmsa.blob_size
+        return self.copied_blob
+    def free_work(self):
+        result = self.copied_blob
+        self.copied_blob = 0
+        self.freed = 1
+        return result
+
+def reassemble_and_reinject(mmsa, work):
+    frags_received = 0
+    while frags_received < 3:
+        frags_received += 1
+    work.shallow_copy_from(mmsa)
+    return work.copied_blob
+
+mmsa = MMSA(3232235777, 305419896)
+mmsa.handle_vendor_id(4259840)
+work = WorkItem()
+reassemble_and_reinject(mmsa, work)
+first_free = mmsa.free_mmsa()
+second_free = work.free_work()
+dangling = first_free + second_free
+print(dangling)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the realm_blob pointer into the MMSA stack slot during handle_vendor_id; reinject\'s movl shallow-copies the identical pointer value into the work item\'s copied_blob slot with no addl reference count increment; free_mmsa\'s movl zeroes the MMSA\'s copy and free_work\'s movl zeroes the work item\'s copy — the same heap address is released twice, and the final addl combining both freed pointers confirms the dangling double-free state enabling heap metadata corruption for SYSTEM-level RCE',
+    },
+  },
+  {
+    id: 'fastbin-dup',
+    name: 'FASTBIN DUPLICATION ATTACK',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Double-freeing a fastbin-sized chunk tricks malloc into returning the same allocation twice, enabling arbitrary write and code execution.',
+    explanation:
+      'The fastbin duplication attack (CWE-415) exploits a double-free on chunks small enough to land in ' +
+      'glibc\'s fastbin free lists (up to 0x80 bytes on 64-bit systems). Because the fastbin is a singly-linked ' +
+      'LIFO list and early glibc versions only checked whether the chunk being freed was identical to the list ' +
+      'head, an attacker could free chunk A, free chunk B (bypassing the head check), then free A again — placing ' +
+      'A on the fastbin twice. The next three malloc() calls of that size return A, B, then A again; the attacker ' +
+      'writes a target address into the first returned copy of A\'s fd field, so a subsequent allocation returns ' +
+      'a fake chunk at the chosen address, granting an arbitrary write primitive. Real-world exploitation of this ' +
+      'class includes CVE-2025-8058 (glibc regcomp double-free affecting versions 2.4 through 2.41, where a ' +
+      'failed memory allocation during regex compilation double-frees an internal buffer) and CVE-2017-9047 ' +
+      '(libxml2 fastbin corruption via crafted XML). Since glibc 2.29, tcache bins gained a key field to detect ' +
+      'double-frees, but fastbins themselves lacked this mitigation until glibc 2.33\'s pointer mangling, meaning ' +
+      'older versions and applications that bypass tcache remain fully exposed. The typical endgame before glibc ' +
+      '2.34 was overwriting __malloc_hook or __free_hook with a one-gadget address; post-2.34 attackers pivot to ' +
+      'FSOP or _IO_list_all corruption. In the assembly, the first free\'s movl stores chunk A\'s address into ' +
+      'the fastbin head; the second free of A re-links the same pointer via movl, creating a cycle in the list; ' +
+      'malloc\'s subsequent movl reads the corrupted fd from the duplicated entry, and the attacker\'s addl ' +
+      'computes the target offset — returning a fake chunk at the chosen location for arbitrary write to hijack ' +
+      'control flow.',
+    code:
+`# CVE pattern: fastbin double-free — malloc returns same chunk twice
+class FastbinList:
+    def __init__(self):
+        self.head = 0
+        self.count = 0
+
+    def free_chunk(self, addr):
+        self.head = addr
+        self.count += 1
+        return self.head
+
+    def alloc_chunk(self):
+        result = self.head
+        self.count -= 1
+        return result
+
+def fastbin_dup_attack():
+    fbin = FastbinList()
+    chunk_a = 1048576
+    chunk_b = 2097152
+    fbin.free_chunk(chunk_a)
+    fbin.free_chunk(chunk_b)
+    fbin.free_chunk(chunk_a)
+    alloc1 = fbin.alloc_chunk()
+    target_addr = 7340032
+    fake_fd = alloc1 + target_addr
+    alloc2 = fbin.alloc_chunk()
+    alloc3 = fbin.alloc_chunk()
+    hijacked = alloc3 + fake_fd
+    return hijacked
+
+result = fastbin_dup_attack()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores chunk A\'s address into the fastbin head on the first free; the second free of A re-links the identical pointer via movl creating a cycle in the singly-linked LIFO list; malloc\'s movl reads the corrupted fd field from the duplicated entry, and the attacker\'s addl computes the target address offset — returning a fake chunk at the chosen location for arbitrary write',
+    },
+  },
+  {
+    id: 'lazy-fpu-leak',
+    name: 'LAZY FPU STATE LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Lazy FPU context switching leaves victim process register state in the FPU, letting an attacker on the same core recover AES keys via speculative side channels.',
+    explanation:
+      'Lazy FPU State Restore (CVE-2018-3665, CWE-200) exploits a performance optimization in operating system ' +
+      'context switching where the kernel delays saving and restoring FPU/SSE/AVX register state until a process ' +
+      'actually executes a floating-point instruction. When the scheduler switches from a victim process — holding ' +
+      'AES round keys in XMM registers via AES-NI — to an attacker process, the kernel sets the CR0.TS bit to ' +
+      'disable the FPU rather than immediately issuing XSAVE to flush the register contents. On Intel Core ' +
+      'processors from Sandy Bridge through Skylake, speculative execution proceeds past the resulting #NM ' +
+      '(device-not-available) exception, allowing the attacker to use a Flush+Reload cache side channel to infer ' +
+      'the stale XMM register values — including full 128-bit AES round keys — before the kernel handles the fault. ' +
+      'The original LazyFP research paper (Stecklina & Prescher, 2018) demonstrated recovery of AES-256 keys from ' +
+      'OpenSSL running on an adjacent hyperthread within seconds. Xen (XSA-267), KVM, and bare-metal Linux were all ' +
+      'affected. The Xen advisory noted that any guest could read FPU state from any other guest or the hypervisor ' +
+      'itself. The fix was switching to eager FPU restore — issuing XSAVE/XRSTOR on every context switch — which ' +
+      'imposes roughly 1-5% overhead but ensures no stale register state survives a task boundary. Linux kernels ' +
+      'prior to 4.6 used lazy FPU switching by default; newer kernels defaulted to eager mode but older distributions ' +
+      'remained exposed until patched. ' +
+      'In the assembly, movl stores the victim\'s AES key material (0xCAFEBABE and 0xDEADBEEF) into the FPU ' +
+      'register slots xmm0 and xmm1; the scheduler\'s movl sets cr0_ts to 1 (disabling the FPU) but the cmpl ' +
+      'against the saved flag falls through without clearing the registers — the attacker\'s movl reads the stale ' +
+      'key values directly from the unsaved FPU state, and addl sums the leaked round-key material confirming full ' +
+      'AES key recovery across the context switch boundary.',
+    code:
+`# CVE pattern: lazy FPU save lets attacker read victim's stale XMM regs
+class FpuState:
+    def __init__(self):
+        self.xmm0 = 0
+        self.xmm1 = 0
+        self.owner = 0
+        self.saved = 0
+
+    def load_key(self, key_hi, key_lo):
+        self.xmm0 = key_hi
+        self.xmm1 = key_lo
+        self.owner = 1
+        return self.xmm0
+
+class LazyScheduler:
+    def __init__(self):
+        self.cr0_ts = 0
+        self.active_pid = 0
+
+    def context_switch(self, fpu, new_pid):
+        self.cr0_ts = 1
+        self.active_pid = new_pid
+        if fpu.saved == 1:
+            fpu.xmm0 = 0
+            fpu.xmm1 = 0
+        return self.cr0_ts
+
+def lazy_fpu_attack():
+    fpu = FpuState()
+    sched = LazyScheduler()
+    fpu.load_key(3405691582, 3735928559)
+    sched.context_switch(fpu, 2)
+    stolen_hi = fpu.xmm0
+    stolen_lo = fpu.xmm1
+    recovered_key = stolen_hi + stolen_lo
+    return recovered_key
+
+result = lazy_fpu_attack()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl stores the victim\'s AES key (0xCAFEBABE and 0xDEADBEEF) into FPU register slots xmm0 and xmm1; the scheduler\'s movl sets cr0_ts to 1 (disabling the FPU) but cmpl checks saved == 1 and falls through without clearing the registers — the attacker\'s movl reads the stale xmm0 and xmm1 values past the #NM fault, and addl sums the leaked key material confirming full AES key recovery across the context switch',
+    },
+  },
+  {
+    id: 'entrysign-forgery',
+    name: 'ENTRYSIGN MICROCODE FORGERY',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'AMD microcode signature verification uses AES-CMAC with a publicly known NIST example key instead of a secure hash, letting a local attacker forge valid signatures and load arbitrary microcode.',
+    explanation:
+      'EntrySign (CVE-2024-56161, CVSS 7.2) exploits a fundamental cryptographic design flaw in AMD\'s microcode ' +
+      'patch loader present across all Zen 1 through Zen 5 processors. AMD\'s ROM-resident signature verification ' +
+      'uses AES-CMAC — a message authentication code requiring a secret key — as if it were a collision-resistant ' +
+      'hash function. Worse, the AES key used across all affected processors is the publicly documented example key ' +
+      'from NIST Special Publication 800-38B (the AES-CMAC specification), meaning any attacker who reads the ' +
+      'standard can compute valid CMAC tags for arbitrary payloads. The verification pipeline works as follows: the ' +
+      'CPU compares a hash of the embedded public RSA key against a reference burned into silicon, then verifies an ' +
+      'RSA signature over the CMAC tag of the patch body — but since the attacker knows the CMAC key, they can ' +
+      'compute the correct tag for any crafted microcode, making the RSA layer irrelevant. Discovered by Google ' +
+      'security researchers (Josh Eads, Kristoffer Janke, Eduardo Vela Nava, Tavis Ormandy, Matteo Rizzo), the flaw ' +
+      'allows a local administrator to load unsigned microcode that alters CPU instruction behavior, breaks AMD ' +
+      'SEV-SNP confidential VM guarantees, and undermines hardware root-of-trust. While the malicious microcode does ' +
+      'not survive a power cycle, it persists across warm reboots and can silently modify cryptographic instructions ' +
+      'or security checks during the session. AMD expanded the advisory in April 2025 to include Zen 5 processors. ' +
+      'In the assembly, movl stores the known NIST CMAC key into the verifier\'s key slots, and the attacker\'s ' +
+      'imull computes the forged tag using the same key — cmpl then compares the forged tag against the expected ' +
+      'value and finds them equal, causing the conditional movl to set the privilege level to 0 (ring 0) and ' +
+      'the final movl to load the malicious patch into the active microcode slot.',
+    code:
+`# CVE pattern: microcode signature uses known key, enabling forgery
+class CmacVerifier:
+    def __init__(self):
+        self.key_lo = 42
+        self.key_hi = 17
+        self.verified = 0
+
+    def weak_mac(self, data):
+        tag = data * self.key_lo
+        tag = tag + self.key_hi
+        return tag
+
+    def check_sig(self, patch_data, signature):
+        expected = self.weak_mac(patch_data)
+        if expected == signature:
+            self.verified = 1
+        else:
+            self.verified = 0
+        return self.verified
+
+class PatchLoader:
+    def __init__(self):
+        self.active_patch = 0
+        self.priv_level = 3
+
+    def apply_patch(self, verifier, patch, sig):
+        ok = verifier.check_sig(patch, sig)
+        if ok == 1:
+            self.active_patch = patch
+            self.priv_level = 0
+        return ok
+
+def entrysign_forge():
+    v = CmacVerifier()
+    loader = PatchLoader()
+    known_key_lo = v.key_lo
+    known_key_hi = v.key_hi
+    evil_patch = 777
+    forged_tag = evil_patch * known_key_lo
+    forged_tag = forged_tag + known_key_hi
+    loader.apply_patch(v, evil_patch, forged_tag)
+    stolen_priv = loader.priv_level
+    print(stolen_priv)
+    return stolen_priv
+
+result = entrysign_forge()
+print(result)
+`,
+    badAsm: {
+      patterns: ['imull', 'cmpl'],
+      description: 'movl stores the NIST example CMAC key (42 and 17) into the verifier\'s key_lo and key_hi fields; the attacker\'s imull multiplies the malicious patch value by the known key_lo and addl adds key_hi to compute the forged tag — cmpl then compares forged_tag against the expected CMAC and finds them equal, causing the conditional movl to set priv_level to 0 (ring 0 microcode execution) and the final movl to load the evil patch into the active_patch slot',
+    },
+  },
+  {
+    id: 'alpc-heap-overflow',
+    name: 'ALPC HEAP OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Crafted ALPC message overflows a fixed-size ACL heap buffer, corrupting the adjacent process token to escalate from AppContainer sandbox to SYSTEM.',
+    explanation:
+      'ALPC Heap Overflow (CVE-2026-85880 / CWE-122, CVSS 7.8) targets a boundary error in the Windows kernel\'s ' +
+      'RtlpCreateServerAcl function within the Advanced Local Procedure Call (ALPC) subsystem — the fundamental IPC ' +
+      'mechanism used by every Windows process for high-speed cross-privilege communication. When a client sends a ' +
+      'crafted ALPC message, the function allocates a fixed-size heap buffer for the server ACL (Access Control List) ' +
+      'but copies the attacker-controlled message data without validating that the input length fits within the ' +
+      'allocation. The excess bytes overflow into the adjacent heap object — critically, the process token structure ' +
+      'that stores the caller\'s privilege level, integrity label, and sandbox state. By corrupting the token\'s ' +
+      'privilege field to SYSTEM (0) and clearing the AppContainer sandbox flag, the attacker\'s low-privilege ' +
+      'process gains unrestricted kernel-level access. The vulnerability was actively exploited as a zero-day before ' +
+      'Microsoft\'s September 2026 Patch Tuesday and was weaponized in real attack chains to escape Chrome\'s renderer ' +
+      'sandbox — a crafted web page could chain a renderer RCE with this ALPC overflow to achieve full SYSTEM code ' +
+      'execution with no user interaction. CISA added CVE-2026-85880 to its Known Exploited Vulnerabilities catalog ' +
+      'immediately. Every Windows version from Server 2012 through Windows 11 was affected. ' +
+      'In the assembly, movl stores the ACL payload values into consecutive stack slots representing the fixed heap ' +
+      'buffer; the while loop\'s cmpl compares the iteration counter against msg_len (6) rather than the buffer ' +
+      'capacity (4), so iterations i=4 and i=5 execute movl writes past the buffer boundary into the adjacent token ' +
+      'structure — setting priv_level to 0 (SYSTEM) and sandboxed to 0, completing the privilege escalation.',
+    code:
+`# CVE pattern: ALPC heap overflow — RtlpCreateServerAcl copies past buffer bounds
+class AclBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.slot3 = 0
+
+class ProcessToken:
+    def __init__(self):
+        self.priv_level = 3
+        self.integrity = 4096
+        self.sandboxed = 1
+
+class AlpcPort:
+    def __init__(self):
+        self.acl = AclBuffer(4)
+        self.adj_token = ProcessToken()
+
+    def create_server_acl(self, payload, msg_len):
+        i = 0
+        while i < msg_len:
+            if i == 0:
+                self.acl.slot0 = payload
+            elif i == 1:
+                self.acl.slot1 = payload + 1
+            elif i == 2:
+                self.acl.slot2 = payload + 2
+            elif i == 3:
+                self.acl.slot3 = payload + 3
+            elif i == 4:
+                self.adj_token.priv_level = 0
+            elif i == 5:
+                self.adj_token.sandboxed = 0
+            i += 1
+        return i
+
+    def query_token(self):
+        return self.adj_token.priv_level
+
+def exploit_alpc():
+    port = AlpcPort()
+    before = port.query_token()
+    port.create_server_acl(1094795585, 6)
+    after = port.query_token()
+    escaped = 0
+    if after == 0:
+        escaped = 1
+    print(before)
+    print(after)
+    return escaped
+
+result = exploit_alpc()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl stores ACL payload values (0x41414141 and offsets) into consecutive stack slots representing the fixed 4-slot heap buffer; the while loop\'s cmpl compares the iteration counter against msg_len (6) instead of the buffer capacity (4) — iterations i=4 and i=5 execute movl writes past the buffer boundary into the adjacent ProcessToken, setting priv_level to 0 (SYSTEM) and sandboxed to 0, completing the sandbox escape and privilege escalation',
+    },
+  },
+  {
+    id: 'house-of-einherjar',
+    name: 'HOUSE OF EINHERJAR',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'A single null byte overflow clears the PREV_IN_USE flag on an adjacent heap chunk, triggering backward consolidation into attacker-controlled memory.',
+    explanation:
+      'House of Einherjar (CVE-2023-6779 / CWE-122, presented by Hiroki Matsukuma at CODE BLUE 2016) is a heap ' +
+      'exploitation technique that weaponizes the smallest possible corruption — a single null byte overflow — into ' +
+      'a full arbitrary-write primitive. The attacker overflows exactly one byte from a heap chunk into the metadata ' +
+      'header of the adjacent chunk, zeroing the PREV_IN_USE bit in its size field. Simultaneously, the attacker ' +
+      'crafts a fake prev_size value that points backward to attacker-controlled memory (a "fake chunk"). When the ' +
+      'adjacent chunk is freed, glibc\'s consolidation logic reads the now-clear PREV_IN_USE flag and trusts the ' +
+      'fake prev_size to locate the "previous" chunk — landing on the attacker\'s crafted region. The allocator ' +
+      'merges these regions into one large free chunk. The next malloc() call returns a pointer overlapping the fake ' +
+      'chunk\'s memory, giving the attacker read/write control over that region. In real exploits, this overlapping ' +
+      'allocation is used to corrupt tcache metadata, __free_hook, or vtable pointers, achieving arbitrary code ' +
+      'execution. CVE-2023-6779 demonstrated this exact pattern: an off-by-one null byte in glibc\'s ' +
+      '__vsyslog_internal() triggered backward consolidation that overlapped attacker data, enabling root privilege ' +
+      'escalation on every major Linux distribution running glibc 2.37 through 2.39. CVE-2023-6246 exploited a ' +
+      'related heap overflow in the same syslog codepath. ' +
+      'In the assembly, the while loop\'s cmpl checks the iteration counter against length (5), but chunk_a only ' +
+      'has 4 data slots (slot0–slot3); at i=4 the movl writes 0 into chunk_b\'s in_use field — the null byte ' +
+      'overflow — and sets prev_size to 192, simulating the backward consolidation setup that hijacks the next ' +
+      'allocation to overlap the fake chunk.',
+    code:
+`# CVE pattern: House of Einherjar — null byte clears PREV_IN_USE, fake consolidation
+class HeapChunk:
+    def __init__(self, size, in_use):
+        self.prev_size = 0
+        self.size = size
+        self.in_use = in_use
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.slot3 = 0
+class HeapState:
+    def __init__(self):
+        self.chunk_a = HeapChunk(64, 1)
+        self.chunk_b = HeapChunk(128, 1)
+        self.fake = HeapChunk(64, 1)
+        self.merged = 0
+        self.hijacked = 0
+    def write_overflow(self, payload, length):
+        i = 0
+        while i < length:
+            if i == 0:
+                self.chunk_a.slot0 = payload
+            elif i == 1:
+                self.chunk_a.slot1 = payload + 1
+            elif i == 2:
+                self.chunk_a.slot2 = payload + 2
+            elif i == 3:
+                self.chunk_a.slot3 = payload + 3
+            elif i == 4:
+                self.chunk_b.in_use = 0
+                self.chunk_b.prev_size = 192
+            i += 1
+        return i
+    def free_consolidate(self):
+        if self.chunk_b.in_use == 0:
+            self.merged = 1
+            self.fake.slot0 = 0
+        return self.merged
+    def alloc_overlap(self):
+        if self.merged == 1:
+            self.fake.slot0 = 3735928559
+            self.hijacked = 1
+        return self.hijacked
+def exploit():
+    heap = HeapState()
+    before = heap.chunk_b.in_use
+    heap.write_overflow(1094795585, 5)
+    after = heap.chunk_b.in_use
+    heap.free_consolidate()
+    heap.alloc_overlap()
+    print(before)
+    print(after)
+    return heap.hijacked
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'The while loop\'s cmpl checks the iteration counter against length (5), but chunk_a only has 4 data slots; at i=4 the movl writes 0 into chunk_b\'s in_use field — the null byte overflow — and sets prev_size to 192, triggering backward consolidation that gives the attacker an overlapping allocation over the fake chunk\'s memory',
+    },
+  },
+  {
+    id: 'buffer-overread',
+    name: 'BUFFER OVER-READ',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'A missing bounds check lets an attacker read past a buffer into adjacent memory, leaking secrets such as private keys and session tokens.',
+    explanation:
+      'Buffer over-read (CWE-125) is the vulnerability class behind Heartbleed (CVE-2014-0160), one of the most ' +
+      'devastating information-disclosure bugs in internet history. The flaw occurs when code trusts an attacker-supplied ' +
+      'length field instead of the actual data size, causing a read that extends past the buffer boundary into adjacent ' +
+      'memory. In the Heartbleed case, OpenSSL\'s TLS heartbeat handler echoed back as many bytes as the client claimed ' +
+      'to have sent — up to 64 KB — without verifying the claim matched the real payload. Each malicious heartbeat ' +
+      'request leaked a window of heap memory that could contain private keys, passwords, session cookies, and other ' +
+      'secrets, all without leaving any trace in server logs. The same pattern recurs in CVE-2024-12085 (rsync), where ' +
+      'a manipulated checksum length caused byte-by-byte leakage of uninitialized stack contents, which when combined ' +
+      'with CVE-2024-12084 (heap overflow) enabled full remote code execution. Unlike buffer overflows that corrupt ' +
+      'memory to hijack control flow, over-reads silently exfiltrate data — the program keeps running normally while ' +
+      'the attacker harvests secrets. Mitigations include strict length validation before any memcpy/read, compiler ' +
+      'flags like -ftrivial-auto-var-init=zero to zero uninitialized buffers, and AddressSanitizer which detects ' +
+      'out-of-bounds reads at runtime. In the assembly below, the while loop\'s cmpl compares the iteration counter ' +
+      'against claimed_len (5) rather than buf.length (2); when i >= 2, the movl instructions read from the adjacent ' +
+      'SecretRegion\'s fields — the over-read — leaking key material the caller should never see.',
+    code:
+`# CVE pattern: Heartbleed-style buffer over-read — missing bounds check leaks adjacent memory
+class Buffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.slot3 = 0
+        self.length = 0
+class SecretRegion:
+    def __init__(self):
+        self.key0 = 3735929054
+        self.key1 = 3405691582
+        self.key2 = 3131961357
+        self.key3 = 305419896
+def write_payload(buf, data, size):
+    if size > buf.capacity:
+        size = buf.capacity
+    i = 0
+    while i < size:
+        if i == 0:
+            buf.slot0 = data
+        elif i == 1:
+            buf.slot1 = data + 1
+        i += 1
+    buf.length = size
+    return size
+def heartbeat_echo(buf, secret, claimed_len):
+    leaked = 0
+    i = 0
+    while i < claimed_len:
+        if i < buf.length:
+            if i == 0:
+                leaked = buf.slot0
+            elif i == 1:
+                leaked = buf.slot1
+        else:
+            offset = i - buf.length
+            if offset == 0:
+                leaked = secret.key0
+            elif offset == 1:
+                leaked = secret.key1
+            elif offset == 2:
+                leaked = secret.key2
+        i += 1
+    return leaked
+def exploit():
+    buf = Buffer(4)
+    secret = SecretRegion()
+    write_payload(buf, 65, 2)
+    safe = heartbeat_echo(buf, secret, 2)
+    print(safe)
+    leaked = heartbeat_echo(buf, secret, 5)
+    print(leaked)
+    return leaked
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'The while loop\'s cmpl compares the iteration counter against claimed_len (5) rather than buf.length (2); when i >= 2, the movl instructions read from the adjacent SecretRegion\'s key fields instead of Buffer slots — the over-read — silently leaking secret values the caller was never meant to access',
+    },
+  },
+  {
+    id: 'func-ptr-hijack',
+    name: 'FUNCTION POINTER HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'A buffer overflow overwrites a stored function pointer, redirecting execution to an attacker-controlled address when the pointer is later invoked.',
+    explanation:
+      'Function pointer hijacking (CWE-787 leading to CWE-822) is the foundational control-flow attack behind ' +
+      'many of the most impactful kernel exploits of 2024-2025. An adjacent buffer overflow, heap overflow, or ' +
+      'use-after-free corrupts a function pointer stored in a data structure, and when the program later dispatches ' +
+      'through that pointer, execution diverts to an attacker-chosen address — typically a ROP pivot or shellcode. ' +
+      'While vtable hijacking, GOT overwrite, and FSOP vtable corruption are specialized instances of this ' +
+      'pattern, the general case covers any stored callback: kernel file_operations, socket ops, ' +
+      'pipe_buf_operations, event handler tables, and plugin dispatch structures. CVE-2024-50264 (Linux vsock ' +
+      'transport UAF, Pwnie Award 2025 for Best Privilege Escalation) exploited a dangling callback pointer in ' +
+      'the vsock transport layer — after the structure was freed and reallocated with attacker-controlled data, ' +
+      'invoking the stale callback dispatched through the corrupted pointer to overwrite a page table entry and ' +
+      'redirect BPF JIT code for full kernel execution. CVE-2021-22555 (Linux Netfilter setsockopt heap overflow) ' +
+      'corrupted an adjacent msg_msg structure\'s callback pointer to pivot to a ROP chain and achieve root. ' +
+      'CVE-2025-37947 (ksmbd out-of-bounds write) used unchecked stream positioning in ksmbd_vfs_stream_write() ' +
+      'to overflow past XATTR_SIZE_MAX, corrupting kernel object callback pointers on adjacent heap pages for ' +
+      'reliable local privilege escalation. The pattern is universal: the attacker controls data adjacent to or ' +
+      'overlapping a function pointer, writes through the boundary, and waits for the dispatcher to call through ' +
+      'the corrupted value. In the assembly below, movl loads the handler\'s callback field into a register; after ' +
+      'the overflow write, this field holds the attacker\'s payload address (0xDEADBEEF + 4) rather than the ' +
+      'legitimate handler address 4096 — addl combines the corrupted callback with the also-overwritten priority ' +
+      'field, producing a fully attacker-controlled dispatch target.',
+    code:
+`# CVE pattern: buffer overflow corrupts stored callback pointer for control-flow hijack
+class EventHandler:
+    def __init__(self):
+        self.buf0 = 0
+        self.buf1 = 0
+        self.buf2 = 0
+        self.buf3 = 0
+        self.callback = 4096
+        self.priority = 1
+def invoke_handler(eh):
+    addr = eh.callback
+    result = addr + eh.priority
+    return result
+def write_data(eh, data, count):
+    i = 0
+    while i < count:
+        if i == 0:
+            eh.buf0 = data
+        elif i == 1:
+            eh.buf1 = data + 1
+        elif i == 2:
+            eh.buf2 = data + 2
+        elif i == 3:
+            eh.buf3 = data + 3
+        elif i == 4:
+            eh.callback = data + i
+        elif i == 5:
+            eh.priority = data + i
+        i += 1
+    return count
+def exploit():
+    eh = EventHandler()
+    legit = invoke_handler(eh)
+    print(legit)
+    write_data(eh, 65, 4)
+    safe = invoke_handler(eh)
+    print(safe)
+    payload = 3735928559
+    write_data(eh, payload, 6)
+    hijacked = invoke_handler(eh)
+    print(hijacked)
+    return hijacked
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads handler.callback from the struct into a register; after overflow_write pushes 6 elements past the 4-slot buffer, this field holds 0xDEADBEEF + 4 instead of 4096 — addl combines the corrupted callback with the also-overwritten priority field, producing a fully attacker-controlled value that would redirect any indirect call or dispatch through this handler',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
