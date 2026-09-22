@@ -50,6 +50,11 @@ export interface LineMapping {
   // Memory traffic: how many memory reads (loads) and writes (stores) this
   // line's asm performs. Only nonzero of {loads, stores} are present.
   memory_counts?: Record<string, number>
+  // Branch-sense map: how this line's conditional jumps split by sense
+  // (signed / unsigned / equality / unconditional / other). Only nonzero senses
+  // are present. The signed-vs-unsigned split is the comparison-safety signal.
+  // Named `*_sense*` to coexist with the branch-flow-map's `branches` field.
+  branch_sense_counts?: Record<string, number>
   // Cycle-cost estimate: summed approximate relative cycle weight of this line's
   // instructions (divide ~20, multiply/call ~3-4, most staples 1). A latency-
   // oriented sharpening of asm_count — the costliest line isn't always the longest.
@@ -105,6 +110,13 @@ export interface MemorySummary {
   memory_totals: Record<string, number>
 }
 
+export interface BranchSenseSummary {
+  // Program-wide branch-condition map: each branch sense (signed / unsigned /
+  // equality / unconditional / other) mapped to the number of jumps of that
+  // sense, in stable display order with zero senses omitted.
+  branch_totals: Record<string, number>
+}
+
 export interface CycleHotspot { py_line: number; cycles: number }
 
 export interface CycleSummary {
@@ -113,6 +125,8 @@ export interface CycleSummary {
   // (costliest first). Coarse RELATIVE teaching estimates, not cycle-accurate.
   total_cycles: number
   hotspots: CycleHotspot[]
+}
+
 export interface BranchSummary {
   // Program-wide branch flow counts. Per-line branch entries live on
   // LineMapping.branches; this summary tallies them.
@@ -159,6 +173,7 @@ export interface CompileResponse {
   stack_summary?: StackSummary | null
   memory_summary?: MemorySummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
+  branch_sense_summary?: BranchSenseSummary | null
   cycle_summary?: CycleSummary | null
   branch_summary?: BranchSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
