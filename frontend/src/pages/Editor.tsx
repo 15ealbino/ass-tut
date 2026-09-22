@@ -73,6 +73,40 @@ function formatMemory(counts?: Record<string, number>): string {
   return parts.join(' · ')
 }
 
+// ─── Branch-condition presentation ──────────────────────────────────────────
+// Backend classifies each conditional jump by SENSE — signed (jl/jle/jg/jge),
+// unsigned (jb/jbe/ja/jae), equality (je/jne), or the unconditional jmp. The
+// signed-vs-unsigned split is the one that decides whether a bounds check is
+// safe, so it leads the BRANCH chip and per-line tooltips. Rendered
+// "2 signed · 1 eq", zero senses omitted (matches the backend map).
+const BRANCH_ORDER = ['signed', 'unsigned', 'equality', 'unconditional', 'other'] as const
+const BRANCH_LABEL: Record<string, string> = {
+  signed: 'signed',
+  unsigned: 'unsigned',
+  equality: 'eq',
+  unconditional: 'uncond',
+  other: 'other',
+}
+function formatBranchSenses(counts?: Record<string, number>): string {
+  if (!counts) return ''
+  const known = BRANCH_ORDER.filter(s => (counts[s] ?? 0) > 0) as string[]
+  const extra = Object.keys(counts)
+    .filter(s => !(BRANCH_ORDER as readonly string[]).includes(s) && counts[s] > 0)
+    .sort()
+  return [...known, ...extra].map(s => `${counts[s]} ${BRANCH_LABEL[s] ?? s}`).join(' · ')
+}
+
+// ─── Cycle-cost presentation ────────────────────────────────────────────────
+// Backend weights each instruction by an approximate relative cycle cost
+// (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
+// the eye is drawn to the genuinely expensive lines rather than the merely long
+// ones — instruction count is not cost. Rendered "≈N cyc" in the CYCLES chip
+// and per-line tooltips. The estimates are coarse and relative, not cycle-exact.
+function formatCycles(cycles?: number): string {
+  if (!cycles || cycles <= 0) return ''
+  return `≈${cycles} cyc`
+}
+
 // ─── Instruction-glossary presentation ─────────────────────────────────────
 // The backend returns one entry per distinct mnemonic in the compiled asm.
 // Render them, grouped by the same category order as the mix, into a single
@@ -11492,6 +11526,46 @@ export default function EditorPage() {
               MEM:: {formatMemory(result.memory_summary.memory_totals)}
             </span>
           )}
+          {result.branch_sense_summary?.branch_totals && formatBranchSenses(result.branch_sense_summary.branch_totals) && (
+            <span
+              title={`Branch map — conditional jumps by sense: ${formatBranchSenses(result.branch_sense_summary.branch_totals)}. x86 has parallel SIGNED (jl/jle/jg/jge) and UNSIGNED (jb/jbe/ja/jae) jumps that test the same compare. This transpiler emits all-int C, so gcc emits SIGNED branches — an UNSIGNED branch here would mean a comparison was treated as unsigned, the classic bug that lets a negative length slip past a bounds check.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              SENSE:: {formatBranchSenses(result.branch_sense_summary.branch_totals)}
+            </span>
+          )}
+          {result.cycle_summary && result.cycle_summary.total_cycles > 0 && (
+            <span
+              title={`Cycle-cost estimate — a latency-weighted sharpening of the raw instruction count. Each instruction carries an approximate relative cost (integer divide ≈20, multiply/call ≈3-4, most staples 1); this is their sum across the program. Compare it with COST:: — the gap shows how much apparent work is a few genuinely expensive operations versus many cheap ones. The costliest Python line is not always the one with the most instructions. NOTE: coarse relative teaching estimates, not cycle-accurate figures.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              CYCLES:: {formatCycles(result.cycle_summary.total_cycles)}
+            </span>
+          )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (
             <span
               title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
@@ -11556,6 +11630,12 @@ export default function EditorPage() {
             const hintTitle = hints.length
               ? `\n${hints.map(h => `⚡ ${HINT_LABEL[h.kind] ?? h.kind}: ${h.message}`).join('\n')}`
               : ''
+            const branchTitle = formatBranchSenses(mapping.branch_sense_counts)
+              ? ` — branch: ${formatBranchSenses(mapping.branch_sense_counts)}`
+              : ''
+            const cycTitle = formatCycles(mapping.cycle_estimate)
+              ? ` — cost: ${formatCycles(mapping.cycle_estimate)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -11576,7 +11656,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${mixTitle}${regsTitle}${memTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (

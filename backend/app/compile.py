@@ -13,6 +13,7 @@ from typing import Dict, List, Set, Tuple
 
 from app.asm_glossary import build_asm_glossary
 from app.strength import analyze_strength
+from app.cycle_cost import analyze_cycles
 from app.transpiler import TranspileError, build_line_map, transpile
 
 logger = logging.getLogger(__name__)
@@ -614,6 +615,120 @@ def analyze_memory_traffic(
     return {"memory_totals": {"loads": total_loads, "stores": total_stores}}
 
 
+# ── Branch-condition map (signed vs unsigned) ───────────────────────────────
+#
+# The instruction mix lumps every jump into a single "branch" bucket; the
+# glossary describes a conditional jump generically as "taken only when the
+# flags satisfy the condition". Neither says the one thing that matters most
+# when you read a comparison in a disassembly: is the branch SIGNED or UNSIGNED?
+#
+# x86 has two parallel families of conditional jumps that test the SAME cmp:
+#   signed    jl / jle / jg / jge   (SF/OF ordering)      — for `int`-style values
+#   unsigned  jb / jbe / ja / jae   (CF ordering)         — for `unsigned`/pointer
+# plus equality (je / jne, sense-neutral) and the unconditional `jmp`.
+#
+# The lesson this teaches (mission pillar 2 — spotting vulnerable asm and the
+# bug behind it): picking the wrong family is a textbook vulnerability. A signed
+# length compared with an unsigned branch (or an `unsigned` bound compared with a
+# signed one) lets a negative value read as huge — or a huge value read as
+# negative — and slip straight past a bounds check. This transpiler emits
+# all-`int` C, so gcc emits the SIGNED family; seeing "2 signed" next to a Python
+# `if a < b` makes that concrete, and trains the eye to notice the day an
+# UNSIGNED branch shows up where a signed one was intended. (Pillar 1: it also
+# makes control flow legible — which `if`/`while`/`for` produced which jumps.)
+#
+# Classified by exact mnemonic (jumps are short, and exact-set matching avoids
+# the prefix-shadowing hazards of the mix/glossary tables — e.g. "jns" vs "js").
+_EQUALITY_JUMPS = frozenset({"je", "jz", "jne", "jnz"})
+_SIGNED_JUMPS = frozenset({
+    "jl", "jnge", "jle", "jng", "jg", "jnle", "jge", "jnl", "js", "jns",
+})
+_UNSIGNED_JUMPS = frozenset({
+    "jb", "jnae", "jc", "jbe", "jna", "ja", "jnbe", "jae", "jnb", "jnc",
+})
+# Overflow / parity jumps: real conditional branches, but neither signed-ordering
+# nor unsigned-ordering nor equality. gcc -O0 does not emit them for this
+# transpiler's integer code, but they are classified rather than dropped so an
+# unexpected one is never silently miscounted as "not a branch".
+_OTHER_JUMPS = frozenset({"jo", "jno", "jp", "jpe", "jnp", "jpo"})
+
+# Stable display / serialisation order for the branch-sense maps.
+_BRANCH_SENSE_ORDER = {
+    "signed": 0, "unsigned": 1, "equality": 2, "unconditional": 3, "other": 4,
+}
+
+
+def classify_branch_sense(mnemonic: str) -> str | None:
+    """Classify an x86 jump mnemonic by the *sense* of the branch it takes.
+
+    `mnemonic` is the lowercased first whitespace-separated token of an
+    instruction line (e.g. "jl", "jne", "jmp"). Returns one of
+    "signed" / "unsigned" / "equality" / "unconditional" / "other" for a jump,
+    or None for any mnemonic that is not a jump (so non-branch instructions are
+    ignored rather than bucketed).
+
+    Unlike the prefix tables used elsewhere in this module, matching is exact:
+    jump mnemonics are short and their prefixes overlap ("j" is a prefix of them
+    all, "jn" of both "jne" and "jnb"), so a prefix scan would mis-sort them.
+    """
+    if mnemonic == "jmp":
+        return "unconditional"
+    if mnemonic in _EQUALITY_JUMPS:
+        return "equality"
+    if mnemonic in _SIGNED_JUMPS:
+        return "signed"
+    if mnemonic in _UNSIGNED_JUMPS:
+        return "unsigned"
+    if mnemonic in _OTHER_JUMPS:
+        return "other"
+    return None
+
+
+def _ordered_branch_sense_map(counts: Dict[str, int]) -> Dict[str, int]:
+    """Return `counts` with zero entries dropped and keys in display order."""
+    return {
+        sense: counts[sense]
+        for sense in sorted(counts, key=lambda s: _BRANCH_SENSE_ORDER.get(s, 99))
+        if counts[sense] > 0
+    }
+
+
+def analyze_branch_senses(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``branch_sense_counts`` map and
+    return a program-wide summary ``{"branch_totals": {sense: count, ...}}``.
+    Mutates ``line_map`` in place.
+
+    Named ``*_sense*`` to coexist with the separate branch-flow-map pass
+    (``analyze_branches`` / ``LineMapping.branches``), which classifies jumps by
+    direction rather than signed/unsigned sense.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` and
+    the other per-line passes). Per line, ``branch_sense_counts`` carries only the
+    nonzero senses in display order (mirroring the zero-omitting instruction
+    mix); ``branch_totals`` is the same, summed across every line — empty when
+    the program has no jumps at all.
+    """
+    totals: Dict[str, int] = {}
+    for mapping in line_map.values():
+        counts: Dict[str, int] = {}
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if 1 <= asm_no <= len(asm_lines):
+                text = asm_lines[asm_no - 1].strip()
+                mnemonic = text.split(None, 1)[0].lower() if text else ""
+                sense = classify_branch_sense(mnemonic)
+                if sense is not None:
+                    counts[sense] = counts.get(sense, 0) + 1
+                    totals[sense] = totals.get(sense, 0) + 1
+        mapping["branch_sense_counts"] = _ordered_branch_sense_map(counts)
+
+    return {"branch_totals": _ordered_branch_sense_map(totals)}
+
+
 def _classify_mnemonic(mnemonic: str) -> str | None:
     """Return the cost flag for an x86 mnemonic, or None if it is unremarkable.
 
@@ -624,6 +739,200 @@ def _classify_mnemonic(mnemonic: str) -> str | None:
         if mnemonic.startswith(prefix):
             return flag
     return None
+
+
+# ── Branch flow analysis ────────────────────────────────────────────────────
+#
+# Where the instruction mix lumps every jump into a single "branch" bucket, this
+# pass names each individual branch — which mnemonic, whether it is conditional,
+# where it goes, and (critically for reading control flow off a disassembly)
+# whether its target lies ABOVE or BELOW its own source line in the same asm
+# stream.
+#
+# The lessons this teaches (mission pillars 1 and 2):
+#   * Pillar 1 (make the mapping concrete): a Python `if` compiles to a
+#     conditional FORWARD jump around the then-body (the "branch-around"
+#     pattern); a `for`/`while` compiles to a BACKWARD jump that loops back to
+#     the test at the head of the loop. Seeing that shape appear line-by-line
+#     in the branch entries makes the Python → x86 control-flow lowering
+#     something you can read, not just believe.
+#   * Pillar 2 (spot bad / vulnerable asm): reading control flow off raw asm is
+#     a day-one reverse-engineering skill — loops = backward branches, if/else
+#     = forward-around. The wrong shapes matter just as much: a backward branch
+#     with no exit condition (an infinite loop bug), a forward branch that
+#     skips a length check (a classic sanitiser bypass), or a chain of `jmp`
+#     sleds (obfuscation / shellcode) all read off the annotated branches.
+#
+# Only intra-file *branch* instructions are surfaced. `call`/`ret` control flow
+# is already covered by the instruction mix's "call" category and by the
+# register footprint (implicit `%esp`/`%eip`), and mixing calls in here would
+# muddy the "forward vs backward" reading the pass is built around.
+
+# jmp/jmpl are the unconditional family; every other `j*` mnemonic (je/jne/jl/
+# jle/…/jecxz) is conditional; `loop`/`loope`/`loopne` are the decrement-%ecx-
+# and-branch-if-nonzero family (conditional). No other x86 mnemonic starts with
+# `j` or `loop`, so a prefix match is safe.
+_BRANCH_DIRECTIONS = ("forward", "backward", "self_loop", "external", "unknown")
+
+# Full asm label: `.L2:`, `.LFB0:`, `main:`, `__x86.get_pc_thunk.ax:`. Labels
+# occupy the whole stripped line (no operands) and take letters, digits, `_`,
+# `.`, `$`. The trailing `:` is required to distinguish a label from an
+# operand mention of the same symbol.
+_LABEL_RE = re.compile(r"^([.\w$]+):$")
+
+
+def classify_branch(mnemonic: str) -> str | None:
+    """Return ``"unconditional"``, ``"conditional"``, or ``None`` (not a branch)
+    for an x86 mnemonic.
+
+    ``mnemonic`` is the lowercased first whitespace-separated token of an
+    instruction line (e.g. ``"jle"``, ``"jmp"``, ``"loop"``, ``"movl"``). Size
+    suffixes are handled by prefix match: ``"jmpl"`` classifies the same as
+    ``"jmp"``.
+    """
+    if mnemonic.startswith("jmp"):
+        return "unconditional"
+    if mnemonic.startswith("j"):
+        return "conditional"
+    if mnemonic.startswith("loop"):
+        return "conditional"
+    return None
+
+
+def _label_positions(asm_lines: List[str]) -> Dict[str, int]:
+    """Map each label declaration to its 1-indexed display asm line.
+
+    ``asm_lines`` is the filtered display assembly (same list handed to every
+    other per-line pass). Only lines whose *entire* stripped form is
+    ``<label>:`` are recorded — an operand mention of the same symbol elsewhere
+    on a line is not a declaration.
+    """
+    positions: Dict[str, int] = {}
+    for idx, text in enumerate(asm_lines, start=1):
+        m = _LABEL_RE.match(text.strip())
+        if m:
+            positions[m.group(1)] = idx
+    return positions
+
+
+def _parse_branch(text: str) -> Tuple[str, str, str] | None:
+    """Return ``(mnemonic, kind, target)`` if ``text`` is a branch, else ``None``.
+
+    ``kind`` is ``"unconditional"`` for ``jmp``/``jmpl`` and ``"conditional"``
+    for every other ``j*`` / ``loop*`` mnemonic. ``target`` is the raw operand
+    text (typically a label like ``".L2"``; ``""`` for the malformed no-operand
+    case; starts with ``"*"`` for an indirect target like ``"*%eax"``).
+
+    Assumes the operand carries no trailing comment (e.g. ``jmp .L2 # foo``),
+    which would otherwise poison ``target`` and misclassify direction as
+    ``external``. This holds because ``_run_gcc`` does not pass
+    ``-fverbose-asm``; if that ever changes, strip a trailing ``#``/``//``
+    comment off the operand here.
+    """
+    stripped = text.strip()
+    if not stripped or stripped.endswith(':'):
+        return None
+    parts = stripped.split(None, 1)
+    mnemonic = parts[0].lower()
+    kind = classify_branch(mnemonic)
+    if kind is None:
+        return None
+    target = parts[1].strip() if len(parts) > 1 else ""
+    return mnemonic, kind, target
+
+
+def branch_direction(source_line: int, target: str, labels: Dict[str, int]) -> str:
+    """Classify a branch's direction relative to its own source line.
+
+    Returns one of ``"forward"`` (target below the branch — the classic if/else
+    branch-around), ``"backward"`` (target above — a loop back-edge),
+    ``"self_loop"`` (target lands on the branch itself), ``"external"`` (the
+    target label is not declared in this asm file, e.g. a tail call), or
+    ``"unknown"`` (no target text, or indirect ``jmp *%eax`` / ``jmp *4(%eax)``
+    where the destination is computed at run time).
+    """
+    if not target or target.startswith('*'):
+        return "unknown"
+    tgt_line = labels.get(target)
+    if tgt_line is None:
+        return "external"
+    if tgt_line == source_line:
+        return "self_loop"
+    return "forward" if tgt_line > source_line else "backward"
+
+
+def analyze_branches(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``branches`` list (every branch
+    instruction that line's assembly emits, in occurrence order) and return a
+    program-wide summary. Mutates ``line_map`` in place.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` /
+    ``analyze_registers`` / ``analyze_stack``).
+
+    Per-line branch entry shape::
+
+        {
+          "mnemonic":    "jle",         # lowercased opcode, size-suffix included
+          "conditional": True,          # False for jmp/jmpl only
+          "direction":   "forward",     # forward|backward|self_loop|external|unknown
+          "target":      ".L2",         # raw operand text; "*%eax" for indirect
+        }
+
+    Summary shape::
+
+        {
+          "total":         N,
+          "conditional":   N,
+          "unconditional": N,
+          "forward":       N,
+          "backward":      N,
+          "self_loop":     N,
+          "external":      N,
+          "unknown":       N,
+        }
+
+    Per-line totals sum to the program-wide ``total``. An asm line shared by
+    two Python lines' mappings is counted once per Python line (same convention
+    as ``analyze_registers``); at gcc's ``.loc`` granularity that sharing is
+    rare in practice.
+    """
+    labels = _label_positions(asm_lines)
+    totals: Dict[str, int] = {
+        "total": 0,
+        "conditional": 0,
+        "unconditional": 0,
+        "forward": 0,
+        "backward": 0,
+        "self_loop": 0,
+        "external": 0,
+        "unknown": 0,
+    }
+    for mapping in line_map.values():
+        branches: List[Dict] = []
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if not (1 <= asm_no <= len(asm_lines)):
+                continue
+            parsed = _parse_branch(asm_lines[asm_no - 1])
+            if parsed is None:
+                continue
+            mnemonic, kind, target = parsed
+            direction = branch_direction(asm_no, target, labels)
+            branches.append({
+                "mnemonic": mnemonic,
+                "conditional": kind == "conditional",
+                "direction": direction,
+                "target": target,
+            })
+            totals["total"] += 1
+            totals[kind] += 1
+            totals[direction] += 1
+        mapping["branches"] = branches
+    return totals
 
 
 def analyze_cost(
@@ -779,6 +1088,18 @@ async def compile_python(python_source: str) -> dict:
     # Split each Python line's memory movement into loads vs stores. Independent
     # of the passes above; runs over the same already-mapped display asm.
     memory_summary = analyze_memory_traffic(line_map, asm_lines)
+    # Classify each Python line's conditional jumps by sense (signed / unsigned /
+    # equality / unconditional) — the signed-vs-unsigned distinction that decides
+    # whether a bounds check is safe. Independent of the passes above.
+    branch_sense_summary = analyze_branch_senses(line_map, asm_lines)
+    # Weight each Python line's instructions by approximate cycle cost so the
+    # costliest lines — not merely the longest — stand out. Sharpens analyze_cost's
+    # raw instruction count into a latency-oriented ranking.
+    cycle_summary = analyze_cycles(line_map, asm_lines)
+    # Name every branch instruction per line (mnemonic / conditional /
+    # direction / target) and build the program-wide branch counts. Runs over
+    # the same line_map as the other per-line passes; independent of them.
+    branch_summary = analyze_branches(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
     # Source-level arithmetic strength hints: annotate each Python line whose
@@ -799,6 +1120,9 @@ async def compile_python(python_source: str) -> dict:
         "register_summary": register_summary,
         "stack_summary": stack_summary,
         "memory_summary": memory_summary,
+        "branch_sense_summary": branch_sense_summary,
+        "cycle_summary": cycle_summary,
+        "branch_summary": branch_summary,
         "asm_glossary": asm_glossary,
         "strength_summary": strength_summary,
     }
