@@ -625,6 +625,200 @@ def _classify_mnemonic(mnemonic: str) -> str | None:
     return None
 
 
+# ── Branch flow analysis ────────────────────────────────────────────────────
+#
+# Where the instruction mix lumps every jump into a single "branch" bucket, this
+# pass names each individual branch — which mnemonic, whether it is conditional,
+# where it goes, and (critically for reading control flow off a disassembly)
+# whether its target lies ABOVE or BELOW its own source line in the same asm
+# stream.
+#
+# The lessons this teaches (mission pillars 1 and 2):
+#   * Pillar 1 (make the mapping concrete): a Python `if` compiles to a
+#     conditional FORWARD jump around the then-body (the "branch-around"
+#     pattern); a `for`/`while` compiles to a BACKWARD jump that loops back to
+#     the test at the head of the loop. Seeing that shape appear line-by-line
+#     in the branch entries makes the Python → x86 control-flow lowering
+#     something you can read, not just believe.
+#   * Pillar 2 (spot bad / vulnerable asm): reading control flow off raw asm is
+#     a day-one reverse-engineering skill — loops = backward branches, if/else
+#     = forward-around. The wrong shapes matter just as much: a backward branch
+#     with no exit condition (an infinite loop bug), a forward branch that
+#     skips a length check (a classic sanitiser bypass), or a chain of `jmp`
+#     sleds (obfuscation / shellcode) all read off the annotated branches.
+#
+# Only intra-file *branch* instructions are surfaced. `call`/`ret` control flow
+# is already covered by the instruction mix's "call" category and by the
+# register footprint (implicit `%esp`/`%eip`), and mixing calls in here would
+# muddy the "forward vs backward" reading the pass is built around.
+
+# jmp/jmpl are the unconditional family; every other `j*` mnemonic (je/jne/jl/
+# jle/…/jecxz) is conditional; `loop`/`loope`/`loopne` are the decrement-%ecx-
+# and-branch-if-nonzero family (conditional). No other x86 mnemonic starts with
+# `j` or `loop`, so a prefix match is safe.
+_BRANCH_DIRECTIONS = ("forward", "backward", "self_loop", "external", "unknown")
+
+# Full asm label: `.L2:`, `.LFB0:`, `main:`, `__x86.get_pc_thunk.ax:`. Labels
+# occupy the whole stripped line (no operands) and take letters, digits, `_`,
+# `.`, `$`. The trailing `:` is required to distinguish a label from an
+# operand mention of the same symbol.
+_LABEL_RE = re.compile(r"^([.\w$]+):$")
+
+
+def classify_branch(mnemonic: str) -> str | None:
+    """Return ``"unconditional"``, ``"conditional"``, or ``None`` (not a branch)
+    for an x86 mnemonic.
+
+    ``mnemonic`` is the lowercased first whitespace-separated token of an
+    instruction line (e.g. ``"jle"``, ``"jmp"``, ``"loop"``, ``"movl"``). Size
+    suffixes are handled by prefix match: ``"jmpl"`` classifies the same as
+    ``"jmp"``.
+    """
+    if mnemonic.startswith("jmp"):
+        return "unconditional"
+    if mnemonic.startswith("j"):
+        return "conditional"
+    if mnemonic.startswith("loop"):
+        return "conditional"
+    return None
+
+
+def _label_positions(asm_lines: List[str]) -> Dict[str, int]:
+    """Map each label declaration to its 1-indexed display asm line.
+
+    ``asm_lines`` is the filtered display assembly (same list handed to every
+    other per-line pass). Only lines whose *entire* stripped form is
+    ``<label>:`` are recorded — an operand mention of the same symbol elsewhere
+    on a line is not a declaration.
+    """
+    positions: Dict[str, int] = {}
+    for idx, text in enumerate(asm_lines, start=1):
+        m = _LABEL_RE.match(text.strip())
+        if m:
+            positions[m.group(1)] = idx
+    return positions
+
+
+def _parse_branch(text: str) -> Tuple[str, str, str] | None:
+    """Return ``(mnemonic, kind, target)`` if ``text`` is a branch, else ``None``.
+
+    ``kind`` is ``"unconditional"`` for ``jmp``/``jmpl`` and ``"conditional"``
+    for every other ``j*`` / ``loop*`` mnemonic. ``target`` is the raw operand
+    text (typically a label like ``".L2"``; ``""`` for the malformed no-operand
+    case; starts with ``"*"`` for an indirect target like ``"*%eax"``).
+
+    Assumes the operand carries no trailing comment (e.g. ``jmp .L2 # foo``),
+    which would otherwise poison ``target`` and misclassify direction as
+    ``external``. This holds because ``_run_gcc`` does not pass
+    ``-fverbose-asm``; if that ever changes, strip a trailing ``#``/``//``
+    comment off the operand here.
+    """
+    stripped = text.strip()
+    if not stripped or stripped.endswith(':'):
+        return None
+    parts = stripped.split(None, 1)
+    mnemonic = parts[0].lower()
+    kind = classify_branch(mnemonic)
+    if kind is None:
+        return None
+    target = parts[1].strip() if len(parts) > 1 else ""
+    return mnemonic, kind, target
+
+
+def branch_direction(source_line: int, target: str, labels: Dict[str, int]) -> str:
+    """Classify a branch's direction relative to its own source line.
+
+    Returns one of ``"forward"`` (target below the branch — the classic if/else
+    branch-around), ``"backward"`` (target above — a loop back-edge),
+    ``"self_loop"`` (target lands on the branch itself), ``"external"`` (the
+    target label is not declared in this asm file, e.g. a tail call), or
+    ``"unknown"`` (no target text, or indirect ``jmp *%eax`` / ``jmp *4(%eax)``
+    where the destination is computed at run time).
+    """
+    if not target or target.startswith('*'):
+        return "unknown"
+    tgt_line = labels.get(target)
+    if tgt_line is None:
+        return "external"
+    if tgt_line == source_line:
+        return "self_loop"
+    return "forward" if tgt_line > source_line else "backward"
+
+
+def analyze_branches(
+    line_map: Dict[int, dict],
+    asm_lines: List[str],
+) -> dict:
+    """Annotate each ``line_map`` entry with a ``branches`` list (every branch
+    instruction that line's assembly emits, in occurrence order) and return a
+    program-wide summary. Mutates ``line_map`` in place.
+
+    ``asm_lines`` is the filtered display assembly, 1-indexed by the numbers
+    stored in each entry's ``asm_lines`` (same convention as ``analyze_cost`` /
+    ``analyze_registers`` / ``analyze_stack``).
+
+    Per-line branch entry shape::
+
+        {
+          "mnemonic":    "jle",         # lowercased opcode, size-suffix included
+          "conditional": True,          # False for jmp/jmpl only
+          "direction":   "forward",     # forward|backward|self_loop|external|unknown
+          "target":      ".L2",         # raw operand text; "*%eax" for indirect
+        }
+
+    Summary shape::
+
+        {
+          "total":         N,
+          "conditional":   N,
+          "unconditional": N,
+          "forward":       N,
+          "backward":      N,
+          "self_loop":     N,
+          "external":      N,
+          "unknown":       N,
+        }
+
+    Per-line totals sum to the program-wide ``total``. An asm line shared by
+    two Python lines' mappings is counted once per Python line (same convention
+    as ``analyze_registers``); at gcc's ``.loc`` granularity that sharing is
+    rare in practice.
+    """
+    labels = _label_positions(asm_lines)
+    totals: Dict[str, int] = {
+        "total": 0,
+        "conditional": 0,
+        "unconditional": 0,
+        "forward": 0,
+        "backward": 0,
+        "self_loop": 0,
+        "external": 0,
+        "unknown": 0,
+    }
+    for mapping in line_map.values():
+        branches: List[Dict] = []
+        for asm_no in mapping.get("asm_lines", []):
+            # asm_no is 1-indexed into the filtered display asm; skip strays.
+            if not (1 <= asm_no <= len(asm_lines)):
+                continue
+            parsed = _parse_branch(asm_lines[asm_no - 1])
+            if parsed is None:
+                continue
+            mnemonic, kind, target = parsed
+            direction = branch_direction(asm_no, target, labels)
+            branches.append({
+                "mnemonic": mnemonic,
+                "conditional": kind == "conditional",
+                "direction": direction,
+                "target": target,
+            })
+            totals["total"] += 1
+            totals[kind] += 1
+            totals[direction] += 1
+        mapping["branches"] = branches
+    return totals
+
+
 def analyze_cost(
     line_map: Dict[int, dict],
     asm_lines: List[str],
@@ -778,6 +972,10 @@ async def compile_python(python_source: str) -> dict:
     # Split each Python line's memory movement into loads vs stores. Independent
     # of the passes above; runs over the same already-mapped display asm.
     memory_summary = analyze_memory_traffic(line_map, asm_lines)
+    # Name every branch instruction per line (mnemonic / conditional /
+    # direction / target) and build the program-wide branch counts. Runs over
+    # the same line_map as the other per-line passes; independent of them.
+    branch_summary = analyze_branches(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
 
@@ -792,5 +990,6 @@ async def compile_python(python_source: str) -> dict:
         "register_summary": register_summary,
         "stack_summary": stack_summary,
         "memory_summary": memory_summary,
+        "branch_summary": branch_summary,
         "asm_glossary": asm_glossary,
     }
