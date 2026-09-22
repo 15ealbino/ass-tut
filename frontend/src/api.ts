@@ -50,6 +50,10 @@ export interface LineMapping {
   // Memory traffic: how many memory reads (loads) and writes (stores) this
   // line's asm performs. Only nonzero of {loads, stores} are present.
   memory_counts?: Record<string, number>
+  // Cycle-cost estimate: summed approximate relative cycle weight of this line's
+  // instructions (divide ~20, multiply/call ~3-4, most staples 1). A latency-
+  // oriented sharpening of asm_count — the costliest line isn't always the longest.
+  cycle_estimate?: number
   // Branch flow: every branch instruction this Python line emits, in
   // occurrence order. Each entry names the mnemonic, whether it is
   // conditional, its direction relative to its source line (forward =
@@ -101,6 +105,14 @@ export interface MemorySummary {
   memory_totals: Record<string, number>
 }
 
+export interface CycleHotspot { py_line: number; cycles: number }
+
+export interface CycleSummary {
+  // Program-wide cycle-cost estimate: sum of every mapped instruction's
+  // approximate cycle weight, plus the Python lines ranked by estimated cost
+  // (costliest first). Coarse RELATIVE teaching estimates, not cycle-accurate.
+  total_cycles: number
+  hotspots: CycleHotspot[]
 export interface BranchSummary {
   // Program-wide branch flow counts. Per-line branch entries live on
   // LineMapping.branches; this summary tallies them.
@@ -147,6 +159,7 @@ export interface CompileResponse {
   stack_summary?: StackSummary | null
   memory_summary?: MemorySummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
+  cycle_summary?: CycleSummary | null
   branch_summary?: BranchSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
