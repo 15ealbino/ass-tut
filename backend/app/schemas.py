@@ -13,6 +13,15 @@ class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
+class StrengthHint(BaseModel):
+    # One arithmetic strength hint for a Python line.
+    #   kind    — stable label: "mul-pow2", "div-pow2", or "div-var".
+    #   message — plain-English note tying the Python construct to the assembly
+    #             it becomes: a compiler strength reduction (shift / bitwise AND)
+    #             for a power-of-two constant, or a real idiv for a runtime divisor.
+    kind: str
+    message: str
+
 
 class Branch(BaseModel):
     # One branch instruction as it appears on a single Python line's asm.
@@ -61,6 +70,12 @@ class LineMapping(BaseModel):
     # by direction. Only nonzero of {"loads", "stores"} are present. Empty for the
     # pyghidra pipeline, which computes no per-line memory traffic.
     memory_counts: Dict[str, int] = Field(default_factory=dict)
+    # Arithmetic strength hints: source-level notes for this Python line whose
+    # arithmetic the compiler strength-reduces (a power-of-two multiply/divide →
+    # shift / bitwise AND) or cannot (a runtime divisor → a real idiv). Empty when
+    # the line has no flagged arithmetic, and empty for the pyghidra pipeline,
+    # which computes no per-line hints.
+    strength_hints: List[StrengthHint] = Field(default_factory=list)
     # Branch-sense map: how this line's conditional jumps split by sense
     # ("signed", "unsigned", "equality", "unconditional", "other") — the
     # signed-vs-unsigned distinction that decides whether a comparison is safe.
@@ -120,6 +135,22 @@ class MemorySummary(BaseModel):
     # Program-wide memory traffic: the total number of memory reads (loads) and
     # writes (stores) across the whole program. Both keys are always present.
     memory_totals: Dict[str, int] = Field(default_factory=lambda: {"loads": 0, "stores": 0})
+
+
+class StrengthHintSummaryEntry(BaseModel):
+    # One flagged Python line in the program-wide strength summary.
+    py_line: int
+    kind: str
+    message: str
+
+
+class StrengthSummary(BaseModel):
+    # Program-wide arithmetic strength hints.
+    #   hint_totals — each hint kind mapped to the number of lines carrying it,
+    #                 ordered by kind (mul-pow2, div-pow2, div-var); zeros omitted.
+    #   hints       — every flagged line, ordered by (py_line, kind).
+    hint_totals: Dict[str, int] = Field(default_factory=dict)
+    hints: List[StrengthHintSummaryEntry] = Field(default_factory=list)
 
 
 class BranchSenseSummary(BaseModel):
@@ -217,3 +248,6 @@ class CompileResponse(BaseModel):
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
+    # Source-level arithmetic strength hints for the transpile pipeline; None for
+    # pyghidra (no per-line Python→asm mapping to hang hints off).
+    strength_summary: Optional[StrengthSummary] = None
