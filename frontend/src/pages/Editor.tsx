@@ -10866,6 +10866,87 @@ print(result)
       description: 'movl loads handler.callback from the struct into a register; after overflow_write pushes 6 elements past the 4-slot buffer, this field holds 0xDEADBEEF + 4 instead of 4096 — addl combines the corrupted callback with the also-overwritten priority field, producing a fully attacker-controlled value that would redirect any indirect call or dispatch through this handler',
     },
   },
+  {
+    id: 'stackwarp-desync',
+    name: 'STACKWARP ENGINE DESYNC',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'A sibling hardware thread toggles the CPU stack engine via an undocumented MSR, desynchronizing the victim thread\'s stack pointer and redirecting control flow to attacker-controlled data.',
+    explanation:
+      'StackWarp (CVE-2025-29943, CVSS 8.8) exploits a synchronization failure in the speculative stack engine present in ' +
+      'all AMD Zen 1 through Zen 5 processors. Modern x86 CPUs optimize push, pop, call, and ret instructions by maintaining ' +
+      'a running stack-pointer delta in the frontend pipeline — the stack engine — so RSP updates resolve before the ' +
+      'backend commits them. Bit 19 of the undocumented core-scoped MSR 0xC0011029 enables or disables this engine, but ' +
+      'the toggle is not properly synchronized between sibling SMT threads sharing the same physical core. A malicious ' +
+      'hypervisor or host thread clears bit 19 while the victim (e.g., an AMD SEV-SNP confidential VM) executes stack ' +
+      'operations: the backend continues moving the actual RSP on each push and pop, but the frontend\'s delta freezes. ' +
+      'When the engine is re-enabled or a synchronization event occurs, the mismatch between the engine\'s tracked RSP and ' +
+      'the real RSP produces a deterministic "warp" — the stack pointer jumps by the accumulated unsynchronized offset. ' +
+      'This lets the attacker redirect ret instructions to read a return address from an attacker-controlled stack location ' +
+      'rather than the legitimate one, achieving arbitrary code execution inside the protected VM. The attack requires no ' +
+      'memory corruption: it abuses the CPU\'s own microarchitectural optimization to shift where the processor believes ' +
+      'the stack is. CISPA researchers demonstrated full control-flow hijack and cryptographic key extraction from SEV-SNP ' +
+      'guests. AMD addressed the flaw with microcode updates (AMD-SB-7045). In the assembly below, subl adjusts rsp for ' +
+      'each push but the engine\'s internal delta is frozen; when do_pop executes, movl reads from the engine\'s stale ' +
+      'offset (mem3, attacker-planted 0xDEADBEEF) rather than the correct slot (mem2, value 3333).',
+    code:
+`# CVE pattern: sibling-thread MSR toggle warps guest RSP (StackWarp CVE-2025-29943)
+class CPU:
+    def __init__(self):
+        self.actual_rsp = 4
+        self.engine_rsp = 4
+        self.engine_on = 1
+        self.mem0 = 0
+        self.mem1 = 0
+        self.mem2 = 0
+        self.mem3 = 4096
+def do_push(cpu, val):
+    cpu.actual_rsp = cpu.actual_rsp - 1
+    if cpu.actual_rsp == 0:
+        cpu.mem0 = val
+    elif cpu.actual_rsp == 1:
+        cpu.mem1 = val
+    elif cpu.actual_rsp == 2:
+        cpu.mem2 = val
+    elif cpu.actual_rsp == 3:
+        cpu.mem3 = val
+    if cpu.engine_on == 1:
+        cpu.engine_rsp = cpu.engine_rsp - 1
+    return cpu.actual_rsp
+def do_pop(cpu):
+    pos = cpu.engine_rsp
+    if pos >= 3:
+        val = cpu.mem3
+    elif pos == 2:
+        val = cpu.mem2
+    elif pos == 1:
+        val = cpu.mem1
+    else:
+        val = cpu.mem0
+    cpu.actual_rsp = cpu.actual_rsp + 1
+    if cpu.engine_on == 1:
+        cpu.engine_rsp = cpu.engine_rsp + 1
+    return val
+def exploit():
+    cpu = CPU()
+    do_push(cpu, 1111)
+    do_push(cpu, 2222)
+    v = do_pop(cpu)
+    print(v)
+    cpu.engine_on = 0
+    do_push(cpu, 3333)
+    cpu.mem3 = 3735928559
+    warped = do_pop(cpu)
+    print(warped)
+    return warped
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['subl', 'movl'],
+      description: 'subl decrements actual_rsp for each push (the backend moves RSP correctly), but when engine_on is 0 the frontend\'s stack engine delta freezes — engine_rsp never decrements; on do_pop, movl reads from the engine\'s stale offset (slot mem3, now holding attacker-planted 0xDEADBEEF) instead of the correct slot (mem2, value 3333), redirecting any return-address pop to attacker-controlled data without any memory corruption',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
