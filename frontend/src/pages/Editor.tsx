@@ -10947,6 +10947,80 @@ print(result)
       description: 'subl decrements actual_rsp for each push (the backend moves RSP correctly), but when engine_on is 0 the frontend\'s stack engine delta freezes — engine_rsp never decrements; on do_pop, movl reads from the engine\'s stale offset (slot mem3, now holding attacker-planted 0xDEADBEEF) instead of the correct slot (mem2, value 3333), redirecting any return-address pop to attacker-controlled data without any memory corruption',
     },
   },
+  {
+    id: 'ebt-snat-splice-write',
+    name: 'EBT SNAT SPLICE WRITE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Ebtables SNAT ARP address rewrite writes through splice-imported file pages without copy-on-write, corrupting shared memory.',
+    explanation:
+      'CVE-2026-53266 (CVSS 8.8, CISA KEV September 2026) is a write-through vulnerability in the Linux ' +
+      'kernel\'s ebtables SNAT target. When performing an optional ARP sender hardware address rewrite, the ' +
+      'code calls skb_store_bits() at an offset relative to skb->data without first invoking ' +
+      'skb_ensure_writable() to verify the destination range is safely writable. If the target ARP header ' +
+      'resides in a nonlinear socket-buffer fragment backed by a splice()-imported file page, the write ' +
+      'copies the new MAC address directly into the underlying shared file-backed memory page instead of a ' +
+      'private copy. This corrupts memory visible to all processes mapping that file page — an attacker on ' +
+      'a system configured with bridge netfilter SNAT rules can craft ARP traffic whose payload overlaps a ' +
+      'splice-imported page, then trigger the SNAT rewrite to overwrite arbitrary data in the file cache. ' +
+      'The flaw stems from a design constraint: the Ethernet header is accessed via skb_mac_header() rather ' +
+      'than skb->data, which made a straightforward skb_ensure_writable() call regress small-packet handling ' +
+      '(commit 63137bc5882a). The fix adds a targeted writable check before the ARP SHA write path. ' +
+      'Exploitation was confirmed in the wild by CISA, with federal agencies ordered to patch within 48 hours. ' +
+      'Fixed upstream in kernels 5.10.259, 6.1.176, and 6.12.94. In the assembly below, movl writes the SNAT ' +
+      'address into the page\'s byte slot — because the page is shared (refcount > 1) and no COW copy was ' +
+      'performed, the write corrupts the original file data visible to all other mappings.',
+    code:
+`# CVE pattern: ebtables SNAT ARP splice-page write-through (CVE-2026-53266)
+class FilePage:
+    def __init__(self):
+        self.b0 = 170
+        self.b1 = 187
+        self.b2 = 204
+        self.b3 = 221
+        self.refcount = 1
+        self.writable = 0
+class SkBuff:
+    def __init__(self):
+        self.linear = 1
+        self.arp_off = 2
+        self.frag_ref = 0
+def splice_import(skb, page):
+    skb.linear = 0
+    page.refcount = page.refcount + 1
+    return page.refcount
+def store_bits(page, offset, val):
+    if offset == 0:
+        page.b0 = val
+    elif offset == 1:
+        page.b1 = val
+    elif offset == 2:
+        page.b2 = val
+    else:
+        page.b3 = val
+    return 0
+def snat_arp_rewrite(skb, page, hwaddr):
+    off = skb.arp_off
+    store_bits(page, off, hwaddr)
+    return 0
+def exploit():
+    fp = FilePage()
+    skb = SkBuff()
+    print(fp.b2)
+    splice_import(skb, fp)
+    print(fp.refcount)
+    snat_arp_rewrite(skb, fp, 57005)
+    print(fp.b2)
+    corrupted = fp.b2
+    return corrupted
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl'],
+      description: 'movl writes the SNAT hardware address (57005 / 0xDEAD) into the FilePage\'s b2 slot — because the page was splice-imported (shared, refcount 2) and no copy-on-write was performed, this single movl corrupts the original file-backed data visible to every process mapping that page',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
