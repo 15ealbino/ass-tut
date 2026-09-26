@@ -10866,6 +10866,227 @@ print(result)
       description: 'movl loads handler.callback from the struct into a register; after overflow_write pushes 6 elements past the 4-slot buffer, this field holds 0xDEADBEEF + 4 instead of 4096 — addl combines the corrupted callback with the also-overwritten priority field, producing a fully attacker-controlled value that would redirect any indirect call or dispatch through this handler',
     },
   },
+  {
+    id: 'stackwarp-desync',
+    name: 'STACKWARP ENGINE DESYNC',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'A sibling hardware thread toggles the CPU stack engine via an undocumented MSR, desynchronizing the victim thread\'s stack pointer and redirecting control flow to attacker-controlled data.',
+    explanation:
+      'StackWarp (CVE-2025-29943, CVSS 8.8) exploits a synchronization failure in the speculative stack engine present in ' +
+      'all AMD Zen 1 through Zen 5 processors. Modern x86 CPUs optimize push, pop, call, and ret instructions by maintaining ' +
+      'a running stack-pointer delta in the frontend pipeline — the stack engine — so RSP updates resolve before the ' +
+      'backend commits them. Bit 19 of the undocumented core-scoped MSR 0xC0011029 enables or disables this engine, but ' +
+      'the toggle is not properly synchronized between sibling SMT threads sharing the same physical core. A malicious ' +
+      'hypervisor or host thread clears bit 19 while the victim (e.g., an AMD SEV-SNP confidential VM) executes stack ' +
+      'operations: the backend continues moving the actual RSP on each push and pop, but the frontend\'s delta freezes. ' +
+      'When the engine is re-enabled or a synchronization event occurs, the mismatch between the engine\'s tracked RSP and ' +
+      'the real RSP produces a deterministic "warp" — the stack pointer jumps by the accumulated unsynchronized offset. ' +
+      'This lets the attacker redirect ret instructions to read a return address from an attacker-controlled stack location ' +
+      'rather than the legitimate one, achieving arbitrary code execution inside the protected VM. The attack requires no ' +
+      'memory corruption: it abuses the CPU\'s own microarchitectural optimization to shift where the processor believes ' +
+      'the stack is. CISPA researchers demonstrated full control-flow hijack and cryptographic key extraction from SEV-SNP ' +
+      'guests. AMD addressed the flaw with microcode updates (AMD-SB-7045). In the assembly below, subl adjusts rsp for ' +
+      'each push but the engine\'s internal delta is frozen; when do_pop executes, movl reads from the engine\'s stale ' +
+      'offset (mem3, attacker-planted 0xDEADBEEF) rather than the correct slot (mem2, value 3333).',
+    code:
+`# CVE pattern: sibling-thread MSR toggle warps guest RSP (StackWarp CVE-2025-29943)
+class CPU:
+    def __init__(self):
+        self.actual_rsp = 4
+        self.engine_rsp = 4
+        self.engine_on = 1
+        self.mem0 = 0
+        self.mem1 = 0
+        self.mem2 = 0
+        self.mem3 = 4096
+def do_push(cpu, val):
+    cpu.actual_rsp = cpu.actual_rsp - 1
+    if cpu.actual_rsp == 0:
+        cpu.mem0 = val
+    elif cpu.actual_rsp == 1:
+        cpu.mem1 = val
+    elif cpu.actual_rsp == 2:
+        cpu.mem2 = val
+    elif cpu.actual_rsp == 3:
+        cpu.mem3 = val
+    if cpu.engine_on == 1:
+        cpu.engine_rsp = cpu.engine_rsp - 1
+    return cpu.actual_rsp
+def do_pop(cpu):
+    pos = cpu.engine_rsp
+    if pos >= 3:
+        val = cpu.mem3
+    elif pos == 2:
+        val = cpu.mem2
+    elif pos == 1:
+        val = cpu.mem1
+    else:
+        val = cpu.mem0
+    cpu.actual_rsp = cpu.actual_rsp + 1
+    if cpu.engine_on == 1:
+        cpu.engine_rsp = cpu.engine_rsp + 1
+    return val
+def exploit():
+    cpu = CPU()
+    do_push(cpu, 1111)
+    do_push(cpu, 2222)
+    v = do_pop(cpu)
+    print(v)
+    cpu.engine_on = 0
+    do_push(cpu, 3333)
+    cpu.mem3 = 3735928559
+    warped = do_pop(cpu)
+    print(warped)
+    return warped
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['subl', 'movl'],
+      description: 'subl decrements actual_rsp for each push (the backend moves RSP correctly), but when engine_on is 0 the frontend\'s stack engine delta freezes — engine_rsp never decrements; on do_pop, movl reads from the engine\'s stale offset (slot mem3, now holding attacker-planted 0xDEADBEEF) instead of the correct slot (mem2, value 3333), redirecting any return-address pop to attacker-controlled data without any memory corruption',
+    },
+  },
+  {
+    id: 'ebt-snat-splice-write',
+    name: 'EBT SNAT SPLICE WRITE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Ebtables SNAT ARP address rewrite writes through splice-imported file pages without copy-on-write, corrupting shared memory.',
+    explanation:
+      'CVE-2026-53266 (CVSS 8.8, CISA KEV September 2026) is a write-through vulnerability in the Linux ' +
+      'kernel\'s ebtables SNAT target. When performing an optional ARP sender hardware address rewrite, the ' +
+      'code calls skb_store_bits() at an offset relative to skb->data without first invoking ' +
+      'skb_ensure_writable() to verify the destination range is safely writable. If the target ARP header ' +
+      'resides in a nonlinear socket-buffer fragment backed by a splice()-imported file page, the write ' +
+      'copies the new MAC address directly into the underlying shared file-backed memory page instead of a ' +
+      'private copy. This corrupts memory visible to all processes mapping that file page — an attacker on ' +
+      'a system configured with bridge netfilter SNAT rules can craft ARP traffic whose payload overlaps a ' +
+      'splice-imported page, then trigger the SNAT rewrite to overwrite arbitrary data in the file cache. ' +
+      'The flaw stems from a design constraint: the Ethernet header is accessed via skb_mac_header() rather ' +
+      'than skb->data, which made a straightforward skb_ensure_writable() call regress small-packet handling ' +
+      '(commit 63137bc5882a). The fix adds a targeted writable check before the ARP SHA write path. ' +
+      'Exploitation was confirmed in the wild by CISA, with federal agencies ordered to patch within 48 hours. ' +
+      'Fixed upstream in kernels 5.10.259, 6.1.176, and 6.12.94. In the assembly below, movl writes the SNAT ' +
+      'address into the page\'s byte slot — because the page is shared (refcount > 1) and no COW copy was ' +
+      'performed, the write corrupts the original file data visible to all other mappings.',
+    code:
+`# CVE pattern: ebtables SNAT ARP splice-page write-through (CVE-2026-53266)
+class FilePage:
+    def __init__(self):
+        self.b0 = 170
+        self.b1 = 187
+        self.b2 = 204
+        self.b3 = 221
+        self.refcount = 1
+        self.writable = 0
+class SkBuff:
+    def __init__(self):
+        self.linear = 1
+        self.arp_off = 2
+        self.frag_ref = 0
+def splice_import(skb, page):
+    skb.linear = 0
+    page.refcount = page.refcount + 1
+    return page.refcount
+def store_bits(page, offset, val):
+    if offset == 0:
+        page.b0 = val
+    elif offset == 1:
+        page.b1 = val
+    elif offset == 2:
+        page.b2 = val
+    else:
+        page.b3 = val
+    return 0
+def snat_arp_rewrite(skb, page, hwaddr):
+    off = skb.arp_off
+    store_bits(page, off, hwaddr)
+    return 0
+def exploit():
+    fp = FilePage()
+    skb = SkBuff()
+    print(fp.b2)
+    splice_import(skb, fp)
+    print(fp.refcount)
+    snat_arp_rewrite(skb, fp, 57005)
+    print(fp.b2)
+    corrupted = fp.b2
+    return corrupted
+result = exploit()
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl'],
+      description: 'movl writes the SNAT hardware address (57005 / 0xDEAD) into the FilePage\'s b2 slot — because the page was splice-imported (shared, refcount 2) and no copy-on-write was performed, this single movl corrupts the original file-backed data visible to every process mapping that page',
+    },
+  },
+  {
+    id: 'dirty-ah6',
+    name: 'DIRTY AH6',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Unchecked IPv6 routing header segments_left field causes a backward OOB memmove, corrupting kernel memory for privilege escalation.',
+    explanation:
+      'DirtyAH6 (CVE-2026-80844 / CWE-787, CVSS 7.8) exploits a missing validation in the Linux kernel\'s IPv6 ' +
+      'Authentication Header processing. The function ipv6_rearrange_rthdr() rearranges IPv6 routing-header addresses ' +
+      'before computing the AH integrity hash. It assumes that segments_left is no larger than the number of addresses ' +
+      'described by hdrlen, but this assumption does not hold for raw IPv6 HDRINCL packets, where the application ' +
+      'constructs the header directly. A packet with hdrlen=2 (one 16-byte address slot) but segments_left=255 makes ' +
+      'the function compute a pointer displacement of (255-1)*16 = 4064 bytes backward from the first address. The ' +
+      'subsequent memmove() copies 4064 bytes of kernel memory from before the routing header into the packet, ' +
+      'corrupting adjacent slab objects, socket buffers, or credential structures. An unprivileged attacker with access ' +
+      'to network namespaces (available by default on most distributions) sends the malformed packet via a raw AF_INET6 ' +
+      'socket and triggers the AH XFRM transform. Proof-of-concept exploits achieving local root were published on ' +
+      'September 18, 2026. The fix validates segments_left against hdrlen before the pointer arithmetic. ' +
+      'In the assembly, imull computes the backward offset from the attacker-controlled segments_left field without ' +
+      'any bounds check against hdrlen; movl writes data at the computed negative offset into kernel memory, and the ' +
+      'corrupted bytes overwrite adjacent slab objects or cred_struct fields for privilege escalation.',
+    code:
+`# CVE pattern: AH6 routing header segments_left exceeds hdrlen — OOB memmove
+class RoutingHeader:
+    def __init__(self, hdrlen, segments_left):
+        self.hdrlen = hdrlen
+        self.segments_left = segments_left
+        self.addr0 = 4196352
+        self.max_addrs = 0
+
+    def compute_max(self):
+        self.max_addrs = self.hdrlen * 8
+        return self.max_addrs
+
+class KernelSlab:
+    def __init__(self, uid, gid, handler):
+        self.uid = uid
+        self.gid = gid
+        self.handler = handler
+        self.corrupted = 0
+
+    def read_cred(self):
+        result = self.uid + self.gid + self.handler
+        return result
+
+def rearrange_rthdr(rthdr, slab):
+    offset = rthdr.segments_left * 16
+    max_offset = rthdr.max_addrs
+    if offset > max_offset:
+        slab.uid = 0
+        slab.gid = 0
+        slab.corrupted = 1
+    return offset
+
+rthdr = RoutingHeader(2, 255)
+rthdr.compute_max()
+slab = KernelSlab(1000, 1000, 4196352)
+displacement = rearrange_rthdr(rthdr, slab)
+leaked = slab.read_cred()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['imull', 'cmpl', 'movl'],
+      description: 'imull computes the displacement from the attacker-controlled segments_left (255) multiplied by 16, producing 4080 bytes past the hdrlen-derived max of 16; cmpl detects the overflow but in the real kernel no such check exists before memmove; movl writes uid=0 and gid=0 into the adjacent slab object, simulating the OOB corruption that overwrites cred_struct fields for root escalation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
