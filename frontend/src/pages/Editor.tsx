@@ -11087,6 +11087,87 @@ print(leaked)
       description: 'imull computes the displacement from the attacker-controlled segments_left (255) multiplied by 16, producing 4080 bytes past the hdrlen-derived max of 16; cmpl detects the overflow but in the real kernel no such check exists before memmove; movl writes uid=0 and gid=0 into the adjacent slab object, simulating the OOB corruption that overwrites cred_struct fields for root escalation',
     },
   },
+  {
+    id: 'house-of-botcake',
+    name: 'HOUSE OF BOTCAKE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Freeing a victim chunk into both tcache and the unsorted bin creates overlapping allocations, enabling tcache poisoning and arbitrary write.',
+    explanation:
+      'House of Botcake is a heap exploitation technique that bypasses glibc\'s tcache double-free detection ' +
+      '(introduced in glibc 2.29) by splitting the two frees across different bin structures. The attacker ' +
+      'allocates seven same-sized chunks to fill the tcache, plus a victim chunk and a chunk above it (the ' +
+      '"prev" chunk), with a padding allocation to prevent top-chunk consolidation. All seven chunks are ' +
+      'freed into tcache, then the victim is freed into the unsorted bin. Next, the prev chunk is freed, ' +
+      'causing glibc\'s coalescing logic to merge it backward with the victim into a single large unsorted-bin ' +
+      'chunk. The attacker removes one entry from tcache to make room and frees the victim again — this time ' +
+      'into tcache, since tcache now has a free slot. The victim now exists simultaneously in tcache (as a ' +
+      'small chunk) and inside the consolidated unsorted-bin chunk. Allocating the large consolidated region ' +
+      'returns memory that overlaps the victim\'s tcache entry, letting the attacker overwrite its forward ' +
+      'pointer (fd/next). On glibc 2.32+ the pointer is mangled via safe-linking (addr >> 12 XOR target), ' +
+      'but with any heap leak this is trivially defeated. The next tcache allocation returns the poisoned ' +
+      'address — typically __free_hook, __malloc_hook, or a GOT entry — granting an arbitrary write ' +
+      'primitive. The technique was first documented in the shellphish how2heap repository and has been ' +
+      'widely used in CTF exploitation and real-world heap-corruption chains targeting glibc 2.26 through ' +
+      '2.35 and beyond. ' +
+      'In the assembly, the first movl writes the victim address into the unsorted bin head pointer; addl ' +
+      'sums prev_size and victim_size to form the merged chunk that overlaps the victim\'s tcache entry; ' +
+      'the second movl re-inserts the victim into tcache head, creating the dual-bin state; the final movl ' +
+      'writes the attacker\'s target address (0xDEADBEEF) through the poisoned forward pointer, achieving ' +
+      'arbitrary write to __free_hook or a GOT slot.',
+    code:
+`# CVE pattern: tcache + unsortedbin double-free creates overlapping chunks
+class TcacheBin:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.count = 0
+        self.head = 0
+
+    def insert(self, addr):
+        self.count += 1
+        self.head = addr
+        return self.count
+
+    def remove(self):
+        self.count -= 1
+        result = self.head
+        return result
+
+class UnsortedBin:
+    def __init__(self):
+        self.head = 0
+        self.size = 0
+
+    def insert(self, addr, size):
+        self.head = addr
+        self.size = size
+        return self.head
+
+    def consolidate(self, prev_addr, prev_sz, victim_sz):
+        self.head = prev_addr
+        self.size = prev_sz + victim_sz
+        return self.size
+
+tcache = TcacheBin(7)
+for i in range(7):
+    tcache.insert(4194304 + i * 256)
+
+victim = 4196352
+prev = 4196096
+unsorted = UnsortedBin()
+unsorted.insert(victim, 256)
+merged = unsorted.consolidate(prev, 256, 256)
+tcache.remove()
+tcache.insert(victim)
+overlap = prev
+target = 3735928559
+print(target)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'The first movl writes the victim address into the unsorted bin head, placing it in the coalescing path; addl sums prev_size and victim_size to form the merged chunk that overlaps the victim\'s tcache entry; the second movl re-inserts the victim into tcache head, creating the dual-bin state; the final movl writes the attacker\'s target (0xDEADBEEF) through the poisoned forward pointer, achieving arbitrary write to __free_hook or a GOT slot',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
