@@ -16,6 +16,7 @@ addressing modes:
     register      register-direct                               `%eax`, `%st(0)`
     displacement  base register + displacement (a stack local)  `-4(%ebp)`, `(%eax)`
     indexed       base + scaled index (an array element)        `-24(%ebp,%eax,4)`
+    segment       segment-relative memory (a stack canary)      `%gs:20`
     direct        a bare symbol / code target                   `.L2`, `helper`
 
 The lessons this teaches (mission pillars 1 and 2):
@@ -30,6 +31,12 @@ The lessons this teaches (mission pillars 1 and 2):
     operand tells you "an array is being walked here" at a glance, and the
     absence of a bounds check around one is how out-of-range array reads hide in
     plain sight.
+  * Pillar 2 (security signal): the `segment` mode is a memory access through a
+    segment register (`%gs:20`). At -O0 gcc's default `-fstack-protector-strong`
+    emits exactly this to load and check the stack canary on any function with a
+    local array — precisely the array-indexing programs this feature is built
+    around. Seeing a `segment` operand appear is the stack protector made
+    visible: a security mechanism you can read straight off the disassembly.
 
 Classification is purely syntactic on the AT&T operand text, and it is *total*:
 an unrecognised operand falls into `direct` rather than being dropped, so the
@@ -42,14 +49,26 @@ from typing import Dict, List
 # Stable display / serialisation order for the addressing-mode maps. Ordered as a
 # learner reads a program's cost: the cheap operand forms first (immediate,
 # register), then the -O0 stack-slot staple (displacement), then the array-access
-# highlight (indexed), then the catch-all (direct).
+# highlight (indexed), then the segment-relative canary access, then the
+# catch-all (direct).
 _MODE_ORDER = {
     "immediate": 0,
     "register": 1,
     "displacement": 2,
     "indexed": 3,
-    "direct": 4,
+    "segment": 4,
+    "direct": 5,
 }
+
+# A segment-override memory operand: a segment register followed by ':', e.g.
+# `%gs:20` or `%fs:(%eax)`. gcc's default -fstack-protector-strong loads and
+# checks the stack canary through `%gs:` (i386) on any function with a local
+# array, so this form appears in exactly the array-indexing programs this feature
+# targets. Checked BEFORE the register test — `%gs:20` starts with `%` but is a
+# memory access, not register-direct — and before the parenthesised-memory test,
+# so both `%gs:20` and the rarer `%gs:(%eax)` classify as `segment`. The trailing
+# ':' is required: a bare `%gs` (e.g. `push %gs`) is a register-direct operand.
+_SEGMENT_RE = re.compile(r"^%(?:cs|ds|es|fs|gs|ss):")
 
 # An AT&T memory operand always carries a parenthesised base/index group holding
 # at least one register: `-4(%ebp)`, `(%eax)`, `(%ebp,%eax,4)`, `.L4(,%eax,4)`,
@@ -64,15 +83,20 @@ def classify_operand(operand: str) -> str:
     """Sort one AT&T assembly operand into its addressing mode.
 
     Returns one of ``"immediate"`` / ``"register"`` / ``"displacement"`` /
-    ``"indexed"`` / ``"direct"``. Total by construction: any operand that is not
-    an immediate, a register-direct, or a parenthesised memory reference falls
-    into ``"direct"`` (bare symbols and code targets), so no operand is dropped.
+    ``"indexed"`` / ``"segment"`` / ``"direct"``. Total by construction: any
+    operand that is not an immediate, a segment-relative access, a register-direct,
+    or a parenthesised memory reference falls into ``"direct"`` (bare symbols and
+    code targets), so no operand is dropped.
 
     ``operand`` is a single already-split operand string (no surrounding
     whitespace assumed — it is stripped here defensively).
 
     * ``immediate``   — begins with ``$`` (a literal value or an address
       constant like ``$.LC0``).
+    * ``segment``     — a segment-override memory access: a segment register
+      followed by ``:`` (``%gs:20``, ``%fs:(%eax)``). Checked before the register
+      and memory tests because it begins with ``%`` yet is a memory reference; a
+      bare ``%gs`` without the ``:`` is register-direct, not this.
     * memory operand  — contains a ``(...%...)`` base/index group. It is
       ``indexed`` when that group carries a comma (a base+index[,scale] form —
       the array-element fingerprint) and ``displacement`` otherwise (base +
@@ -87,6 +111,8 @@ def classify_operand(operand: str) -> str:
         return "direct"
     if op.startswith("$"):
         return "immediate"
+    if _SEGMENT_RE.match(op):
+        return "segment"
     mem = _MEM_GROUP_RE.search(op)
     if mem is not None:
         # A comma inside the base/index parentheses means an index register is

@@ -61,6 +61,12 @@ needs_gcc = pytest.mark.skipif(
         # (whose parens hold no %, so it is NOT a memory operand)
         ("%eax", "register"), ("%ebp", "register"), ("%al", "register"),
         ("%st(0)", "register"),
+        # a bare segment register (no ':') is register-direct, e.g. `push %gs`
+        ("%gs", "register"), ("%fs", "register"),
+        # segment-override memory — a segment register followed by ':'. The
+        # stack-canary access `-fstack-protector-strong` emits on array code;
+        # begins with % yet is a memory reference, so it must NOT read as register.
+        ("%gs:20", "segment"), ("%fs:0x14", "segment"), ("%gs:(%eax)", "segment"),
         # displacement — base register + (optional) displacement, no index
         ("-4(%ebp)", "displacement"), ("(%eax)", "displacement"),
         ("8(%ebp)", "displacement"), ("sym@GOTOFF(%ebx)", "displacement"),
@@ -94,6 +100,10 @@ def test_classify_operand_strips_whitespace():
         ("addl %eax, %edx", ["register", "register"]),
         ("call helper", ["direct"]),
         ("jmp .L2", ["direct"]),
+        # stack-canary load / check (gcc -fstack-protector-strong, i386): the
+        # %gs: operand is a segment memory access, the other is a register.
+        ("movl %gs:20, %eax", ["segment", "register"]),
+        ("subl %gs:20, %edx", ["segment", "register"]),
         # operand-less instructions contribute nothing
         ("ret", []), ("cltd", []), ("leave", []),
         # labels and directives are not instructions
@@ -137,17 +147,19 @@ def test_analyze_addressing_counts_per_line_and_total():
 
 def test_analyze_addressing_totals_are_ordered():
     # Even if higher-order modes are seen first, the summary keys come out in the
-    # fixed display order (immediate < register < displacement < indexed < direct).
+    # fixed display order
+    # (immediate < register < displacement < indexed < segment < direct).
     asm_lines = [
         "jmp .L2",                     # direct
         "movl -4(%ebp,%eax,4), %eax",  # indexed, register
         "movl $1, %ebx",               # immediate, register
         "movl -8(%ebp), %ecx",         # displacement, register
+        "movl %gs:20, %edx",           # segment, register
     ]
-    line_map = {1: {"c_lines": [1], "asm_lines": [1, 2, 3, 4], "color": "#000"}}
+    line_map = {1: {"c_lines": [1], "asm_lines": [1, 2, 3, 4, 5], "color": "#000"}}
     summary = analyze_addressing(line_map, asm_lines)
     assert list(summary["addressing_totals"].keys()) == [
-        "immediate", "register", "displacement", "indexed", "direct",
+        "immediate", "register", "displacement", "indexed", "segment", "direct",
     ]
 
 

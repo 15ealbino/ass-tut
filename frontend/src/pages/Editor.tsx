@@ -99,17 +99,20 @@ function formatBranchSenses(counts?: Record<string, number>): string {
 // ─── Addressing-mode presentation ───────────────────────────────────────────
 // Backend classifies each asm operand by ADDRESSING MODE — immediate constant
 // ($5), register-direct (%eax), base+displacement (a stack local, -4(%ebp)),
-// scaled base+index (an array element, (%ebp,%eax,4)), or a bare direct symbol
-// (.L2). At -O0 `displacement` dominates because every local is spilled to the
-// stack; the `indexed` mode is the fingerprint of array-element access, so it
-// leads the eye to `xs[i]`. Rendered "6 disp · 1 idx" in the ADDR chip and
-// per-line tooltips, zero modes omitted (matches the backend map).
-const ADDRESSING_ORDER = ['immediate', 'register', 'displacement', 'indexed', 'direct'] as const
+// scaled base+index (an array element, (%ebp,%eax,4)), segment-relative (the
+// stack canary, %gs:20), or a bare direct symbol (.L2). At -O0 `displacement`
+// dominates because every local is spilled to the stack; the `indexed` mode is
+// the fingerprint of array-element access, so it leads the eye to `xs[i]`, and a
+// `segment` operand is the stack protector made visible. Rendered "6 disp · 1
+// idx" in the ADDR chip and per-line tooltips, zero modes omitted (matches the
+// backend map).
+const ADDRESSING_ORDER = ['immediate', 'register', 'displacement', 'indexed', 'segment', 'direct'] as const
 const ADDRESSING_LABEL: Record<string, string> = {
   immediate: 'imm',
   register: 'reg',
   displacement: 'disp',
   indexed: 'idx',
+  segment: 'seg',
   direct: 'direct',
 }
 function formatAddressing(counts?: Record<string, number>): string {
@@ -11573,7 +11576,7 @@ export default function EditorPage() {
           )}
           {result.addressing_summary?.addressing_totals && formatAddressing(result.addressing_summary.addressing_totals) && (
             <span
-              title={`Addressing modes — how the program's asm operands form their addresses: ${formatAddressing(result.addressing_summary.addressing_totals)}. imm = immediate constant ($5), reg = register-direct (%eax), disp = base+displacement (a stack local, -4(%ebp)), idx = scaled base+index (an array element, (%ebp,%eax,4)), direct = a bare symbol / code target. At -O0 'disp' dominates because every local is spilled to the stack; an 'idx' operand is the fingerprint of array access — 'xs[i]' becomes exactly that mode, and an idx read with no nearby bounds check is how out-of-range array reads hide in a disassembly.`}
+              title={`Addressing modes — how the program's asm operands form their addresses: ${formatAddressing(result.addressing_summary.addressing_totals)}. imm = immediate constant ($5), reg = register-direct (%eax), disp = base+displacement (a stack local, -4(%ebp)), idx = scaled base+index (an array element, (%ebp,%eax,4)), seg = segment-relative (the stack canary, %gs:20), direct = a bare symbol / code target. At -O0 'disp' dominates because every local is spilled to the stack; an 'idx' operand is the fingerprint of array access — 'xs[i]' becomes exactly that mode, and an idx read with no nearby bounds check is how out-of-range array reads hide in a disassembly; a 'seg' operand is gcc's stack protector (-fstack-protector-strong) made visible.`}
               style={{
                 fontSize: 9,
                 fontWeight: 700,

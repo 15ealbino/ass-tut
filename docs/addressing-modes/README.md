@@ -25,6 +25,7 @@ one of five addressing modes:
 | `register` | register-direct | `%eax`, `%st(0)` |
 | `displacement` | base register + displacement — **a stack local** | `-4(%ebp)`, `(%eax)` |
 | `indexed` | base + **scaled index** — **an array element** | `-24(%ebp,%eax,4)` |
+| `segment` | segment-relative memory — **the stack canary** | `%gs:20` |
 | `direct` | a bare symbol / code target | `.L2`, `helper` |
 
 It reports two things:
@@ -36,7 +37,7 @@ It reports two things:
 
 ### Why this is its own lesson
 
-Two modes carry the outsized teaching signal:
+Three modes carry the outsized teaching signal:
 
 - **`displacement` dominates at `-O0`.** Because every local variable is spilled
   to the stack, nearly every operand is a `-N(%ebp)` slot. Seeing that one mode
@@ -56,6 +57,25 @@ Two modes carry the outsized teaching signal:
   out-of-range array reads hide in a disassembly (pillar 2). No plain Python
   arithmetic ever produces this mode — only indexing does — so it appears on
   precisely the lines that touch an array.
+- **`segment` is the stack protector made visible.** At `-O0` gcc's default
+  `-fstack-protector-strong` loads and checks a **stack canary** through a
+  segment-relative access (`%gs:20` on i386) on any function that has a local
+  array — i.e. exactly the `xs[i]` programs above. Seeing a `segment` operand
+  appear on a line is a security mechanism you can read straight off the
+  disassembly:
+
+  ```asm
+  movl %gs:20, %eax        # load the canary from thread-local storage
+  movl %eax, -12(%ebp)     #   ... stash it just below the saved return address
+  ...
+  subl %gs:20, %edx        # on return: compare — a smashed canary aborts
+  ```
+
+  That `%gs:` operand begins with `%` yet is a **memory** access, not a register —
+  a distinction the classifier has to get right (a bare `%gs`, as in `push %gs`,
+  *is* register-direct). Because the protector fires on array code, this mode and
+  the `indexed` mode tend to show up together, which is the point: the canary is
+  the compiler's answer to the very out-of-bounds risk the `indexed` mode flags.
 
 ## How a learner uses it
 
@@ -90,9 +110,14 @@ assembly** — no extra compilation. It lives in its own module,
 `backend/app/addressing.py`:
 
 1. `classify_operand(operand)` sorts one AT&T operand into its mode, and is
-   **total** — anything that is not an immediate, a register, or a parenthesised
-   memory reference falls into `direct`, so no operand is ever dropped:
+   **total** — anything that is not an immediate, a segment access, a register, or
+   a parenthesised memory reference falls into `direct`, so no operand is ever
+   dropped:
    - `immediate` — begins with `$`.
+   - `segment` — a segment register followed by `:` (`%gs:20`, `%fs:(%eax)`),
+     matched by `_SEGMENT_RE`. Tested **before** the register and memory checks
+     because it begins with `%` yet is a memory access; a bare `%gs` (no `:`) is
+     register-direct, not this.
    - A **memory operand** carries a `(...%...)` base/index group (matched by
      `_MEM_GROUP_RE`). It is `indexed` when that group contains a comma (a
      base+index[,scale] form — the array fingerprint) and `displacement`
@@ -107,7 +132,7 @@ assembly** — no extra compilation. It lives in its own module,
 3. `analyze_addressing(line_map, asm_lines)` runs alongside the other per-line
    passes, adds an `addressing_counts` map to each `line_map` entry (nonzero
    modes only, in the fixed display order
-   `immediate < register < displacement < indexed < direct`), and returns
+   `immediate < register < displacement < indexed < segment < direct`), and returns
    `{ "addressing_totals": { mode: count, … } }`.
 4. These fields are declared on `LineMapping` and a new `AddressingSummary` in
    `backend/app/schemas.py` (defaulting to empty, so the pyghidra pipeline — which
@@ -130,11 +155,12 @@ defensively-skipped out-of-range asm index contributes nothing.
 - **Out of scope:** the width of each access (byte vs word vs dword); resolving
   *which* variable a slot or symbol names (the
   [stack frame map](../stack-frame-map/README.md) covers slot identity); the
-  scale factor or displacement value of an indexed operand (only the mode is
-  reported); RIP-relative / segment-override modes (gcc's `-m32` output for this
-  transpiler emits neither); cache or latency modelling; the pyghidra pipeline;
-  any change to the transpiler or C/asm generation, or to the existing per-line
-  passes (this pass is orthogonal and purely additive).
+  scale factor or displacement value of an indexed operand, and the specific
+  segment register / offset of a `segment` operand (only the mode is reported);
+  RIP-relative addressing (gcc's `-m32` output for this transpiler does not emit
+  it); cache or latency modelling; the pyghidra pipeline; any change to the
+  transpiler or C/asm generation, or to the existing per-line passes (this pass is
+  orthogonal and purely additive).
 
 ## Running the tests
 
@@ -147,8 +173,10 @@ SECRET_KEY=dev-secret pytest tests/test_addressing.py
 The test file has two layers:
 
 - **Unit tests** for `classify_operand` (every mode plus edge cases: the x87
-  `%st(0)` register, `sym@GOTOFF(%ebx)`, the indexed `.L4(,%eax,4)`, an indirect
-  `*%eax`, and the empty operand), `operand_modes` (operand order, operand-less
+  `%st(0)` register, `sym@GOTOFF(%ebx)`, the indexed `.L4(,%eax,4)`, the
+  segment-override `%gs:20` / `%fs:0x14` vs. a bare `%gs` register, an indirect
+  `*%eax`, and the empty operand), `operand_modes` (operand order, the
+  stack-canary `movl %gs:20, %eax`, operand-less
   instructions, labels, directives, and that a scaled-index operand is kept
   intact rather than split on its internal commas), and `analyze_addressing`
   (per-line counts, display ordering, out-of-range defensiveness, empty input, a

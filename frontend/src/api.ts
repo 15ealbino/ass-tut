@@ -69,10 +69,11 @@ export interface LineMapping {
   // if/else branch-around, backward = loop back-edge), and the raw target.
   branches?: Branch[]
   // Addressing-mode map: how this line's asm operands split across addressing
-  // modes (immediate / register / displacement / indexed / direct) — the mode a
-  // reverse-engineer reads first. The "indexed" (scaled base+index) mode is the
-  // fingerprint of array-element access (`xs[i]`). Counts are of operands; only
-  // nonzero modes are present.
+  // modes (immediate / register / displacement / indexed / segment / direct) —
+  // the mode a reverse-engineer reads first. The "indexed" (scaled base+index)
+  // mode is the fingerprint of array-element access (`xs[i]`); the "segment"
+  // (%gs:/%fs:) mode is the stack-canary access -fstack-protector-strong emits.
+  // Counts are of operands; only nonzero modes are present.
   addressing_counts?: Record<string, number>
 }
 
@@ -181,10 +182,11 @@ export interface BranchSummary {
 
 export interface AddressingSummary {
   // Program-wide addressing-mode map: each addressing mode (immediate /
-  // register / displacement / indexed / direct) mapped to the number of operands
-  // using it, in stable display order with zero modes omitted. At -O0 the
-  // "displacement" mode dominates (every local is a %ebp stack slot); an
-  // "indexed" entry means a scaled array-element access appears somewhere.
+  // register / displacement / indexed / segment / direct) mapped to the number
+  // of operands using it, in stable display order with zero modes omitted. At
+  // -O0 the "displacement" mode dominates (every local is a %ebp stack slot); an
+  // "indexed" entry means a scaled array-element access appears somewhere; a
+  // "segment" entry is the stack canary (-fstack-protector-strong) made visible.
   addressing_totals: Record<string, number>
 }
 
