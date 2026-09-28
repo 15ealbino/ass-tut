@@ -68,6 +68,12 @@ export interface LineMapping {
   // conditional, its direction relative to its source line (forward =
   // if/else branch-around, backward = loop back-edge), and the raw target.
   branches?: Branch[]
+  // Addressing-mode map: how this line's asm operands split across addressing
+  // modes (immediate / register / displacement / indexed / direct) — the mode a
+  // reverse-engineer reads first. The "indexed" (scaled base+index) mode is the
+  // fingerprint of array-element access (`xs[i]`). Counts are of operands; only
+  // nonzero modes are present.
+  addressing_counts?: Record<string, number>
 }
 
 export interface StrengthHint {
@@ -173,6 +179,15 @@ export interface BranchSummary {
   unknown: number
 }
 
+export interface AddressingSummary {
+  // Program-wide addressing-mode map: each addressing mode (immediate /
+  // register / displacement / indexed / direct) mapped to the number of operands
+  // using it, in stable display order with zero modes omitted. At -O0 the
+  // "displacement" mode dominates (every local is a %ebp stack slot); an
+  // "indexed" entry means a scaled array-element access appears somewhere.
+  addressing_totals: Record<string, number>
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -201,6 +216,8 @@ export interface CompileResponse {
   branch_sense_summary?: BranchSenseSummary | null
   cycle_summary?: CycleSummary | null
   branch_summary?: BranchSummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  addressing_summary?: AddressingSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
   // Source-level arithmetic strength hints (transpile pipeline); null/absent for

@@ -96,6 +96,31 @@ function formatBranchSenses(counts?: Record<string, number>): string {
   return [...known, ...extra].map(s => `${counts[s]} ${BRANCH_LABEL[s] ?? s}`).join(' · ')
 }
 
+// ─── Addressing-mode presentation ───────────────────────────────────────────
+// Backend classifies each asm operand by ADDRESSING MODE — immediate constant
+// ($5), register-direct (%eax), base+displacement (a stack local, -4(%ebp)),
+// scaled base+index (an array element, (%ebp,%eax,4)), or a bare direct symbol
+// (.L2). At -O0 `displacement` dominates because every local is spilled to the
+// stack; the `indexed` mode is the fingerprint of array-element access, so it
+// leads the eye to `xs[i]`. Rendered "6 disp · 1 idx" in the ADDR chip and
+// per-line tooltips, zero modes omitted (matches the backend map).
+const ADDRESSING_ORDER = ['immediate', 'register', 'displacement', 'indexed', 'direct'] as const
+const ADDRESSING_LABEL: Record<string, string> = {
+  immediate: 'imm',
+  register: 'reg',
+  displacement: 'disp',
+  indexed: 'idx',
+  direct: 'direct',
+}
+function formatAddressing(counts?: Record<string, number>): string {
+  if (!counts) return ''
+  const known = ADDRESSING_ORDER.filter(m => (counts[m] ?? 0) > 0) as string[]
+  const extra = Object.keys(counts)
+    .filter(m => !(ADDRESSING_ORDER as readonly string[]).includes(m) && counts[m] > 0)
+    .sort()
+  return [...known, ...extra].map(m => `${counts[m]} ${ADDRESSING_LABEL[m] ?? m}`).join(' · ')
+}
+
 // ─── Cycle-cost presentation ────────────────────────────────────────────────
 // Backend weights each instruction by an approximate relative cycle cost
 // (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
@@ -11546,6 +11571,26 @@ export default function EditorPage() {
               SENSE:: {formatBranchSenses(result.branch_sense_summary.branch_totals)}
             </span>
           )}
+          {result.addressing_summary?.addressing_totals && formatAddressing(result.addressing_summary.addressing_totals) && (
+            <span
+              title={`Addressing modes — how the program's asm operands form their addresses: ${formatAddressing(result.addressing_summary.addressing_totals)}. imm = immediate constant ($5), reg = register-direct (%eax), disp = base+displacement (a stack local, -4(%ebp)), idx = scaled base+index (an array element, (%ebp,%eax,4)), direct = a bare symbol / code target. At -O0 'disp' dominates because every local is spilled to the stack; an 'idx' operand is the fingerprint of array access — 'xs[i]' becomes exactly that mode, and an idx read with no nearby bounds check is how out-of-range array reads hide in a disassembly.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              ADDR:: {formatAddressing(result.addressing_summary.addressing_totals)}
+            </span>
+          )}
           {result.cycle_summary && result.cycle_summary.total_cycles > 0 && (
             <span
               title={`Cycle-cost estimate — a latency-weighted sharpening of the raw instruction count. Each instruction carries an approximate relative cost (integer divide ≈20, multiply/call ≈3-4, most staples 1); this is their sum across the program. Compare it with COST:: — the gap shows how much apparent work is a few genuinely expensive operations versus many cheap ones. The costliest Python line is not always the one with the most instructions. NOTE: coarse relative teaching estimates, not cycle-accurate figures.`}
@@ -11636,6 +11681,9 @@ export default function EditorPage() {
             const cycTitle = formatCycles(mapping.cycle_estimate)
               ? ` — cost: ${formatCycles(mapping.cycle_estimate)}`
               : ''
+            const addrTitle = formatAddressing(mapping.addressing_counts)
+              ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -11656,7 +11704,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (

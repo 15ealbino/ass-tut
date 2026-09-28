@@ -96,6 +96,13 @@ class LineMapping(BaseModel):
     # label. Empty for the pyghidra pipeline, which computes no per-line
     # branch map.
     branches: List[Branch] = Field(default_factory=list)
+    # Addressing-mode map: how this line's asm operands split across addressing
+    # modes ("immediate", "register", "displacement", "indexed", "direct") — the
+    # mode a reverse-engineer reads first. The "indexed" (scaled base+index) mode
+    # is the fingerprint of array-element access. Counts are of operands; only
+    # nonzero modes are present. Empty for the pyghidra pipeline, which computes
+    # no per-line addressing map.
+    addressing_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class Hotspot(BaseModel):
@@ -199,6 +206,16 @@ class BranchSummary(BaseModel):
     unknown: int = 0
 
 
+class AddressingSummary(BaseModel):
+    # Program-wide addressing-mode map: each addressing mode
+    # ("immediate" / "register" / "displacement" / "indexed" / "direct") mapped
+    # to the number of operands using it, in stable display order with zero modes
+    # omitted. Empty only when the program has no operands at all. At -O0 the
+    # "displacement" mode dominates (every local is a %ebp stack slot); an
+    # "indexed" entry means a scaled array-element access appears somewhere.
+    addressing_totals: Dict[str, int] = Field(default_factory=dict)
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -245,6 +262,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line branch
     # map).
     branch_summary: Optional[BranchSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line
+    # addressing map).
+    addressing_summary: Optional[AddressingSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
