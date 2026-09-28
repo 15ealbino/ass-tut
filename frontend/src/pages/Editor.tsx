@@ -11168,6 +11168,78 @@ print(target)
       description: 'The first movl writes the victim address into the unsorted bin head, placing it in the coalescing path; addl sums prev_size and victim_size to form the merged chunk that overlaps the victim\'s tcache entry; the second movl re-inserts the victim into tcache head, creating the dual-bin state; the final movl writes the attacker\'s target (0xDEADBEEF) through the poisoned forward pointer, achieving arbitrary write to __free_hook or a GOT slot',
     },
   },
+  {
+    id: 'padding-oracle',
+    name: 'PADDING ORACLE',
+    severity: 'CRITICAL',
+    category: 'Cryptographic',
+    description: 'Error-response side channel lets an attacker decrypt CBC ciphertext one byte at a time without the key.',
+    explanation:
+      'A padding oracle attack (CWE-209 / CWE-354) exploits the fact that a decryption endpoint reveals ' +
+      'whether the PKCS#7 padding of a CBC-mode ciphertext block is valid. The attacker tampers with an ' +
+      'IV or prior ciphertext byte and submits the modified block; a "bad padding" vs "bad MAC" error ' +
+      '(or timing difference) leaks one bit of information per query. By iterating through all 256 possible ' +
+      'byte values, the attacker identifies the tampered byte that produces valid padding (0x01), which ' +
+      'directly reveals the intermediate decryption state. XOR-ing that intermediate value with the original ' +
+      'IV byte recovers the plaintext byte. Repeating for each byte position decrypts the entire message ' +
+      'in at most 256 × blocksize queries — without ever learning the key. ' +
+      'CVE-2014-3566 (POODLE) exploited this in SSL 3.0 CBC, letting a network attacker steal session cookies ' +
+      'in ~256 requests per byte. CVE-2016-2107 reintroduced the flaw in OpenSSL\'s AES-NI code path due to ' +
+      'an incorrect fix for the earlier Lucky Thirteen timing oracle (CVE-2013-0169). The original Vaudenay ' +
+      'attack (EUROCRYPT 2002) showed that any system returning distinguishable padding errors is vulnerable. ' +
+      'In the assembly, the `subl` computes the decryption transform (ct - key), `addl` applies the IV ' +
+      'modification, and `cmpl` branches on whether the result equals the expected pad byte — the branch ' +
+      'target difference is the oracle leak that an attacker observes.',
+    code:
+`# CVE pattern: padding oracle — error leak decrypts ciphertext byte-by-byte
+class CipherBlock:
+    def __init__(self, ct, iv, key):
+        self.ct = ct
+        self.iv = iv
+        self.key = key
+        self.intermediate = 0
+
+    def decrypt(self):
+        self.intermediate = self.ct - self.key
+        plain = self.intermediate + self.iv
+        return plain
+
+    def check_pad(self, expected):
+        plain = self.decrypt()
+        if plain == expected:
+            return 1
+        return 0
+
+class PadOracle:
+    def __init__(self, secret):
+        self.secret = secret
+        self.queries = 0
+        self.recovered = 0
+
+    def probe(self, ct, tampered_iv):
+        blk = CipherBlock(ct, tampered_iv, self.secret)
+        valid = blk.check_pad(1)
+        self.queries += 1
+        return valid
+
+oracle = PadOracle(7)
+ciphertext = 5
+guess = 0
+while guess < 25:
+    hit = oracle.probe(ciphertext, guess)
+    if hit == 1:
+        oracle.recovered = guess
+        break
+    guess += 1
+
+print(oracle.recovered)
+print(oracle.queries)
+`,
+    badAsm: {
+      patterns: ['subl', 'addl', 'cmpl'],
+      description: 'subl computes the intermediate state (ct - key) simulating block-cipher decryption; addl applies the tampered IV byte; cmpl branches on whether the result equals the expected pad value — the taken/not-taken branch is the oracle signal an attacker observes to recover plaintext one byte at a time',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
