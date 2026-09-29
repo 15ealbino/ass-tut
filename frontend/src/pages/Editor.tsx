@@ -11240,6 +11240,71 @@ print(oracle.queries)
       description: 'subl computes the intermediate state (ct - key) simulating block-cipher decryption; addl applies the tampered IV byte; cmpl branches on whether the result equals the expected pad value — the taken/not-taken branch is the oracle signal an attacker observes to recover plaintext one byte at a time',
     },
   },
+  {
+    id: 'weak-prng',
+    name: 'WEAK PRNG STATE RECOVERY',
+    severity: 'CRITICAL',
+    category: 'Cryptographic',
+    description: 'Linear congruential generator leaks full internal state, letting an attacker predict every future token from a single observed output.',
+    explanation:
+      'A weak PRNG (CWE-338) uses a deterministic algorithm — typically a linear congruential generator (LCG) ' +
+      'with public constants — whose internal state is fully recoverable from one or a few outputs. Once the ' +
+      'attacker observes a single token, they clone the generator and predict every subsequent session token, ' +
+      'CSRF nonce, or password-reset link. CVE-2024-31497 (PuTTY) exposed ECDSA private keys because the nonce ' +
+      'generator produced biased outputs: only ~60 signatures were needed for lattice-based key recovery. ' +
+      'CVE-2024-40762 (SonicOS SSLVPN) used a weak PRNG for authentication tokens, letting remote attackers ' +
+      'predict session tokens without authentication. CVE-2008-0166 (Debian OpenSSL) seeded the PRNG with only ' +
+      'the process ID, reducing the keyspace to ~32,768 possible keys — the entire Debian SSH key population ' +
+      'was factorable in minutes. ' +
+      'In the assembly, imull multiplies the state by the LCG constant and addl adds the increment — these ' +
+      'two instructions ARE the entire PRNG, and an attacker who reads one output value can reverse them to ' +
+      'recover the state and predict all future outputs.',
+    code:
+`# CVE pattern: LCG state recoverable — auth tokens predictable from one output
+class WeakPRNG:
+    def __init__(self, seed):
+        self.state = seed
+        self.multiplier = 1103515245
+        self.increment = 12345
+        self.output_count = 0
+
+    def next_value(self):
+        self.state = self.state * self.multiplier + self.increment
+        self.output_count += 1
+        return self.state
+
+    def gen_token(self):
+        raw = self.next_value()
+        token = raw + self.output_count
+        return token
+
+class TokenValidator:
+    def __init__(self):
+        self.accepted = 0
+        self.rejected = 0
+
+    def check(self, token, expected):
+        if token == expected:
+            self.accepted += 1
+            return 1
+        self.rejected += 1
+        return 0
+
+prng = WeakPRNG(42)
+token1 = prng.gen_token()
+token2 = prng.gen_token()
+attacker_prng = WeakPRNG(42)
+guess1 = attacker_prng.gen_token()
+validator = TokenValidator()
+result = validator.check(guess1, token1)
+print(result)
+print(validator.accepted)
+`,
+    badAsm: {
+      patterns: ['imull', 'addl'],
+      description: 'imull multiplies the PRNG state by the LCG constant (1103515245) and addl adds the increment (12345) — these two instructions are the entire generator, and an attacker who observes one output reverses them to clone the state and predict all future tokens',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
