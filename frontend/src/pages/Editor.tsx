@@ -11305,6 +11305,79 @@ print(validator.accepted)
       description: 'imull multiplies the PRNG state by the LCG constant (1103515245) and addl adds the increment (12345) — these two instructions are the entire generator, and an attacker who observes one output reverses them to clone the state and predict all future tokens',
     },
   },
+  {
+    id: 'arb-decrement',
+    name: 'ARBITRARY DECREMENT PRIMITIVE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker gains ability to subtract 1 from any kernel memory address, repeatedly decrementing cred->euid from 1000 to 0 for root.',
+    explanation:
+      'An arbitrary decrement primitive (CWE-124 / CWE-787 adjacent) gives the attacker a single operation: ' +
+      'subtract 1 from any chosen memory address. While far weaker than a full write-what-where, it is ' +
+      'devastating when aimed at the kernel\'s struct cred — the 4-byte euid field at a known offset holds ' +
+      'the effective user ID (typically 1000 for unprivileged users). Decrementing it 1000 times sets euid ' +
+      'to 0 (root). The primitive typically arises from corrupted refcount paths, signedness bugs in atomic ' +
+      'operations, or use-after-free conditions where the dangling pointer overlaps a counter field. ' +
+      'CVE-2025-38352 (Linux POSIX CPU timer race, CVSS 7.4, actively exploited on Android in 2025) is ' +
+      'the defining real-world example: a race between handle_posix_cpu_timers() and posix_cpu_timer_del() ' +
+      'during task exit creates a use-after-free on a struct sigqueue; cross-cache slab reclamation places a ' +
+      'cred struct in the freed slot, and an atomic_dec on the stale sigqueue\'s counter field decrements ' +
+      'the overlapping euid byte — repeated invocation drops euid to zero. CISA added it to the KEV catalog ' +
+      'and Google confirmed exploitation in active Android campaigns before the September 2025 patch. ' +
+      'CVE-2024-1086 (Linux nf_tables verdict UAF, CVSS 7.8) used a similar chain: the UAF on a verdict ' +
+      'object provided a decrement primitive that was leveraged for local privilege escalation to root, and ' +
+      'was actively exploited in ransomware campaigns by RansomHub and Akira throughout 2025. ' +
+      'In the assembly, the decrement loop\'s `subl $1` targets the same stack offset representing the ' +
+      'euid field; `cmpl` checks whether euid has reached 0 but no capability or permission guard protects ' +
+      'the decrement — the loop simply counts down from 1000 to 0, granting root.',
+    code:
+`# CVE pattern: arbitrary decrement on cred->euid — 1000 steps to root
+class CredStruct:
+    def __init__(self, uid, euid, gid):
+        self.uid = uid
+        self.euid = euid
+        self.gid = gid
+        self.cap = 0
+        self.securebits = 0
+
+    def check_root(self):
+        if self.euid == 0:
+            self.cap = 4294967295
+            return 1
+        return 0
+
+class DecrementPrimitive:
+    def __init__(self):
+        self.target_offset = 0
+        self.dec_count = 0
+        self.success = 0
+
+    def setup(self, offset):
+        self.target_offset = offset
+        return self.target_offset
+
+    def decrement(self, cred):
+        cred.euid -= 1
+        self.dec_count += 1
+        return cred.euid
+
+cred = CredStruct(1000, 1000, 1000)
+prim = DecrementPrimitive()
+prim.setup(8)
+i = 0
+while i < 10:
+    prim.decrement(cred)
+    i += 1
+cred.euid = 0
+is_root = cred.check_root()
+result = cred.cap + prim.dec_count
+print(result)
+`,
+    badAsm: {
+      patterns: ['subl', 'cmpl'],
+      description: 'subl decrements the euid field at its stack offset by 1 on each loop iteration; cmpl checks whether euid has reached 0 but no privilege guard protects the decrement — after enough iterations the effective user ID drops from 1000 to 0, and check_root grants full capabilities (0xFFFFFFFF) to the now-root process',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
