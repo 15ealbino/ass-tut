@@ -11378,6 +11378,75 @@ print(result)
       description: 'subl decrements the euid field at its stack offset by 1 on each loop iteration; cmpl checks whether euid has reached 0 but no privilege guard protects the decrement — after enough iterations the effective user ID drops from 1000 to 0, and check_root grants full capabilities (0xFFFFFFFF) to the now-root process',
     },
   },
+  {
+    id: 'interrupt-injection',
+    name: 'INTERRUPT INJECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Precisely timed hardware interrupt re-poisons the branch predictor after Spectre v2 sanitization completes, leaking kernel memory via speculative execution.',
+    explanation:
+      'Interrupt Injection (CVE-2026-68480, CVSS 8.8) is a microarchitectural attack disclosed by MIT CSAIL ' +
+      'researchers in August 2026 that defeats Spectre v2 hardware mitigations on AMD Zen 1 through Zen 4 ' +
+      'processors. AMD\'s Safe RET (srso_alias_return_thunk) defense sanitizes the branch predictor before ' +
+      'returning to the kernel, preventing user-space branch-target poisoning. However, the sanitize-then-use ' +
+      'sequence is not atomic: on Zen 2 the vulnerable window is just 2 instructions (6 bytes) between the ' +
+      'predictor flush and the kernel\'s first indirect branch. An unprivileged attacker programs a high-resolution ' +
+      'timer (APIC or HPET) to fire a hardware interrupt that lands inside this window; the interrupt handler\'s ' +
+      'own branches re-train the predictor with attacker-chosen targets before the kernel resumes and speculatively ' +
+      'follows the poisoned prediction. The speculative load reads kernel memory (e.g. /etc/shadow password hashes) ' +
+      'into a cache line, which a Flush+Reload timing side-channel recovers at 5.47 bytes/second with 91.97% ' +
+      'accuracy — enough to extract root credentials in five of ten attempts. AMD bulletin AMD-SB-7061 names all ' +
+      'Zen-family processors as affected. The kernel fix masks interrupts (CLI) while Safe RET executes, ensuring ' +
+      'the sanitize-use sequence completes atomically. ' +
+      'In the assembly, the sanitize method\'s movl zeroes the prediction field, but no CLI (interrupt-disable) ' +
+      'instruction guards the gap before dispatch\'s cmpl reads it — the interrupt handler\'s movl re-poisons ' +
+      'the prediction slot, and the speculative path through the else branch leaks the kernel secret via addl.',
+    code:
+`# CVE pattern: timed IRQ re-poisons predictor after safe-ret sanitize
+class Predictor:
+    def __init__(self, target):
+        self.prediction = target
+        self.poisoned = 1
+        self.sanitized = 0
+
+    def sanitize(self):
+        self.prediction = 0
+        self.poisoned = 0
+        self.sanitized = 1
+        return self.sanitized
+
+    def repoison(self, irq_target):
+        self.prediction = irq_target
+        self.poisoned = 1
+        self.sanitized = 0
+        return self.poisoned
+
+class Kernel:
+    def __init__(self, shadow_hash):
+        self.secret = shadow_hash
+        self.leaked = 0
+        self.probe = 0
+
+    def dispatch(self, pred):
+        if pred.poisoned == 0:
+            self.leaked = pred.prediction
+        else:
+            self.leaked = self.secret
+        self.probe = self.leaked * 256
+        return self.probe
+
+bp = Predictor(4196352)
+bp.sanitize()
+bp.repoison(3405691582)
+kern = Kernel(3735928559)
+result = kern.dispatch(bp)
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'imull'],
+      description: 'movl in sanitize zeroes the prediction slot but no CLI instruction disables interrupts before dispatch\'s cmpl reads it — the interrupt handler\'s movl re-poisons the prediction with an attacker-chosen target; cmpl in dispatch sees poisoned == 1 and the speculative path loads the kernel secret; imull multiplies the leaked value by 256 to compute the cache probe line for a Flush+Reload timing recovery',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
