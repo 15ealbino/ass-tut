@@ -11447,6 +11447,82 @@ print(result)
       description: 'movl in sanitize zeroes the prediction slot but no CLI instruction disables interrupts before dispatch\'s cmpl reads it — the interrupt handler\'s movl re-poisons the prediction with an attacker-chosen target; cmpl in dispatch sees poisoned == 1 and the speculative path loads the kernel secret; imull multiplies the leaked value by 256 to compute the cache probe line for a Flush+Reload timing recovery',
     },
   },
+  {
+    id: 'fragnesia-coalesce',
+    name: 'FRAGNESIA COALESCE BYPASS',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'TCP receive coalescing drops the shared-fragment flag, letting ESP decrypt in-place over page-cache pages for deterministic privilege escalation.',
+    explanation:
+      'Fragnesia (CVE-2026-46300, CVSS 7.8) exploits a logic flaw in the Linux kernel\'s socket buffer ' +
+      'coalescing path: when TCP receive merges two sk_buffs via skb_try_coalesce(), it fails to propagate ' +
+      'the SKBFL_SHARED_FRAG flag from the source skb to the destination. This flag marks fragment pages ' +
+      'that belong to external subsystems such as the page cache. With the flag silently dropped, the ESP ' +
+      '(IPsec) receive path calls skb_has_shared_frag() which returns false, concluding it can decrypt ' +
+      'in-place without copying. The AES-GCM decryption then overwrites page-cache-backed fragments — ' +
+      'corrupting the in-memory representation of any readable file while leaving the on-disk copy intact. ' +
+      'By targeting a setuid binary like /usr/bin/su, an unprivileged attacker writes a 192-byte root-shell ' +
+      'ELF stub into the cached pages; executing su then spawns a root shell. Unlike Dirty Frag ' +
+      '(CVE-2026-43284) which exploits splice() to plant unowned fragments, Fragnesia corrupts the flag ' +
+      'during normal TCP receive coalescing — a far more common kernel code path. Discovered by William ' +
+      'Bowling (V12 security team), a public PoC was released on disclosure day (May 14, 2026), and ' +
+      'CISA added it to the KEV catalog. The fix propagates SKBFL_SHARED_FRAG during coalesce. ' +
+      'In the assembly, movl sets shared_flag = 1 in the source skb, but coalesce\'s movl copies frag_data ' +
+      'without propagating the flag — esp_check\'s cmpl sees shared_flag == 0 and allows the in-place ' +
+      'movl to overwrite page.data with the attacker\'s ciphertext (0xDEADBEEF), corrupting the cached ' +
+      'setuid binary.',
+    code:
+`# CVE pattern: coalesce drops shared flag — ESP corrupts page cache
+class PageCacheFile:
+    def __init__(self, data, perms):
+        self.data = data
+        self.perms = perms
+        self.cached = 1
+
+    def execute(self):
+        result = self.data + self.perms
+        return result
+
+class SkBuff:
+    def __init__(self, frag_data, shared_flag):
+        self.frag_data = frag_data
+        self.shared_flag = shared_flag
+        self.coalesced = 0
+
+class TcpReceiver:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.merged = 0
+
+    def coalesce(self, dst, src):
+        dst.frag_data += src.frag_data
+        dst.coalesced = 1
+        return dst.frag_data
+
+    def esp_check(self, skb):
+        result = skb.shared_flag
+        return result
+
+    def esp_decrypt(self, skb, page, ciphertext):
+        if skb.shared_flag == 0:
+            page.data = ciphertext
+        return page.data
+
+src_skb = SkBuff(4196352, 1)
+dst_skb = SkBuff(256, 0)
+recv = TcpReceiver(65536)
+recv.coalesce(dst_skb, src_skb)
+su_bin = PageCacheFile(4196352, 4755)
+payload = 3735928559
+recv.esp_decrypt(dst_skb, su_bin, payload)
+hijacked = su_bin.execute()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl sets shared_flag = 1 in the source skb but coalesce\'s movl copies frag_data into the destination without propagating the flag — esp_check\'s cmpl sees dst.shared_flag == 0 and the branch allows movl to overwrite page.data with the attacker\'s ESP ciphertext payload (0xDEADBEEF), corrupting the read-only page cache of the setuid binary',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
