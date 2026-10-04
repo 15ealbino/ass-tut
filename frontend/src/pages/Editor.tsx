@@ -11551,6 +11551,84 @@ print(hijacked)
       description: 'movl sets shared_flag = 1 in the source skb but coalesce\'s movl copies frag_data into the destination without propagating the flag — esp_check\'s cmpl sees dst.shared_flag == 0 and the branch allows movl to overwrite page.data with the attacker\'s ESP ciphertext payload (0xDEADBEEF), corrupting the read-only page cache of the setuid binary',
     },
   },
+  {
+    id: 'zerocopy-refcount-uaf',
+    name: 'ZEROCOPY REFCOUNT UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Missing reference count increment on a copied MSG_ZEROCOPY descriptor drives refcnt to zero prematurely, freeing the ubuf while TX skbs still hold live pointers — use-after-free to root.',
+    explanation:
+      'Zerocopy refcount UAF (CVE-2026-52943 / CWE-416) exploits a lifecycle flaw in the Linux kernel\'s ' +
+      'MSG_ZEROCOPY sendmsg path. When a user sends data with MSG_ZEROCOPY, the kernel pins user pages and attaches ' +
+      'a ubuf_info_msgzc descriptor (containing a refcount and a destructor_arg pointer) to the skb_shared_info of each ' +
+      'socket buffer. The functions pskb_carve_inside_header() and pskb_carve_inside_nonlinear() copy the old ' +
+      'skb_shared_info — including the destructor_arg pointer — into a new buffer via memcpy(), but neither calls ' +
+      'net_zcopy_get() to increment the ubuf\'s refcount for the new holder. Each skb freed calls skb_zcopy_clear() ' +
+      'which decrements the refcount and calls the destructor when it hits zero. With N copies but only 1 initial ' +
+      'reference, the refcount underflows to zero after the first N decrements, freeing ubuf_info_msgzc while ' +
+      'remaining TX skbs still hold live destructor_arg pointers — a textbook use-after-free. An attacker triggers ' +
+      'repeated pskb_carve operations via crafted sendmsg + MSG_ZEROCOPY on a loopback or veth interface, then ' +
+      'heap-sprays the freed ubuf slot with forged credentials to escalate to root. The vulnerability was introduced ' +
+      'with MSG_ZEROCOPY support and affects default kernel configurations. CVE-2026-23057 demonstrated that zerocopy ' +
+      'skbs can also leak uninitialized kernel memory when the linearity assumption fails. CVE-2026-46323 showed a ' +
+      'related flaw: skb_gro_receive() copies frags without checking SKBFL_MANAGED_FRAG_REFS, creating UAF on GRO-merged ' +
+      'zerocopy skbs. CVE-2026-52994 bypassed RLIMIT_MEMLOCK on zerocopy page pinning by reading iter->count after the ' +
+      'iterator was consumed, letting unprivileged users pin unlimited physical memory. ' +
+      'In the assembly, movl stores the initial refcount (1) into the ubuf slot; carve_skb\'s movl copies the destructor_arg ' +
+      'pointer without an addl to increment refcount — each free_skb\'s cmpl checks refcount and the first to see 0 ' +
+      'zeroes the ubuf (movl sets handler=0), but the second free_skb\'s addl still reads from the same freed offset, ' +
+      'accessing attacker-sprayed data in the reclaimed slot.',
+    code:
+`# CVE pattern: pskb_carve copies ubuf ptr without net_zcopy_get — UAF
+class UbufInfo:
+    def __init__(self, callback):
+        self.callback = callback
+        self.refcount = 1
+        self.freed = 0
+
+    def get_ref(self):
+        self.refcount += 1
+        return self.refcount
+
+    def put_ref(self):
+        self.refcount -= 1
+        if self.refcount == 0:
+            self.freed = 1
+            self.callback = 0
+        return self.refcount
+
+    def invoke(self):
+        result = self.callback + self.refcount
+        return result
+
+class SkbSharedInfo:
+    def __init__(self, ubuf):
+        self.destructor_arg = ubuf.callback
+        self.data_len = 0
+
+class CarveHelper:
+    def __init__(self):
+        self.copies = 0
+
+    def pskb_carve(self, src_shinfo):
+        new_arg = src_shinfo.destructor_arg
+        self.copies += 1
+        return new_arg
+
+ubuf = UbufInfo(4196352)
+shinfo = SkbSharedInfo(ubuf)
+carve = CarveHelper()
+copied_arg = carve.pskb_carve(shinfo)
+ubuf.put_ref()
+ubuf.callback = 3735928559
+dangling = ubuf.invoke()
+print(dangling)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'addl'],
+      description: 'movl stores the initial refcount (1) and copies the destructor_arg pointer during pskb_carve without incrementing the refcount via addl — put_ref\'s cmpl sees refcount == 0 and movl zeroes the callback (simulating free), but the dangling copy still references the same offset where movl has sprayed 0xDEADBEEF, and addl in invoke reads the attacker-controlled value from the reclaimed ubuf slot',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
