@@ -111,9 +111,15 @@ steps:
    `jmp` / `jmpl`, every conditional `j*`, and the `loop*` family — `call` / `ret`
    are deliberately excluded as call overhead, not loop structure), look up its
    target label's line. If the target is declared **strictly above** the branch,
-   it is a back-edge, and `loop_spans` records the inclusive span
-   `(target_line, branch_line)`. Forward branches (if/else) and external targets
-   (tail calls whose label is not in the file) are excluded.
+   it is a back-edge. `loop_spans` then returns one span **per loop**, not per
+   back-edge: a loop is identified by its head label, and all back-edges to the
+   same label collapse into the single span `(label_line, last_back_edge_line)`.
+   This matters for a compound condition — `while a or b` compiles at `gcc -O0`
+   to one conditional backward branch per short-circuited disjunct, all jumping
+   to the same loop-body label, so deduplicating by target label keeps it a
+   single depth-1 loop instead of miscounting it as nested. Forward branches
+   (if/else) and external targets (tail calls whose label is not in the file)
+   are excluded.
 3. **Depth.** `depth_at(asm_line, spans)` counts the spans covering a line. Each
    `line_map` entry's `loop_depth` is the **maximum** depth over the asm lines it
    maps to — a loop-header line shares its body's depth because the loop's
@@ -131,8 +137,9 @@ Both the per-line `loop_depth` and the `LoopSummary`
 - **In scope:** the `transpile` (AST → C → gcc `-m32 -O0`) pipeline. Loop
   nesting recovered from intra-file backward branches (`jmp` / conditional `j*`
   / `loop*`), a per-line `loop_depth`, and a program-wide summary. The depth is
-  exact for the reducible, singly-back-edged loops this transpiler's
-  `for` / `while` emit.
+  exact for the reducible loops this transpiler's `for` / `while` emit, including
+  the multi-back-edge case of a compound `or` / `and` condition (whose several
+  backward branches to one head label are merged into a single loop).
 - **Out of scope:**
   - A precise *iteration count* (`range(5)` runs 5 times). Depth is the nesting
     multiplier, not the trip count — reading the loop bound off the `cmp` is a

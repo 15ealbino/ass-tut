@@ -38,8 +38,10 @@ The lessons this teaches (mission pillars 1 and 2):
 
 The depth is a best-effort structural reading of the back-edges, in the spirit
 of the cycle-cost pass's "coarse relative teaching estimate": it is exact for
-the reducible, singly-back-edged loops this transpiler's `for`/`while` produce,
-and it degrades gracefully (never raises, never over-counts a forward branch) on
+the reducible loops this transpiler's `for`/`while` produce — including the
+multi-back-edge case of a compound `or`/`and` condition, whose several backward
+branches to one head label are merged into a single loop (see `loop_spans`) — and
+it degrades gracefully (never raises, never over-counts a forward branch) on
 anything more exotic. Classification is purely syntactic on the AT&T asm text so
 it needs no second compile.
 """
@@ -105,23 +107,33 @@ def branch_target(text: str) -> str | None:
 
 
 def loop_spans(asm_lines: List[str]) -> List[Tuple[int, int]]:
-    """Return the ``(start, end)`` 1-indexed inclusive span of every loop
-    back-edge in ``asm_lines``.
+    """Return the ``(start, end)`` 1-indexed inclusive span of every loop in
+    ``asm_lines``, one span per loop.
 
     A back-edge is a branch whose target label is declared STRICTLY ABOVE the
     branch's own line — the jump that loops control flow back to the top of a
-    loop body. ``start`` is the target label's line (the loop head), ``end`` is
-    the branch's own line (the back-edge). Forward branches (the if/else
-    branch-around) have their target below and are not loops, so they are
-    excluded; a branch whose target is not declared in this file (a tail call)
-    is excluded too.
+    loop body. Forward branches (the if/else branch-around) have their target
+    below and are not loops, so they are excluded; a branch whose target is not
+    declared in this file (a tail call) is excluded too.
 
-    One span is returned per back-edge. The transpiler's `for`/`while` each emit
-    a single back-edge, so spans correspond one-to-one with source loops;
-    overlapping spans are a loop nest (an inner span contained in an outer one).
+    One span is returned per LOOP, not per back-edge. A loop is identified by its
+    head label (the back-edge target), and all back-edges to the same label are
+    one loop: ``start`` is the label's line, ``end`` is the LAST (lowest)
+    back-edge to it. This matters because a loop can have several back-edges to
+    one head — a `while` with a compound `or` condition compiles at ``gcc -O0``
+    to one conditional backward branch per short-circuited disjunct, all to the
+    same body label (``while a or b`` → two ``jle .L3``). Deduplicating by target
+    label keeps that a single depth-1 loop instead of miscounting it as nested.
+    Distinct labels stay distinct spans, so genuine loop nests
+    (an inner span contained in an outer one) are preserved.
+
+    Spans are ordered by the first back-edge seen to each label (so an inner
+    loop, whose back-edge occurs first in the stream, precedes its enclosing
+    outer loop).
     """
     labels = _label_positions(asm_lines)
-    spans: List[Tuple[int, int]] = []
+    # Target label → back-edge source lines (preserves first-seen label order).
+    back_edges: Dict[str, List[int]] = {}
     for idx, text in enumerate(asm_lines, start=1):
         target = branch_target(text)
         if target is None:
@@ -130,8 +142,9 @@ def loop_spans(asm_lines: List[str]) -> List[Tuple[int, int]]:
         if tgt_line is None:
             continue  # external target (tail call) — not an intra-file back-edge
         if tgt_line < idx:  # target above the branch → a backward loop edge
-            spans.append((tgt_line, idx))
-    return spans
+            back_edges.setdefault(target, []).append(idx)
+    # One span per unique loop head: the head label down to its last back-edge.
+    return [(labels[target], max(sources)) for target, sources in back_edges.items()]
 
 
 def depth_at(asm_line: int, spans: List[Tuple[int, int]]) -> int:
@@ -159,7 +172,7 @@ def analyze_loops(
     The returned summary is::
 
         {
-          "loop_count": <number of back-edges, i.e. loops, detected>,
+          "loop_count": <number of loops (distinct back-edge target labels)>,
           "max_depth":  <deepest nesting anywhere in the program>,
           "hotspots":   [{"py_line": n, "loop_depth": d}, ...],
         }

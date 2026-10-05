@@ -110,6 +110,31 @@ _NESTED_LOOPS = [
     "\tret",
 ]
 
+# A single `while` with a compound `or` condition. At gcc -O0 each short-circuited
+# disjunct is its own conditional backward branch to the SAME body label, so the
+# loop has TWO back-edges to `.L3` — yet it is still ONE non-nested loop. (Shape
+# verified against real `gcc -S -O0` for `while (a < 5 || b < 3) { ... }`.)
+#   3 .L3:               # body head          (the one loop's span start)
+#   4   <body>           #                     depth 1
+#   5 .L2:               # test
+#   6   cmpl $4, -4(%ebp)
+#   7   jle .L3          # BACKWARD (a < 5)   → back-edge 1 to .L3
+#   8   cmpl $2, -8(%ebp)
+#   9   jle .L3          # BACKWARD (b < 3)   → back-edge 2 to .L3
+#  10   ret
+_OR_LOOP = [
+    "main:",
+    "\tjmp .L2",
+    ".L3:",
+    "\taddl $1, -12(%ebp)",
+    ".L2:",
+    "\tcmpl $4, -4(%ebp)",
+    "\tjle .L3",
+    "\tcmpl $2, -8(%ebp)",
+    "\tjle .L3",
+    "\tret",
+]
+
 
 # ─── Unit: branch_target (pure, no gcc) ──────────────────────────────────────
 
@@ -155,6 +180,14 @@ def test_loop_spans_single_loop():
 def test_loop_spans_nested_loops():
     # Inner back-edge first (it occurs first in the stream), then the outer.
     assert loop_spans(_NESTED_LOOPS) == [(6, 10), (3, 13)]
+
+
+def test_loop_spans_merges_multiple_back_edges_to_one_head():
+    # Regression: a `while a or b` loop has TWO back-edges to the same body
+    # label but is ONE loop. loop_spans must dedupe by target label into a
+    # single span (head → the LAST back-edge), not report two overlapping spans
+    # that would miscount the depth as 2.
+    assert loop_spans(_OR_LOOP) == [(3, 9)]
 
 
 def test_loop_spans_forward_only_has_no_loops():
@@ -247,6 +280,17 @@ def test_analyze_loops_nested_depths_and_summary():
         {"py_line": 3, "loop_depth": 2},
         {"py_line": 2, "loop_depth": 1},
     ]
+
+
+def test_analyze_loops_compound_or_condition_is_one_depth_one_loop():
+    # The payoff of the dedup: a single `while a or b` loop reports loop_count 1
+    # and max_depth 1, and its body line is depth 1 — not 2.
+    line_map = _line_map({1: [4]})   # py1 → the loop body (asm line 4)
+    summary = analyze_loops(line_map, _OR_LOOP)
+    assert line_map[1]["loop_depth"] == 1
+    assert summary["loop_count"] == 1
+    assert summary["max_depth"] == 1
+    assert summary["hotspots"] == [{"py_line": 1, "loop_depth": 1}]
 
 
 def test_analyze_loops_no_loops_gives_zero_summary():
@@ -350,6 +394,34 @@ async def test_compile_nested_loops_reach_depth_two(client):
     assert body["line_map"]["2"]["loop_depth"] == 1
     # Hotspots are ranked deepest-first.
     assert summary["hotspots"][0]["loop_depth"] == 2
+
+
+@needs_gcc
+async def test_compile_while_with_or_condition_is_one_depth_one_loop(client):
+    # End-to-end regression for the multi-back-edge bug: a `while` with a
+    # compound `or` emits two backward branches to the same body label, but it
+    # is one non-nested loop. loop_count must be 1 and max_depth 1, not 2.
+    code = (
+        "a = 0\n"
+        "b = 0\n"
+        "t = 0\n"
+        "while a < 5 or b < 3:\n"
+        "    t = t + 1\n"
+        "    a = a + 1\n"
+        "    b = b + 1\n"
+        "print(t)\n"
+    )
+    r = await client.post("/compile", json={"code": code})
+    assert r.status_code == 200
+    body = r.json()
+    summary = body["loop_summary"]
+    assert summary["loop_count"] == 1
+    assert summary["max_depth"] == 1
+    # The loop body runs inside exactly one loop.
+    assert body["line_map"]["5"]["loop_depth"] == 1
+    # Sanity: the `or` really did emit more than one backward branch, so this
+    # test would fail without the dedup (it is not vacuously passing).
+    assert body["branch_summary"]["backward"] >= 2
 
 
 @needs_gcc

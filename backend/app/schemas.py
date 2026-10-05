@@ -224,8 +224,9 @@ class LoopHotspot(BaseModel):
 
 class LoopSummary(BaseModel):
     # Program-wide loop-depth map, recovered from the asm back-edges.
-    #   loop_count — number of loop back-edges (backward branches) detected,
-    #                i.e. the number of loops; one per source for/while.
+    #   loop_count — number of loops, i.e. distinct back-edge target labels
+    #                (multiple back-edges to one head — a compound or/and
+    #                condition — count as one loop); one per source for/while.
     #   max_depth  — deepest loop nesting anywhere in the program (0 = no loops).
     #   hotspots   — every Python line at depth >= 1 (the lines that run
     #                repeatedly), ranked by depth descending then line number.
