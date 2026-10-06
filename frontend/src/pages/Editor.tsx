@@ -11629,6 +11629,80 @@ print(dangling)
       description: 'movl stores the initial refcount (1) and copies the destructor_arg pointer during pskb_carve without incrementing the refcount via addl — put_ref\'s cmpl sees refcount == 0 and movl zeroes the callback (simulating free), but the dangling copy still references the same offset where movl has sprayed 0xDEADBEEF, and addl in invoke reads the attacker-controlled value from the reclaimed ubuf slot',
     },
   },
+  {
+    id: 'dead-store-elision',
+    name: 'DEAD STORE ELIMINATION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Compiler optimizes away the zeroing of sensitive data because the buffer is never read again, leaving secrets on the stack for later extraction.',
+    explanation:
+      'Dead store elimination (CWE-14) is a compiler optimization that removes stores to variables that are ' +
+      'never subsequently read — the compiler reasons the store has no observable effect and deletes it. When ' +
+      'the "dead" store is a security-critical memset() or explicit zeroing of a crypto key, password, or ' +
+      'session token, the sensitive data persists in the stack frame or heap long after the programmer believed ' +
+      'it was erased. Any subsequent function that reuses the same stack slot, or an attacker with a memory-read ' +
+      'primitive, recovers the secret. GCC bug #8537 (open since 2002) documents the core issue: gcc -O1 and ' +
+      'above remove memset() calls on buffers that are not read before going out of scope. The C11 standard ' +
+      'introduced memset_s() and C23 added memset_explicit() specifically to prevent this optimization, but ' +
+      'legacy and embedded codebases rarely adopt them. ' +
+      'CVE-2023-32097 through CVE-2023-32100 (Silicon Labs Gecko Platform SDK v4.2.1 and earlier) left AES key ' +
+      'material duplicated in RAM because the compiler removed buffer-clearing code from the CRYPTO module, ' +
+      'allowing physical or debug-probe attackers to extract encryption keys from flash or SRAM. ' +
+      'CVE-2025-64646 (IBM Concert) exposed sensitive information in memory through improper buffer clearing ' +
+      'that was optimized away at compile time, reachable by authenticated users. OpenSSL replaced memset() ' +
+      'with OPENSSL_cleanse() (a volatile-pointer technique) after discovering that both GCC and MSVC silently ' +
+      'removed key-zeroing code from TLS session teardown — the SecureZeroMemory() API on Windows and ' +
+      'explicit_bzero() on BSD/glibc exist for the same reason. OWASP lists insecure compiler optimization as ' +
+      'a documented vulnerability class, and CERT C coding standard MSC06-C mandates compiler-resistant clearing. ' +
+      'In the assembly, movl stores the secret key (0xCAFEBABE) and IV (0x12345678) into stack slots during ' +
+      'construction; the wipe() function generates only movl $1 for the wiped flag, but no movl $0 appears for ' +
+      'the key or IV slots — those stores were dead-store-eliminated; addl in scan_stale_frame reads the stale ' +
+      'secret from the uncleared stack offset, leaking the crypto key to the attacker.',
+    code:
+`# CVE pattern: compiler removes secret-clearing code as dead store
+class CryptoCtx:
+    def __init__(self, key_material):
+        self.key = key_material
+        self.iv = 305419896
+        self.ciphertext = 0
+        self.wiped = 0
+
+    def encrypt(self, plaintext):
+        self.ciphertext = plaintext + self.key + self.iv
+        return self.ciphertext
+
+    def wipe(self):
+        # Programmer wrote: self.key = 0; self.iv = 0
+        # gcc -O1 removes both as dead stores
+        self.wiped = 1
+        return self.wiped
+
+class StackScanner:
+    def __init__(self):
+        self.leaked_key = 0
+        self.leaked_iv = 0
+        self.found = 0
+
+    def scan_stale_frame(self, ctx):
+        self.leaked_key = ctx.key
+        self.leaked_iv = ctx.iv
+        if self.leaked_key > 0:
+            self.found = 1
+        return self.leaked_key
+
+ctx = CryptoCtx(3405691582)
+cipher = ctx.encrypt(256)
+ctx.wipe()
+scanner = StackScanner()
+stolen = scanner.scan_stale_frame(ctx)
+total = stolen + scanner.leaked_iv
+print(total)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the secret key (0xCAFEBABE) and IV (0x12345678) into stack slots during __init__; wipe() generates only movl $1 for the wiped flag — no movl $0 clears the key or IV slots (dead store eliminated at -O1+); addl in scan_stale_frame reads the stale secret from the uncleared stack offsets, leaking the full crypto key to the attacker',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
