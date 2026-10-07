@@ -11703,6 +11703,80 @@ print(total)
       description: 'movl stores the secret key (0xCAFEBABE) and IV (0x12345678) into stack slots during __init__; wipe() generates only movl $1 for the wiped flag — no movl $0 clears the key or IV slots (dead store eliminated at -O1+); addl in scan_stale_frame reads the stale secret from the uncleared stack offsets, leaking the full crypto key to the attacker',
     },
   },
+  {
+    id: 'tun-headroom-underflow',
+    name: 'TUN HEADROOM UNDERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Oversized headroom from OVS underflows the SKB linear-size calculation, placing packet data outside the allocated buffer for kernel out-of-bounds write.',
+    explanation:
+      'TUNderflow (CVE-2026-81000 / CWE-191, CVSS 7.8) exploits a size_t underflow in the Linux kernel\'s TUN/TAP ' +
+      'virtual network driver. The tun_get_user() function in drivers/net/tun.c uses tun->align both as skb headroom ' +
+      'and when computing how much packet data to keep linear via SKB_MAX_HEAD(align) = PAGE_SIZE - ' +
+      'sizeof(skb_shared_info) - align. When Open vSwitch (OVS) propagates an oversized headroom request from another ' +
+      'port to TUN, align can exceed the usable space in a single-page skb head. The subtraction underflows: ' +
+      '4096 - 320 - 8192 = -4416, and when stored in the size_t variable linear, the negative value wraps to ' +
+      '4294962880 (0xFFFFEEA0) — a massive value that causes tun_alloc_skb() to place skb->data far outside the ' +
+      'allocated head area. The subsequent memcpy writes attacker-controlled packet data into kernel memory at the ' +
+      'out-of-bounds offset, enabling arbitrary kernel code execution. A public PoC by 0xBlackash demonstrates local ' +
+      'privilege escalation to root on all major Linux distributions. The flaw was disclosed September 2026 as part ' +
+      'of a quartet of kernel LPE vulnerabilities alongside DirtyAH6, PPPoEject, and DiagSpill. ' +
+      'In the assembly, movl stores the page_size and shared_info constants into stack slots; the subtraction in ' +
+      'calc_linear underflows when the OVS-propagated headroom exceeds usable space; cmpl tests the underflowed ' +
+      'result against 0 — the branch takes the OOB path and movl writes the attacker payload (0xDEADBEEF) into the ' +
+      'corrupted slot, simulating tun_alloc_skb placing skb->data outside the allocated head for kernel memory corruption.',
+    code:
+`# CVE pattern: oversized headroom underflows SKB_MAX_HEAD — kernel OOB write
+class SkbPage:
+    def __init__(self, page_size):
+        self.page_size = page_size
+        self.shared_info = 320
+        self.usable = page_size - 320
+        self.data = 0
+        self.oob_written = 0
+
+class TunDevice:
+    def __init__(self, default_align):
+        self.align = default_align
+        self.written = 0
+        self.corrupted = 0
+
+    def calc_linear(self, skb):
+        result = skb.usable - self.align
+        return result
+
+    def get_user(self, skb, pkt_payload):
+        good_linear = self.calc_linear(skb)
+        if good_linear < 0:
+            skb.oob_written = 1
+            self.corrupted = pkt_payload
+        else:
+            skb.data = pkt_payload
+        self.written += 1
+        return self.corrupted
+
+class OvsPort:
+    def __init__(self, headroom):
+        self.headroom = headroom
+        self.active = 1
+
+    def propagate(self, tun):
+        tun.align = self.headroom
+        return tun.align
+
+skb = SkbPage(4096)
+tun = TunDevice(64)
+ovs = OvsPort(8192)
+ovs.propagate(tun)
+payload = 3735928559
+result = tun.get_user(skb, payload)
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'movl loads the usable size (3776) and OVS-propagated headroom (8192) into registers; the subtraction underflows to -4416 but no unsigned re-check follows — cmpl tests the negative result against 0 and the branch takes the OOB path; movl writes the attacker payload (0xDEADBEEF) into the corrupted skb slot, simulating the kernel OOB write from tun_alloc_skb placing skb->data outside the allocated head area',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
