@@ -11777,6 +11777,62 @@ print(result)
       description: 'movl loads the usable size (3776) and OVS-propagated headroom (8192) into registers; the subtraction underflows to -4416 but no unsigned re-check follows — cmpl tests the negative result against 0 and the branch takes the OOB path; movl writes the attacker payload (0xDEADBEEF) into the corrupted skb slot, simulating the kernel OOB write from tun_alloc_skb placing skb->data outside the allocated head area',
     },
   },
+  {
+    id: 'alloc-size-overflow',
+    name: 'ALLOCATION SIZE OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Signed-to-unsigned conversion in allocation size wraps to a too-small heap buffer, enabling out-of-bounds write.',
+    explanation:
+      'Allocation size overflow (CWE-190 / CWE-680) strikes when a signed integer used to compute a heap ' +
+      'buffer\'s size is converted to an unsigned type, producing a much smaller value than intended. The allocator ' +
+      'returns a tiny buffer, but the caller fills it with the original element count — a heap buffer overflow. ' +
+      'CVE-2025-27363 (FreeType, CVSS 8.1, CISA KEV, actively exploited in the wild) is the canonical example: ' +
+      'parsing TrueType subglyph structures, a signed short value is assigned to an unsigned long, wrapping the ' +
+      'result to a too-small heap buffer; the code then writes up to six signed longs past the allocation boundary, ' +
+      'achieving arbitrary code execution on Android, Linux, and all major platforms embedding FreeType. Google\'s ' +
+      'May 2025 Android bulletin listed it as a zero-click issue; CISA added it to the Known Exploited Vulnerabilities ' +
+      'catalog on 2025-05-06. CVE-2021-21220 (Chrome V8) exploited an integer overflow in JIT-compiled array size ' +
+      'calculation to allocate an undersized backing store, enabling remote code execution via crafted JavaScript. ' +
+      'In the assembly, imull computes count * elem_size and the product wraps in 32-bit signed arithmetic to a ' +
+      'negative value; when stored via movl into the unsigned alloc_size variable, the negative bit-pattern becomes ' +
+      'a small positive allocation; the fill loop\'s cmpl compares against the original (large) actual count, so ' +
+      'movl inside the loop writes far past the end of the undersized buffer.',
+    code:
+`# CVE pattern: signed short to unsigned long wraps alloc — 6 OOB writes
+class GlyphBuffer:
+    def __init__(self, glyph_bytes):
+        self.glyph_bytes = glyph_bytes
+        self.buf_size = 0
+        self.total = 0
+        self.oob = 0
+
+    def alloc_outline(self, signed_count):
+        raw = signed_count * self.glyph_bytes
+        self.buf_size = raw
+        if self.buf_size < 0:
+            self.buf_size = 48
+        return self.buf_size
+
+    def load_subglyphs(self, actual_count, value):
+        i = 0
+        while i < actual_count:
+            self.total += value
+            if self.total > self.buf_size:
+                self.oob = 1
+            i += 1
+        return self.oob
+
+buf = GlyphBuffer(24)
+tiny = buf.alloc_outline(0 - 8)
+result = buf.load_subglyphs(6, 305419896)
+print(result)
+`,
+    badAsm: {
+      patterns: ['imull', 'cmpl', 'movl'],
+      description: 'imull computes signed_count * glyph_bytes and wraps negative in 32-bit; movl stores the bit-pattern as a small unsigned alloc_size; the fill loop\'s cmpl compares against the original actual_count and movl writes payload past the undersized buffer — heap overflow from allocation size confusion',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
