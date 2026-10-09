@@ -11833,6 +11833,63 @@ print(result)
       description: 'imull computes signed_count * glyph_bytes and wraps negative in 32-bit; movl stores the bit-pattern as a small unsigned alloc_size; the fill loop\'s cmpl compares against the original actual_count and movl writes payload past the undersized buffer — heap overflow from allocation size confusion',
     },
   },
+  {
+    id: 'ktls-zero-record',
+    name: 'KTLS ZERO-LENGTH RECORD BYPASS',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Zero-length TLS record in the kernel receive path bypasses record-type validation, leaking kernel memory to userspace.',
+    explanation:
+      'Kernel TLS (kTLS) offloads TLS record processing into the kernel for performance, but CVE-2025-39682 ' +
+      '(CVSS 9.8, CISA KEV, actively exploited in the wild) exposes a critical flaw: a zero-length record ' +
+      'pulled from rx_list during recvmsg() bypasses the record-type check that normally gates how subsequent ' +
+      'records are handled. With the type gate skipped, the receive path applies zero-copy semantics to records ' +
+      'that should be fully validated, exposing raw kernel page contents to userspace. CISA added this flaw to ' +
+      'the Known Exploited Vulnerabilities catalog on 2026-09-18 with a three-day federal remediation deadline, ' +
+      'confirming active exploitation. Attackers leverage the leak for kernel memory disclosure and, when chained ' +
+      'with a write primitive, full privilege escalation to root. Fixes landed in stable kernels 6.1.149, 6.6.103, ' +
+      '6.12.44, and 6.16.4 by adding a proper length check before the type-bypass path. In the assembly, cmpl ' +
+      'tests rec_len against zero and the conditional branch skips type validation entirely; movl then stores the ' +
+      'zerocopy flag unconditionally, and the accumulation loop leaks page-sized chunks without any bounds check.',
+    code:
+`# CVE pattern: zero-len kTLS record skips type gate — kernel page leak
+class KtlsRecvPath:
+    def __init__(self, queue_depth):
+        self.queue_depth = queue_depth
+        self.rec_type = 0
+        self.rec_len = 0
+        self.type_valid = 1
+        self.zerocopy = 0
+        self.leaked_pages = 0
+
+    def queue_zero_record(self, alert_type):
+        self.rec_type = alert_type
+        self.rec_len = 0
+        return self.rec_len
+
+    def do_recvmsg(self, page_size):
+        i = 0
+        while i < self.queue_depth:
+            if self.rec_len == 0:
+                self.type_valid = 0
+            if self.type_valid == 0:
+                self.zerocopy = 1
+                self.leaked_pages += page_size
+            else:
+                self.zerocopy = 0
+            i += 1
+        return self.leaked_pages
+
+rx = KtlsRecvPath(8)
+rx.queue_zero_record(21)
+leak = rx.do_recvmsg(4096)
+print(leak)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl tests rec_len against zero and the conditional branch skips the type-validation gate entirely; movl stores the zerocopy flag (1) unconditionally, so the accumulation loop\'s addl leaks page_size (4096) on every iteration — eight passes yield 32 KiB of kernel page contents exposed to userspace',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
