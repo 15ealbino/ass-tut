@@ -11890,6 +11890,76 @@ print(leak)
       description: 'cmpl tests rec_len against zero and the conditional branch skips the type-validation gate entirely; movl stores the zerocopy flag (1) unconditionally, so the accumulation loop\'s addl leaks page_size (4096) on every iteration — eight passes yield 32 KiB of kernel page contents exposed to userspace',
     },
   },
+  {
+    id: 'secureboot-bypass',
+    name: 'SECURE BOOT BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Signed bootloader uses a custom PE loader instead of firmware-validated LoadImage, allowing unsigned attacker code to execute before the OS with full hardware access.',
+    explanation:
+      'Secure Boot bypass (CWE-693 / CWE-347) occurs when a UEFI application — signed by a trusted certificate ' +
+      'authority like Microsoft\'s UEFI Third Party CA — implements its own PE image loader instead of calling ' +
+      'the firmware\'s standard LoadImage and StartImage services. The custom loader skips the Secure Boot ' +
+      'signature validation that firmware-provided services enforce, allowing it to load and execute arbitrary ' +
+      'unsigned binaries from disk. An attacker places a malicious payload at a hardcoded path (e.g. "cloak.dat") ' +
+      'where the signed loader expects its data; the firmware validates the signed loader\'s own signature, but ' +
+      'the loader\'s custom PE parser then loads the unsigned payload without any integrity check. ' +
+      'CVE-2024-7344 (CVSS 6.7) is the textbook case: ESET researchers discovered that Howyar\'s SysReturn ' +
+      'recovery tool (reloader.efi), signed by Microsoft\'s UEFI CA, used a custom PE loader that accepted ' +
+      'any binary from a crafted file — enabling deployment of bootkits like BlackLotus or Bootkitty on ' +
+      'systems with Secure Boot enabled. CVE-2023-24932 (BlackLotus bootkit) exploited a Windows Boot Manager ' +
+      'flaw to bypass Secure Boot on fully patched Windows 11 systems, establishing kernel-level persistence ' +
+      'below the OS — the first UEFI bootkit to defeat Secure Boot in the wild, requiring Microsoft to roll out ' +
+      'boot manager revocations over multiple years. CVE-2022-21894 (Baton Drop) was the original Secure Boot ' +
+      'policy bypass that BlackLotus leveraged to load older vulnerable boot managers via crafted BCD elements. ' +
+      'In the assembly, cmpl checks the loader\'s own signature validity (sig_valid == 1) but no cmpl or ' +
+      'verification appears for the secondary payload — movl loads the unsigned payload directly into the ' +
+      'execute slot, and addl computes the entry point offset without any integrity gate between the signature ' +
+      'check and the payload execution.',
+    code:
+`# CVE pattern: signed loader skips integrity check on secondary payload
+class SecureBoot:
+    def __init__(self, db_cert):
+        self.db_cert = db_cert
+        self.verified = 0
+        self.boot_count = 0
+
+    def verify_image(self, sig):
+        if sig == self.db_cert:
+            self.verified = 1
+        else:
+            self.verified = 0
+        return self.verified
+
+class UefiLoader:
+    def __init__(self, sig, payload_addr):
+        self.sig = sig
+        self.payload_addr = payload_addr
+        self.payload_data = 0
+        self.executed = 0
+
+    def custom_pe_load(self, cloak_data):
+        self.payload_data = cloak_data
+        return self.payload_data
+
+    def start(self):
+        entry = self.payload_addr + self.payload_data
+        self.executed = 1
+        return entry
+
+sb = SecureBoot(4196352)
+loader = UefiLoader(4196352, 1342177280)
+sb.verify_image(loader.sig)
+bootkit = 3735928559
+loader.custom_pe_load(bootkit)
+hijacked = loader.start()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl verifies the loader\'s own signature against the Secure Boot database (sig == db_cert) but no signature check guards the secondary payload; movl loads the unsigned bootkit value (0xDEADBEEF) directly via custom_pe_load; addl computes the entry point by adding payload_addr + payload_data — the firmware validated the loader, but the loader\'s custom PE parser executes arbitrary unsigned code with ring-0 hardware access',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
