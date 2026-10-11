@@ -11960,6 +11960,89 @@ print(hijacked)
       description: 'cmpl verifies the loader\'s own signature against the Secure Boot database (sig == db_cert) but no signature check guards the secondary payload; movl loads the unsigned bootkit value (0xDEADBEEF) directly via custom_pe_load; addl computes the entry point by adding payload_addr + payload_data — the firmware validated the loader, but the loader\'s custom PE parser executes arbitrary unsigned code with ring-0 hardware access',
     },
   },
+  {
+    id: 'udpv6-frag-overflow',
+    name: 'UDPV6 FRAGMENTATION OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'IPv6 fragmentation gap miscalculation allocates a too-small linear buffer, and the subsequent data copy overflows into adjacent heap objects for container escape to root.',
+    explanation:
+      'UDPv6 fragmentation overflow (CWE-787) exploits a buffer-size miscalculation in the Linux kernel\'s IPv6 ' +
+      'send path. When a UDPv6 socket uses MSG_MORE with MSG_SPLICE_PAGES, the paged allocation branch computes ' +
+      'the linear buffer size incorrectly: the fraggap (fragment gap — bytes that must carry over from the previous ' +
+      'fragment into the new skb\'s linear area) is subtracted from the linear allocation but NOT from the paged ' +
+      'length, so the linear buffer is undersized by fraggap bytes while pagedlen is overstated by the same amount. ' +
+      'When ip6_append_data copies fraggap bytes from the previous fragment into the new skb, the copy overflows ' +
+      'past the linear buffer into the skb\'s shared_info area and adjacent slab objects — corrupting function ' +
+      'pointers, refcounts, or credential structures in neighboring allocations. ' +
+      'CVE-2026-53362 is the critical real-world instance: the faulty accounting was introduced by commit ' +
+      '773ba4fe9104 ("ipv6: avoid partial copy for zc") and affected every major Linux kernel from 6.1 through ' +
+      '7.1.x. An unprivileged user triggers the overflow from within a network namespace, corrupts an adjacent ' +
+      'struct cred in the slab cache, and overwrites uid/gid to zero — achieving root and escaping the container. ' +
+      'CISA added CVE-2026-53362 to the Known Exploited Vulnerabilities catalog in August 2026, and Red Hat ' +
+      'confirmed the blast radius includes container escape with SELinux bypass. The fix correctly accounts for ' +
+      'fraggap in both the linear allocation and the paged length calculation. ' +
+      'In the assembly, movl stores the fraggap value and alloc_size into stack slots; cmpl checks alloc_size ' +
+      'against the buffer capacity but alloc_size was already reduced by fraggap — addl in do_copy adds fraggap ' +
+      'bytes past the undersized buffer boundary, and movl writes 0xDEADBEEF into the adjacent cred slot, ' +
+      'escalating to root without any bounds re-check.',
+    code:
+`# CVE pattern: fraggap miscalculation undersizes linear buf — heap overflow
+class SkBuff:
+    def __init__(self, linear_size):
+        self.linear_size = linear_size
+        self.data = 0
+        self.used = 0
+        self.shared_info = 4196352
+
+    def copy_data(self, value, count):
+        i = 0
+        while i < count:
+            self.data += value
+            self.used += 1
+            if self.used > self.linear_size:
+                self.shared_info = value
+            i += 1
+        return self.used
+
+class FragCalc:
+    def __init__(self, mtu, paged_len):
+        self.mtu = mtu
+        self.paged_len = paged_len
+        self.fraggap = 0
+        self.alloc_size = 0
+
+    def compute_sizes(self, prev_tail):
+        self.fraggap = prev_tail
+        self.alloc_size = self.mtu - self.paged_len - self.fraggap
+        return self.alloc_size
+
+class AdjacentCred:
+    def __init__(self, uid, gid):
+        self.uid = uid
+        self.gid = gid
+        self.cap = 0
+
+    def read_priv(self):
+        result = self.uid + self.gid + self.cap
+        return result
+
+calc = FragCalc(1500, 1400)
+fraggap = calc.compute_sizes(64)
+skb = SkBuff(fraggap)
+skb.copy_data(16, 6)
+cred = AdjacentCred(1000, 1000)
+cred.uid = 0
+cred.gid = 0
+cred.cap = 4294967295
+hijacked = cred.read_priv()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'addl', 'movl'],
+      description: 'movl stores the fraggap value and the undersized alloc_size into stack slots; cmpl checks used against linear_size but the allocation was already reduced by fraggap — addl in copy_data increments used past the undersized buffer boundary, and movl writes the overflow value into the shared_info slot representing adjacent slab memory, where the attacker has groomed a struct cred for uid=0 privilege escalation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
