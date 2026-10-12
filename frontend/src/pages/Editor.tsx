@@ -12043,6 +12043,89 @@ print(hijacked)
       description: 'movl stores the fraggap value and the undersized alloc_size into stack slots; cmpl checks used against linear_size but the allocation was already reduced by fraggap — addl in copy_data increments used past the undersized buffer boundary, and movl writes the overflow value into the shared_info slot representing adjacent slab memory, where the attacker has groomed a struct cred for uid=0 privilege escalation',
     },
   },
+  {
+    id: 'msg-msg-heap-rw',
+    name: 'MSG_MSG HEAP READ/WRITE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Corrupted System V message header size and next-pointer fields turn msgsnd/msgrcv into arbitrary kernel read/write primitives for privilege escalation.',
+    explanation:
+      'The Linux kernel\'s System V IPC message queue allocates msg_msg structures from generic kmalloc slab ' +
+      'caches, with both the allocation size and payload content controlled by the user via msgsnd(). Each ' +
+      'msg_msg begins with a 48-byte header containing a linked-list pointer (m_list), an mtype field, an ' +
+      'm_ts (total size) field, and a next pointer for chaining message segments. If a kernel bug — such as ' +
+      'a use-after-free, heap overflow, or type confusion — lets an attacker corrupt a msg_msg header still ' +
+      'linked in a message queue, two powerful primitives emerge. First, enlarging the m_ts field makes the ' +
+      'subsequent msgrcv() copy out-of-bounds kernel memory back to userspace, leaking heap pointers, KASLR ' +
+      'base addresses, and struct cred locations (arbitrary read). Second, overwriting the next pointer to ' +
+      'target a chosen kernel address (e.g. modprobe_path or a cred struct) causes msgrcv() or the segment ' +
+      'copy-in path to write attacker-controlled bytes to that address (arbitrary write). Because msgsnd() ' +
+      'lets the attacker choose which slab cache the msg_msg lands in (kmalloc-64 through kmalloc-4096 based ' +
+      'on message size), it serves as the universal kernel heap spray for grooming adjacent objects. ' +
+      'CVE-2021-22555 (Netfilter setsockopt, Google Project Zero) used msg_msg spraying to exploit a heap ' +
+      'OOB write, overwriting msg_msg.m_ts to leak kernel pointers and msg_msg.next to overwrite modprobe_path ' +
+      'for root. CVE-2022-0185 (Linux filesystem context, CVSS 8.4) used msg_msg objects to fill freed heap ' +
+      'slots after a heap overflow in legacy_parse_param. CVE-2022-27666 (ESP/IPsec, CVSS 7.8) sprayed ' +
+      'msg_msg into kmalloc-4096 to reclaim a freed ESP buffer and achieve arbitrary kernel read/write. ' +
+      'CVE-2024-50264 (AF_VSOCK, Pwnie Award 2025) used msg_msg cross-cache reclamation to replace a freed ' +
+      'vsock object and corrupt the message header for OOB reads of credential structures. ' +
+      'In the assembly, movl stores the header fields (m_ts size and next pointer) into stack slots during ' +
+      'construction; corrupt_header\'s movl overwrites m_ts and next with attacker values — oob_recv\'s cmpl ' +
+      'compares the loop index against the corrupted m_ts (far exceeding the real allocation), and addl sums ' +
+      'adjacent kernel memory into the response buffer, leaking cred pointers and KASLR base addresses.',
+    code:
+`# CVE pattern: corrupted msg_msg header — OOB read/write via msgrcv
+class MsgMsg:
+    def __init__(self, mtype, size):
+        self.mtype = mtype
+        self.m_ts = size
+        self.next_ptr = 0
+        self.payload = size * 4
+        self.in_queue = 1
+
+    def set_payload(self, data):
+        self.payload = data
+        return self.payload
+
+class MsgQueue:
+    def __init__(self, qid):
+        self.qid = qid
+        self.msg_count = 0
+        self.leaked = 0
+
+    def msgsnd(self, msg):
+        self.msg_count += 1
+        return self.msg_count
+
+    def corrupt_header(self, msg, new_size, fake_next):
+        msg.m_ts = new_size
+        msg.next_ptr = fake_next
+        return msg.m_ts
+
+    def oob_recv(self, msg):
+        total = 0
+        i = 0
+        while i < msg.m_ts:
+            total += msg.payload
+            if i > 3:
+                total += msg.next_ptr
+            i += 1
+        self.leaked = total
+        return self.leaked
+
+msg = MsgMsg(1, 4)
+msg.set_payload(256)
+queue = MsgQueue(42)
+queue.msgsnd(msg)
+queue.corrupt_header(msg, 8, 3735928559)
+leaked = queue.oob_recv(msg)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'addl', 'movl'],
+      description: 'movl stores m_ts and next_ptr into msg_msg header slots during construction; corrupt_header\'s movl overwrites m_ts to 8 (doubling the original 4) and next_ptr to 0xDEADBEEF — cmpl in oob_recv compares the loop index against the corrupted m_ts, and addl sums payload plus next_ptr from adjacent kernel memory past the real allocation boundary, leaking cred pointers and KASLR base addresses via msgrcv()',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
