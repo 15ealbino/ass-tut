@@ -12126,6 +12126,79 @@ print(leaked)
       description: 'movl stores m_ts and next_ptr into msg_msg header slots during construction; corrupt_header\'s movl overwrites m_ts to 8 (doubling the original 4) and next_ptr to 0xDEADBEEF — cmpl in oob_recv compares the loop index against the corrupted m_ts, and addl sums payload plus next_ptr from adjacent kernel memory past the real allocation boundary, leaking cred pointers and KASLR base addresses via msgrcv()',
     },
   },
+  {
+    id: 'integer-underflow',
+    name: 'INTEGER UNDERFLOW',
+    severity: 'CRITICAL',
+    category: 'Arithmetic',
+    description: 'Unsigned subtraction wraps a small-minus-large result to a near-maximal value, producing a massive copy length from seemingly valid inputs.',
+    explanation:
+      'Integer underflow (CWE-191) occurs when a subtraction on an unsigned integer produces a result below zero, ' +
+      'which wraps around to a near-maximal positive value — e.g. (uint32_t)(4 - 40) becomes 0xFFFFFFDC (4,294,967,260). ' +
+      'Unlike signed overflow (CWE-190) where adding past INT_MAX wraps negative, underflow subtracts past zero and ' +
+      'wraps to a massive positive value in unsigned arithmetic. The wrapped result is then used as a buffer size, ' +
+      'copy length, or loop bound, causing catastrophic out-of-bounds access. ' +
+      'CVE-2024-38063 (Windows TCP/IP, CVSS 9.8) is a zero-click wormable RCE in the IPv6 stack: the handler ' +
+      'subtracts header length from total packet length without checking for underflow — a crafted IPv6 fragment ' +
+      'with header_len > total_len wraps the payload size to a massive value, causing a heap buffer overflow during ' +
+      'reassembly that achieves unauthenticated remote code execution on all Windows versions since Server 2008. ' +
+      'CVE-2023-32014 (Windows PGM, CVSS 9.8) exploited an integer underflow in Pragmatic General Multicast for ' +
+      'unauthenticated RCE. CVE-2024-32040 (FreeRDP NSC RLE decode) underflowed a decompression length, enabling ' +
+      'out-of-bounds write during remote desktop sessions. ' +
+      'In the assembly, subl computes total_len - hdr_size and the result goes negative; imull multiplies the ' +
+      'negative bit-pattern by the element size, producing a massive wrapped offset; cmpl against the buffer ' +
+      'capacity fails to catch it when using signed comparison (negative < capacity passes), and addl writes ' +
+      'data far past the allocated region into the adjacent heap object.',
+    code:
+`# CVE pattern: header > total — unsigned subtraction wraps to massive size
+class FragmentParser:
+    def __init__(self, buf_cap):
+        self.buf_cap = buf_cap
+        self.total_len = 0
+        self.hdr_len = 0
+        self.payload_len = 0
+        self.bytes_copied = 0
+        self.corrupted = 0
+
+    def recv(self, total, hdr):
+        self.total_len = total
+        self.hdr_len = hdr
+        self.payload_len = self.total_len - self.hdr_len
+        return self.payload_len
+
+    def reassemble(self, fill_val):
+        copy_size = self.payload_len * 8
+        self.bytes_copied = fill_val + copy_size
+        if self.payload_len < self.buf_cap:
+            self.corrupted = 0
+        else:
+            self.corrupted = 1
+        return self.bytes_copied
+
+class HeapRegion:
+    def __init__(self, base, guard):
+        self.base = base
+        self.guard = guard
+        self.smashed = 0
+
+    def check(self):
+        result = self.base + self.guard
+        return result
+
+parser = FragmentParser(1500)
+parser.recv(4, 40)
+spill = parser.reassemble(3735928559)
+heap = HeapRegion(4196352, 305419896)
+heap.guard = spill
+heap.smashed = 1
+leaked = heap.check()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['subl', 'imull', 'cmpl'],
+      description: 'subl computes total_len - hdr_len and the result goes negative (4 - 40 = -36); imull multiplies the negative bit-pattern by the element size, producing a massive wrapped offset; cmpl compares the negative payload_len against buf_cap using signed comparison — the guard passes because -36 < 1500, but the wrapped offset causes addl to write data far past the buffer into the adjacent heap region\'s guard value',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
