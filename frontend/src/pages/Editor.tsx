@@ -12199,6 +12199,81 @@ print(leaked)
       description: 'subl computes total_len - hdr_len and the result goes negative (4 - 40 = -36); imull multiplies the negative bit-pattern by the element size, producing a massive wrapped offset; cmpl compares the negative payload_len against buf_cap using signed comparison — the guard passes because -36 < 1500, but the wrapped offset causes addl to write data far past the buffer into the adjacent heap region\'s guard value',
     },
   },
+  {
+    id: 'cfi-bypass',
+    name: 'CFI BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Coarse-grained control-flow integrity validates that an indirect call lands on any approved function, so an attacker redirects dispatch to a valid but dangerous target.',
+    explanation:
+      'Control Flow Integrity (CFI) is a compiler or OS defense that restricts indirect call and jump targets ' +
+      'to a set of valid destinations. Coarse-grained implementations — including Microsoft\'s Control Flow Guard ' +
+      '(CFG), Intel CET\'s Indirect Branch Tracking, and early LLVM CFI — maintain a bitmap of approved function ' +
+      'entry points and validate each indirect call against it. The critical weakness: they verify that the target ' +
+      'IS a function, not WHICH function the caller intended. An attacker who controls an indirect call target can ' +
+      'redirect it to any valid function in the process, including system(), VirtualProtect(), or kernel dispatch ' +
+      'handlers. The BATE (Back to the Epilogue) attack at Black Hat Asia 2018 exploited CFG\'s 16-byte alignment ' +
+      'granularity to reach code at unintended offsets within approved pages, bypassing Microsoft Edge\'s CFI on ' +
+      '64-bit Windows 10. Carlini et al. (USENIX Security 2015) demonstrated "control-flow bending" — chaining ' +
+      'valid call targets to achieve arbitrary code execution within CFI policy constraints. The 2025 "Coroutine ' +
+      'Frame-Oriented Programming" technique at Black Hat USA showed bypasses of Intel CET, CFG, and LLVM CFI ' +
+      'simultaneously on both Linux and Windows. Real-world kernel exploits routinely bypass coarse CFI: ' +
+      'CVE-2022-21882 (Win32k privilege escalation) and CVE-2024-30051 (DWM Core Library elevation) both ' +
+      'leveraged indirect calls that passed CFG validation but reached attacker-chosen dispatch routines. ' +
+      'In the assembly, cmpl validates the target against the bitmap range (bitmap_lo through bitmap_hi); the ' +
+      'conditional jumps pass because the attacker\'s shell_addr IS within the approved range — movl then loads ' +
+      'the dangerous handler address and the indirect call proceeds, escalating privilege despite CFI enforcement.',
+    code:
+`# CVE pattern: coarse CFI approves any valid target — attacker picks dangerous handler
+class CfiGuard:
+    def __init__(self, lo, hi):
+        self.bitmap_lo = lo
+        self.bitmap_hi = hi
+        self.log_addr = 4096
+        self.auth_addr = 4128
+        self.shell_addr = 4192
+        self.privilege = 0
+        self.target = 0
+        self.checks = 0
+
+    def indirect_call(self, addr):
+        self.checks += 1
+        self.target = addr
+        if addr >= self.bitmap_lo:
+            if addr <= self.bitmap_hi:
+                if addr == self.shell_addr:
+                    self.privilege = 2
+                elif addr == self.auth_addr:
+                    self.privilege = 1
+                else:
+                    self.privilege = 0
+                return self.privilege
+        return 0
+
+class AttackState:
+    def __init__(self):
+        self.escalated = 0
+        self.controlled_rip = 0
+
+    def exploit(self, priv, target):
+        if priv >= 2:
+            self.escalated = 1
+            self.controlled_rip = target
+        return self.escalated
+
+guard = CfiGuard(4096, 4224)
+attack = AttackState()
+guard.indirect_call(4096)
+priv = guard.indirect_call(4192)
+attack.exploit(priv, guard.target)
+result = attack.controlled_rip + attack.escalated
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl validates the indirect-call target against bitmap_lo (4096) and bitmap_hi (4224) — a coarse range check that approves ANY function entry point in the valid set; movl then loads the attacker\'s chosen shell_addr (4192) into the dispatch slot and execution proceeds because the target IS a valid function — CFI enforcement passes but the wrong handler runs with escalated privilege',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
