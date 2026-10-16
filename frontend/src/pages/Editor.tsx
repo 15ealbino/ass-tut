@@ -12274,6 +12274,90 @@ print(result)
       description: 'cmpl validates the indirect-call target against bitmap_lo (4096) and bitmap_hi (4224) — a coarse range check that approves ANY function entry point in the valid set; movl then loads the attacker\'s chosen shell_addr (4192) into the dispatch slot and execution proceeds because the target IS a valid function — CFI enforcement passes but the wrong handler runs with escalated privilege',
     },
   },
+  {
+    id: 'kvm-mmio-uaf',
+    name: 'KVM MMIO USE-AFTER-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Cross-page MMIO write references a stale stack pointer after the initiating task exits, letting a VM guest corrupt host kernel memory.',
+    explanation:
+      'KVM MMIO use-after-free (CVE-2026-31588 / CWE-416) exploits a lifecycle mismatch in the Linux kernel\'s ' +
+      'KVM x86 MMIO emulation subsystem. When a guest VM performs an MMIO write that crosses a page boundary — ' +
+      'and both pages map to device-emulated MMIO regions — KVM\'s ABI requires splitting the access into two ' +
+      'fragments because only physically contiguous MMIO requests are supported. The first fragment is sent to ' +
+      'userspace (QEMU) via a KVM_EXIT_MMIO vmexit; the second fragment stores a pointer back to the source value, ' +
+      'which lives on the initiating vCPU task\'s kernel stack. If the second KVM_RUN is performed by a different ' +
+      'task — as happens with vCPU thread migration or multi-threaded QEMU — the original task may have exited ' +
+      'and its kernel stack frame freed. The second fragment\'s pointer now dangles into recycled memory, and the ' +
+      'MMIO emulation reads attacker-controlled data from the freed stack as the write value, forwarding it to ' +
+      'the device model. An attacker who controls the guest can groom the host heap so that the freed stack page ' +
+      'is reclaimed by security-critical structures (page tables, credential structs), achieving host kernel memory ' +
+      'corruption from inside the VM. CVE-2026-31588 was rated CVSS 8.8 by multiple vendors; the fix (commit ' +
+      'dc6a6c3db3a4) copies values of 8 bytes or less into a scratch field in the MMIO fragment structure, ' +
+      'eliminating the dangling stack reference. CVE-2026-46022 (ibmasm MMIO out-of-bounds read) and ' +
+      'CVE-2023-46813 (SEV-ES MMIO emulation arbitrary write) demonstrate that MMIO handling is a recurring ' +
+      'kernel attack surface. ' +
+      'In the assembly, movl stores the MMIO write value into a stack-local slot and sets fragment_ptr to reference ' +
+      'it; task_exit\'s movl zeroes the stack slot (simulating frame deallocation); the second fragment\'s addl reads ' +
+      'from the same zeroed offset — at runtime the freed stack page holds attacker-sprayed data, forwarding corrupted ' +
+      'values to the host device model for VM-to-host privilege escalation.',
+    code:
+`# CVE pattern: MMIO page-crossing write dangles stack ptr — guest-to-host UAF
+class MmioFragment:
+    def __init__(self, offset, size):
+        self.offset = offset
+        self.size = size
+        self.data_ptr = 0
+        self.completed = 0
+
+    def set_source(self, stack_val):
+        self.data_ptr = stack_val
+        return self.data_ptr
+
+    def emit_to_device(self):
+        result = self.data_ptr + self.offset
+        self.completed = 1
+        return result
+
+class VcpuTask:
+    def __init__(self, tid, stack_val):
+        self.tid = tid
+        self.stack_val = stack_val
+        self.exited = 0
+
+    def task_exit(self):
+        self.stack_val = 0
+        self.exited = 1
+        return self.exited
+
+class HostHeap:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.cred_uid = 1000
+        self.reclaimed = 0
+
+    def reclaim_stack(self, payload):
+        self.cred_uid = payload
+        self.reclaimed = 1
+        return self.reclaimed
+
+frag1 = MmioFragment(4092, 4)
+frag2 = MmioFragment(4096, 4)
+task = VcpuTask(100, 3735928559)
+frag1.set_source(task.stack_val)
+frag1.emit_to_device()
+task.task_exit()
+host = HostHeap(4096)
+host.reclaim_stack(0)
+frag2.set_source(host.cred_uid)
+hijacked = frag2.emit_to_device()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the MMIO write value into a stack-local slot and sets fragment_ptr; task_exit\'s movl zeroes the stack slot (simulating frame deallocation and free); frag2\'s movl reads from the same offset — at runtime the freed stack page holds attacker-sprayed data, and addl forwards the corrupted value to the device model for VM-to-host privilege escalation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
