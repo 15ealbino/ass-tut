@@ -12358,6 +12358,81 @@ print(hijacked)
       description: 'movl stores the MMIO write value into a stack-local slot and sets fragment_ptr; task_exit\'s movl zeroes the stack slot (simulating frame deallocation and free); frag2\'s movl reads from the same offset — at runtime the freed stack page holds attacker-sprayed data, and addl forwards the corrupted value to the device model for VM-to-host privilege escalation',
     },
   },
+  {
+    id: 'perf-event-uaf',
+    name: 'PERF_EVENT USE-AFTER-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Race in perf_event_open() frees an event structure while a concurrent group traversal still holds a dangling pointer, enabling local root.',
+    explanation:
+      'The Linux perf_event subsystem (CWE-416 / CWE-362) manages performance counters, tracepoints, and ' +
+      'hardware breakpoints via complex event-group hierarchies with intricate reference counting. A race ' +
+      'between perf_event_open() creating a group leader and a concurrent perf_group_detach() teardown can ' +
+      'free a perf_event structure while its sibling list or group_leader pointer is still being traversed ' +
+      'by another CPU — a use-after-free on a SLAB_TYPESAFE_BY_RCU-protected object. ' +
+      'CVE-2022-1729 exploited a race in perf_event_open() between setting up a leading tracepoint event ' +
+      'and attaching sub-events: an unprivileged local user could trigger the race to corrupt kernel memory ' +
+      'and escalate to root on all kernels before 5.17.10. CVE-2023-2235 (CVSS 7.8) demonstrated that ' +
+      'perf_group_detach() did not check siblings\' attach_state before calling add_event_to_groups() — a ' +
+      'remove_on_exec event could be detached before the group was torn down, leaving a dangling list pointer ' +
+      'exploitable for local privilege escalation on Debian, Ubuntu, and RHEL. CVE-2023-6931 showed that ' +
+      'perf_read_group() could read past the end of a group\'s sibling array when the group size changed ' +
+      'concurrently, leaking kernel heap data. The subsystem is a repeat offender because event lifecycle ' +
+      'spans multiple locks (ctx->lock, ctx->mutex, rcu_read_lock), and the perf_event structure is reachable ' +
+      'from both the creating task and any inheriting child — a perfect recipe for reference-counting races. ' +
+      'In the assembly, movl stores event fields (handler address, group_leader pointer) into stack slots; ' +
+      'the detach path\'s movl zeroes these slots (simulating free), but the concurrent group traversal\'s ' +
+      'addl still reads from the same offsets — no lock instruction guards the gap between free and read.',
+    code:
+`# CVE pattern: perf_event freed during concurrent group traversal
+class PerfEvent:
+    def __init__(self, handler, group_id):
+        self.handler = handler
+        self.group_id = group_id
+        self.attach_state = 1
+        self.refcount = 1
+
+    def detach(self):
+        self.attach_state = 0
+        self.handler = 0
+        self.refcount -= 1
+        return self.refcount
+
+    def read_counter(self):
+        result = self.handler + self.group_id
+        return result
+
+class EventGroup:
+    def __init__(self, leader_id):
+        self.leader_id = leader_id
+        self.sibling_count = 0
+        self.total_read = 0
+
+    def add_sibling(self, event):
+        self.sibling_count += 1
+        self.total_read += event.handler
+        return self.sibling_count
+
+    def traverse(self, stale_event):
+        result = stale_event.handler + stale_event.group_id
+        self.total_read += result
+        return self.total_read
+
+leader = PerfEvent(4196352, 100)
+sibling = PerfEvent(4196608, 200)
+group = EventGroup(1)
+group.add_sibling(sibling)
+sibling.detach()
+sibling.handler = 3735928559
+sibling.group_id = 4196864
+leaked = group.traverse(sibling)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the event handler and group_id into stack slots during PerfEvent construction; detach\'s movl zeroes the handler (simulating free) but no lock instruction guards the gap — the concurrent traverse\'s addl reads from the same stack offset where 0xDEADBEEF has been sprayed into the freed slot, turning the perf_event race into arbitrary code execution',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
