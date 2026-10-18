@@ -12433,6 +12433,81 @@ print(leaked)
       description: 'movl stores the event handler and group_id into stack slots during PerfEvent construction; detach\'s movl zeroes the handler (simulating free) but no lock instruction guards the gap — the concurrent traverse\'s addl reads from the same stack offset where 0xDEADBEEF has been sprayed into the freed slot, turning the perf_event race into arbitrary code execution',
     },
   },
+  {
+    id: 'rfds-reg-sampling',
+    name: 'REGISTER FILE DATA SAMPLING',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'CPU transiently forwards stale register values from a prior security domain, leaking secrets across privilege boundaries via microarchitectural sampling.',
+    explanation:
+      'Register File Data Sampling (RFDS / CVE-2023-28746 / CWE-200) is an Intel CPU vulnerability where stale ' +
+      'values from integer, floating-point, and vector register files can be transiently forwarded to dependent ' +
+      'instructions executing in a different security domain — leaking cryptographic keys, ASLR pointers, or ' +
+      'kernel data to an unprivileged attacker. Unlike Spectre (which exploits branch prediction) or MDS (which ' +
+      'exploits fill buffers and load ports), RFDS targets the physical register file itself: Atom-class E-cores ' +
+      '(Goldmont through Gracemont, including Alder Lake and Raptor Lake hybrid chips) can forward data from a ' +
+      'previous hardware thread or privilege level through the shared register rename unit before the microcode ' +
+      'completes the domain switch. Disclosed by Intel in March 2024, RFDS affects every hybrid Intel client CPU ' +
+      'shipping since 2017. The mitigation extends the VERW instruction (already used for MDS) with additional ' +
+      'register-file scrubbing, but unpatched systems remain vulnerable. AMD Zenbleed (CVE-2023-20593) is a ' +
+      'similar register-file leak on AMD Zen 2 caused by a mis-speculated vzeroupper zeroing the wrong YMM ' +
+      'register half — both demonstrate that the physical register file is a shared, cross-domain attack surface. ' +
+      'Xen Security Advisory XSA-452 confirmed that a malicious guest on an affected Xen hypervisor could sample ' +
+      'register residues from the host or other guests, enabling cross-VM secret theft without network access. ' +
+      'In the assembly, movl loads secret values (crypto key, ASLR base) into register-mapped stack slots during ' +
+      'victim_compute; after the domain switch, attacker_sample\'s movl reads from a different stack region but the ' +
+      'CPU transiently forwards the stale register value — addl accumulates the leaked secrets into the probe ' +
+      'array index, encoding them into cache timing observable by the attacker.',
+    code:
+`# CVE pattern: stale register values forwarded across domain boundary
+class RegFile:
+    def __init__(self, num_regs):
+        self.num_regs = num_regs
+        self.r0 = 0
+        self.r1 = 0
+        self.r2 = 0
+        self.stale = 0
+
+    def victim_compute(self, secret_key, aslr_base):
+        self.r0 = secret_key
+        self.r1 = aslr_base
+        self.r2 = secret_key + aslr_base
+        return self.r2
+
+    def domain_switch(self):
+        self.stale = self.r0 + self.r1
+        self.r0 = 0
+        self.r1 = 0
+        self.r2 = 0
+        return self.stale
+
+class Attacker:
+    def __init__(self, probe_size):
+        self.probe_size = probe_size
+        self.sampled = 0
+        self.cache_hit = 0
+        self.leaked_total = 0
+
+    def sample_regfile(self, regfile):
+        self.sampled = regfile.stale
+        self.cache_hit = self.sampled * 64
+        self.leaked_total += self.cache_hit
+        return self.leaked_total
+
+crypto_key = 3405691582
+aslr_base = 4196352
+regs = RegFile(16)
+regs.victim_compute(crypto_key, aslr_base)
+regs.domain_switch()
+attacker = Attacker(256)
+leaked = attacker.sample_regfile(regs)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'imull'],
+      description: 'movl loads secret_key (0xCAFEBABE) and aslr_base into register-mapped stack slots during victim_compute; domain_switch\'s movl zeroes them architecturally but the physical register file retains the stale values — attacker_sample\'s movl transiently reads the residue, and imull multiplies it by the probe stride (64) to encode the secret into a cache line index observable via timing',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
