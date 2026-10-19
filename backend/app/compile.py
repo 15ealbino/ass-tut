@@ -13,6 +13,7 @@ from typing import Dict, List, Set, Tuple
 
 from app.addressing import analyze_addressing
 from app.asm_glossary import build_asm_glossary
+from app.immediates import analyze_immediates
 from app.strength import analyze_strength
 from app.cycle_cost import analyze_cycles
 from app.transpiler import TranspileError, build_line_map, transpile
@@ -1106,6 +1107,12 @@ async def compile_python(python_source: str) -> dict:
     # reads first, with the scaled-index form the fingerprint of array access.
     # Independent of the passes above; runs over the same already-mapped asm.
     addressing_summary = analyze_addressing(line_map, asm_lines)
+    # Recover the numeric immediate constants embedded in each Python line's asm
+    # (the `$`-prefixed literals). The addressing pass counts immediate operands;
+    # this pass surfaces their VALUES, so a learner can read the program's
+    # constants off the disassembly and tell source literals from the ones the
+    # compiler synthesised (shift counts, masks). Independent of the passes above.
+    immediate_summary = analyze_immediates(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
     # Source-level arithmetic strength hints: annotate each Python line whose
@@ -1130,6 +1137,7 @@ async def compile_python(python_source: str) -> dict:
         "cycle_summary": cycle_summary,
         "branch_summary": branch_summary,
         "addressing_summary": addressing_summary,
+        "immediate_summary": immediate_summary,
         "asm_glossary": asm_glossary,
         "strength_summary": strength_summary,
     }

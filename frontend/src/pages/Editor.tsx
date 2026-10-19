@@ -124,6 +124,19 @@ function formatAddressing(counts?: Record<string, number>): string {
   return [...known, ...extra].map(m => `${counts[m]} ${ADDRESSING_LABEL[m] ?? m}`).join(' · ')
 }
 
+// ─── Immediate-constant presentation ───────────────────────────────────────
+// The addressing map counts immediate operands; this surfaces their VALUES —
+// the numeric `$`-literals gcc bakes into the instruction stream. A learner can
+// read the program's constants straight off the disassembly and tell their own
+// source literals (your `42`) from the ones the compiler synthesised even at -O0
+// (a `*8` becomes a shift by `$3`, a `% 8` a mask `$7` — numbers never written
+// in the Python). Rendered as a compact "$3 $7 $42" list in the IMM chip and
+// per-line tooltips; empty when a line embeds no numeric literals.
+function formatImmediates(values?: number[]): string {
+  if (!values || values.length === 0) return ''
+  return values.map(v => `$${v}`).join(' ')
+}
+
 // ─── Cycle-cost presentation ────────────────────────────────────────────────
 // Backend weights each instruction by an approximate relative cycle cost
 // (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
@@ -13275,6 +13288,26 @@ export default function EditorPage() {
               ADDR:: {formatAddressing(result.addressing_summary.addressing_totals)}
             </span>
           )}
+          {result.immediate_summary && result.immediate_summary.distinct > 0 && (
+            <span
+              title={`Immediate constants — the ${result.immediate_summary.distinct} distinct numeric literal(s) gcc baked into the instruction stream, smallest first: ${Object.keys(result.immediate_summary.value_totals).map(Number).sort((a, b) => a - b).map(v => `$${v}×${result.immediate_summary!.value_totals[v]}`).join(' ')}. Reading embedded constants off a disassembly is a day-one reverse-engineering skill. Some are your source literals (your '42' appears as '$42'); others the compiler synthesised even at -O0 — a '*8' becomes a shift by '$3', a '% 8' a mask '$7', numbers never written in your Python. Click a line below to see which constants it embeds. (Symbolic/address immediates like $.LC0 are not counted.)`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              IMM:: {result.immediate_summary.distinct}
+            </span>
+          )}
           {result.cycle_summary && result.cycle_summary.total_cycles > 0 && (
             <span
               title={`Cycle-cost estimate — a latency-weighted sharpening of the raw instruction count. Each instruction carries an approximate relative cost (integer divide ≈20, multiply/call ≈3-4, most staples 1); this is their sum across the program. Compare it with COST:: — the gap shows how much apparent work is a few genuinely expensive operations versus many cheap ones. The costliest Python line is not always the one with the most instructions. NOTE: coarse relative teaching estimates, not cycle-accurate figures.`}
@@ -13368,6 +13401,9 @@ export default function EditorPage() {
             const addrTitle = formatAddressing(mapping.addressing_counts)
               ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
               : ''
+            const immTitle = formatImmediates(mapping.immediate_values)
+              ? ` — imm: ${formatImmediates(mapping.immediate_values)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -13388,7 +13424,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${immTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
