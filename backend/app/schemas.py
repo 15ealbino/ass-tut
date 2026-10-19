@@ -104,6 +104,14 @@ class LineMapping(BaseModel):
     # Counts are of operands; only nonzero modes are present. Empty for the
     # pyghidra pipeline, which computes no per-line addressing map.
     addressing_counts: Dict[str, int] = Field(default_factory=dict)
+    # Immediate-operand map: the distinct numeric literal constants this Python
+    # line's assembly encodes as immediates (e.g. [5, 9] — your `5`, and the `9`
+    # that `i < 10` lowers to), sorted ascending. Where addressing_counts says
+    # HOW MANY operands are immediates, this says WHICH VALUES they are — the most
+    # direct Python→asm link. Symbolic immediates (a string-pool pointer like
+    # $.LC0) are not listed here; they are tallied program-wide in
+    # ImmediateSummary.symbol_refs. Empty for the pyghidra pipeline.
+    immediates: List[int] = Field(default_factory=list)
 
 
 class Hotspot(BaseModel):
@@ -218,6 +226,24 @@ class AddressingSummary(BaseModel):
     addressing_totals: Dict[str, int] = Field(default_factory=dict)
 
 
+class ImmediateSummary(BaseModel):
+    # Program-wide immediate-operand map — the literal constants the compiled asm
+    # encodes.
+    #   value_totals    — each distinct numeric immediate value (as a string key,
+    #                     since JSON object keys are strings) mapped to the number
+    #                     of operand occurrences of it, ordered by the underlying
+    #                     integer value ascending (so "-1" < "0" < "10").
+    #   symbol_refs     — count of symbolic $-operands program-wide (address
+    #                     constants like $.LC0 — a read-only string-pool pointer —
+    #                     or $symbol), which carry no numeric value.
+    #   distinct_values — number of distinct numeric immediate values.
+    # Counts are of operands (an immediate named on two instructions counts
+    # twice). Empty for the pyghidra pipeline, which computes no immediate map.
+    value_totals: Dict[str, int] = Field(default_factory=dict)
+    symbol_refs: int = 0
+    distinct_values: int = 0
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -267,6 +293,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # addressing map).
     addressing_summary: Optional[AddressingSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line
+    # immediate-operand map).
+    immediate_summary: Optional[ImmediateSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)

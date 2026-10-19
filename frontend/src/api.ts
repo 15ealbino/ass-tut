@@ -75,6 +75,13 @@ export interface LineMapping {
   // (%gs:/%fs:) mode is the stack-canary access -fstack-protector-strong emits.
   // Counts are of operands; only nonzero modes are present.
   addressing_counts?: Record<string, number>
+  // Immediate-operand map: the distinct numeric literal constants this line's
+  // asm encodes as immediates (e.g. [5, 9] — your `5`, and the `9` that `i < 10`
+  // lowers to), sorted ascending. Where addressing_counts says HOW MANY operands
+  // are immediates, this says WHICH VALUES they are — the most direct Python→asm
+  // link. Symbolic immediates ($.LC0 string pointers) are tallied program-wide in
+  // ImmediateSummary.symbol_refs, not listed here.
+  immediates?: number[]
 }
 
 export interface StrengthHint {
@@ -190,6 +197,18 @@ export interface AddressingSummary {
   addressing_totals: Record<string, number>
 }
 
+export interface ImmediateSummary {
+  // Program-wide immediate-operand map — the literal constants the compiled asm
+  // encodes. value_totals maps each distinct numeric immediate value (a string
+  // key, ordered by the underlying integer ascending so "-1" < "10") to its
+  // operand-occurrence count; symbol_refs counts symbolic $-operands ($.LC0
+  // string-pool pointers and $symbol address constants, which carry no numeric
+  // value); distinct_values is the number of distinct numeric values.
+  value_totals: Record<string, number>
+  symbol_refs: number
+  distinct_values: number
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -220,6 +239,8 @@ export interface CompileResponse {
   branch_summary?: BranchSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
   addressing_summary?: AddressingSummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  immediate_summary?: ImmediateSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
   // Source-level arithmetic strength hints (transpile pipeline); null/absent for
