@@ -12199,6 +12199,382 @@ print(leaked)
       description: 'subl computes total_len - hdr_len and the result goes negative (4 - 40 = -36); imull multiplies the negative bit-pattern by the element size, producing a massive wrapped offset; cmpl compares the negative payload_len against buf_cap using signed comparison — the guard passes because -36 < 1500, but the wrapped offset causes addl to write data far past the buffer into the adjacent heap region\'s guard value',
     },
   },
+  {
+    id: 'cfi-bypass',
+    name: 'CFI BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Coarse-grained control-flow integrity validates that an indirect call lands on any approved function, so an attacker redirects dispatch to a valid but dangerous target.',
+    explanation:
+      'Control Flow Integrity (CFI) is a compiler or OS defense that restricts indirect call and jump targets ' +
+      'to a set of valid destinations. Coarse-grained implementations — including Microsoft\'s Control Flow Guard ' +
+      '(CFG), Intel CET\'s Indirect Branch Tracking, and early LLVM CFI — maintain a bitmap of approved function ' +
+      'entry points and validate each indirect call against it. The critical weakness: they verify that the target ' +
+      'IS a function, not WHICH function the caller intended. An attacker who controls an indirect call target can ' +
+      'redirect it to any valid function in the process, including system(), VirtualProtect(), or kernel dispatch ' +
+      'handlers. The BATE (Back to the Epilogue) attack at Black Hat Asia 2018 exploited CFG\'s 16-byte alignment ' +
+      'granularity to reach code at unintended offsets within approved pages, bypassing Microsoft Edge\'s CFI on ' +
+      '64-bit Windows 10. Carlini et al. (USENIX Security 2015) demonstrated "control-flow bending" — chaining ' +
+      'valid call targets to achieve arbitrary code execution within CFI policy constraints. The 2025 "Coroutine ' +
+      'Frame-Oriented Programming" technique at Black Hat USA showed bypasses of Intel CET, CFG, and LLVM CFI ' +
+      'simultaneously on both Linux and Windows. Real-world kernel exploits routinely bypass coarse CFI: ' +
+      'CVE-2022-21882 (Win32k privilege escalation) and CVE-2024-30051 (DWM Core Library elevation) both ' +
+      'leveraged indirect calls that passed CFG validation but reached attacker-chosen dispatch routines. ' +
+      'In the assembly, cmpl validates the target against the bitmap range (bitmap_lo through bitmap_hi); the ' +
+      'conditional jumps pass because the attacker\'s shell_addr IS within the approved range — movl then loads ' +
+      'the dangerous handler address and the indirect call proceeds, escalating privilege despite CFI enforcement.',
+    code:
+`# CVE pattern: coarse CFI approves any valid target — attacker picks dangerous handler
+class CfiGuard:
+    def __init__(self, lo, hi):
+        self.bitmap_lo = lo
+        self.bitmap_hi = hi
+        self.log_addr = 4096
+        self.auth_addr = 4128
+        self.shell_addr = 4192
+        self.privilege = 0
+        self.target = 0
+        self.checks = 0
+
+    def indirect_call(self, addr):
+        self.checks += 1
+        self.target = addr
+        if addr >= self.bitmap_lo:
+            if addr <= self.bitmap_hi:
+                if addr == self.shell_addr:
+                    self.privilege = 2
+                elif addr == self.auth_addr:
+                    self.privilege = 1
+                else:
+                    self.privilege = 0
+                return self.privilege
+        return 0
+
+class AttackState:
+    def __init__(self):
+        self.escalated = 0
+        self.controlled_rip = 0
+
+    def exploit(self, priv, target):
+        if priv >= 2:
+            self.escalated = 1
+            self.controlled_rip = target
+        return self.escalated
+
+guard = CfiGuard(4096, 4224)
+attack = AttackState()
+guard.indirect_call(4096)
+priv = guard.indirect_call(4192)
+attack.exploit(priv, guard.target)
+result = attack.controlled_rip + attack.escalated
+print(result)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl validates the indirect-call target against bitmap_lo (4096) and bitmap_hi (4224) — a coarse range check that approves ANY function entry point in the valid set; movl then loads the attacker\'s chosen shell_addr (4192) into the dispatch slot and execution proceeds because the target IS a valid function — CFI enforcement passes but the wrong handler runs with escalated privilege',
+    },
+  },
+  {
+    id: 'kvm-mmio-uaf',
+    name: 'KVM MMIO USE-AFTER-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Cross-page MMIO write references a stale stack pointer after the initiating task exits, letting a VM guest corrupt host kernel memory.',
+    explanation:
+      'KVM MMIO use-after-free (CVE-2026-31588 / CWE-416) exploits a lifecycle mismatch in the Linux kernel\'s ' +
+      'KVM x86 MMIO emulation subsystem. When a guest VM performs an MMIO write that crosses a page boundary — ' +
+      'and both pages map to device-emulated MMIO regions — KVM\'s ABI requires splitting the access into two ' +
+      'fragments because only physically contiguous MMIO requests are supported. The first fragment is sent to ' +
+      'userspace (QEMU) via a KVM_EXIT_MMIO vmexit; the second fragment stores a pointer back to the source value, ' +
+      'which lives on the initiating vCPU task\'s kernel stack. If the second KVM_RUN is performed by a different ' +
+      'task — as happens with vCPU thread migration or multi-threaded QEMU — the original task may have exited ' +
+      'and its kernel stack frame freed. The second fragment\'s pointer now dangles into recycled memory, and the ' +
+      'MMIO emulation reads attacker-controlled data from the freed stack as the write value, forwarding it to ' +
+      'the device model. An attacker who controls the guest can groom the host heap so that the freed stack page ' +
+      'is reclaimed by security-critical structures (page tables, credential structs), achieving host kernel memory ' +
+      'corruption from inside the VM. CVE-2026-31588 was rated CVSS 8.8 by multiple vendors; the fix (commit ' +
+      'dc6a6c3db3a4) copies values of 8 bytes or less into a scratch field in the MMIO fragment structure, ' +
+      'eliminating the dangling stack reference. CVE-2026-46022 (ibmasm MMIO out-of-bounds read) and ' +
+      'CVE-2023-46813 (SEV-ES MMIO emulation arbitrary write) demonstrate that MMIO handling is a recurring ' +
+      'kernel attack surface. ' +
+      'In the assembly, movl stores the MMIO write value into a stack-local slot and sets fragment_ptr to reference ' +
+      'it; task_exit\'s movl zeroes the stack slot (simulating frame deallocation); the second fragment\'s addl reads ' +
+      'from the same zeroed offset — at runtime the freed stack page holds attacker-sprayed data, forwarding corrupted ' +
+      'values to the host device model for VM-to-host privilege escalation.',
+    code:
+`# CVE pattern: MMIO page-crossing write dangles stack ptr — guest-to-host UAF
+class MmioFragment:
+    def __init__(self, offset, size):
+        self.offset = offset
+        self.size = size
+        self.data_ptr = 0
+        self.completed = 0
+
+    def set_source(self, stack_val):
+        self.data_ptr = stack_val
+        return self.data_ptr
+
+    def emit_to_device(self):
+        result = self.data_ptr + self.offset
+        self.completed = 1
+        return result
+
+class VcpuTask:
+    def __init__(self, tid, stack_val):
+        self.tid = tid
+        self.stack_val = stack_val
+        self.exited = 0
+
+    def task_exit(self):
+        self.stack_val = 0
+        self.exited = 1
+        return self.exited
+
+class HostHeap:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.cred_uid = 1000
+        self.reclaimed = 0
+
+    def reclaim_stack(self, payload):
+        self.cred_uid = payload
+        self.reclaimed = 1
+        return self.reclaimed
+
+frag1 = MmioFragment(4092, 4)
+frag2 = MmioFragment(4096, 4)
+task = VcpuTask(100, 3735928559)
+frag1.set_source(task.stack_val)
+frag1.emit_to_device()
+task.task_exit()
+host = HostHeap(4096)
+host.reclaim_stack(0)
+frag2.set_source(host.cred_uid)
+hijacked = frag2.emit_to_device()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the MMIO write value into a stack-local slot and sets fragment_ptr; task_exit\'s movl zeroes the stack slot (simulating frame deallocation and free); frag2\'s movl reads from the same offset — at runtime the freed stack page holds attacker-sprayed data, and addl forwards the corrupted value to the device model for VM-to-host privilege escalation',
+    },
+  },
+  {
+    id: 'perf-event-uaf',
+    name: 'PERF_EVENT USE-AFTER-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Race in perf_event_open() frees an event structure while a concurrent group traversal still holds a dangling pointer, enabling local root.',
+    explanation:
+      'The Linux perf_event subsystem (CWE-416 / CWE-362) manages performance counters, tracepoints, and ' +
+      'hardware breakpoints via complex event-group hierarchies with intricate reference counting. A race ' +
+      'between perf_event_open() creating a group leader and a concurrent perf_group_detach() teardown can ' +
+      'free a perf_event structure while its sibling list or group_leader pointer is still being traversed ' +
+      'by another CPU — a use-after-free on a SLAB_TYPESAFE_BY_RCU-protected object. ' +
+      'CVE-2022-1729 exploited a race in perf_event_open() between setting up a leading tracepoint event ' +
+      'and attaching sub-events: an unprivileged local user could trigger the race to corrupt kernel memory ' +
+      'and escalate to root on all kernels before 5.17.10. CVE-2023-2235 (CVSS 7.8) demonstrated that ' +
+      'perf_group_detach() did not check siblings\' attach_state before calling add_event_to_groups() — a ' +
+      'remove_on_exec event could be detached before the group was torn down, leaving a dangling list pointer ' +
+      'exploitable for local privilege escalation on Debian, Ubuntu, and RHEL. CVE-2023-6931 showed that ' +
+      'perf_read_group() could read past the end of a group\'s sibling array when the group size changed ' +
+      'concurrently, leaking kernel heap data. The subsystem is a repeat offender because event lifecycle ' +
+      'spans multiple locks (ctx->lock, ctx->mutex, rcu_read_lock), and the perf_event structure is reachable ' +
+      'from both the creating task and any inheriting child — a perfect recipe for reference-counting races. ' +
+      'In the assembly, movl stores event fields (handler address, group_leader pointer) into stack slots; ' +
+      'the detach path\'s movl zeroes these slots (simulating free), but the concurrent group traversal\'s ' +
+      'addl still reads from the same offsets — no lock instruction guards the gap between free and read.',
+    code:
+`# CVE pattern: perf_event freed during concurrent group traversal
+class PerfEvent:
+    def __init__(self, handler, group_id):
+        self.handler = handler
+        self.group_id = group_id
+        self.attach_state = 1
+        self.refcount = 1
+
+    def detach(self):
+        self.attach_state = 0
+        self.handler = 0
+        self.refcount -= 1
+        return self.refcount
+
+    def read_counter(self):
+        result = self.handler + self.group_id
+        return result
+
+class EventGroup:
+    def __init__(self, leader_id):
+        self.leader_id = leader_id
+        self.sibling_count = 0
+        self.total_read = 0
+
+    def add_sibling(self, event):
+        self.sibling_count += 1
+        self.total_read += event.handler
+        return self.sibling_count
+
+    def traverse(self, stale_event):
+        result = stale_event.handler + stale_event.group_id
+        self.total_read += result
+        return self.total_read
+
+leader = PerfEvent(4196352, 100)
+sibling = PerfEvent(4196608, 200)
+group = EventGroup(1)
+group.add_sibling(sibling)
+sibling.detach()
+sibling.handler = 3735928559
+sibling.group_id = 4196864
+leaked = group.traverse(sibling)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the event handler and group_id into stack slots during PerfEvent construction; detach\'s movl zeroes the handler (simulating free) but no lock instruction guards the gap — the concurrent traverse\'s addl reads from the same stack offset where 0xDEADBEEF has been sprayed into the freed slot, turning the perf_event race into arbitrary code execution',
+    },
+  },
+  {
+    id: 'rfds-reg-sampling',
+    name: 'REGISTER FILE DATA SAMPLING',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'CPU transiently forwards stale register values from a prior security domain, leaking secrets across privilege boundaries via microarchitectural sampling.',
+    explanation:
+      'Register File Data Sampling (RFDS / CVE-2023-28746 / CWE-200) is an Intel CPU vulnerability where stale ' +
+      'values from integer, floating-point, and vector register files can be transiently forwarded to dependent ' +
+      'instructions executing in a different security domain — leaking cryptographic keys, ASLR pointers, or ' +
+      'kernel data to an unprivileged attacker. Unlike Spectre (which exploits branch prediction) or MDS (which ' +
+      'exploits fill buffers and load ports), RFDS targets the physical register file itself: Atom-class E-cores ' +
+      '(Goldmont through Gracemont, including Alder Lake and Raptor Lake hybrid chips) can forward data from a ' +
+      'previous hardware thread or privilege level through the shared register rename unit before the microcode ' +
+      'completes the domain switch. Disclosed by Intel in March 2024, RFDS affects every hybrid Intel client CPU ' +
+      'shipping since 2017. The mitigation extends the VERW instruction (already used for MDS) with additional ' +
+      'register-file scrubbing, but unpatched systems remain vulnerable. AMD Zenbleed (CVE-2023-20593) is a ' +
+      'similar register-file leak on AMD Zen 2 caused by a mis-speculated vzeroupper zeroing the wrong YMM ' +
+      'register half — both demonstrate that the physical register file is a shared, cross-domain attack surface. ' +
+      'Xen Security Advisory XSA-452 confirmed that a malicious guest on an affected Xen hypervisor could sample ' +
+      'register residues from the host or other guests, enabling cross-VM secret theft without network access. ' +
+      'In the assembly, movl loads secret values (crypto key, ASLR base) into register-mapped stack slots during ' +
+      'victim_compute; after the domain switch, attacker_sample\'s movl reads from a different stack region but the ' +
+      'CPU transiently forwards the stale register value — addl accumulates the leaked secrets into the probe ' +
+      'array index, encoding them into cache timing observable by the attacker.',
+    code:
+`# CVE pattern: stale register values forwarded across domain boundary
+class RegFile:
+    def __init__(self, num_regs):
+        self.num_regs = num_regs
+        self.r0 = 0
+        self.r1 = 0
+        self.r2 = 0
+        self.stale = 0
+
+    def victim_compute(self, secret_key, aslr_base):
+        self.r0 = secret_key
+        self.r1 = aslr_base
+        self.r2 = secret_key + aslr_base
+        return self.r2
+
+    def domain_switch(self):
+        self.stale = self.r0 + self.r1
+        self.r0 = 0
+        self.r1 = 0
+        self.r2 = 0
+        return self.stale
+
+class Attacker:
+    def __init__(self, probe_size):
+        self.probe_size = probe_size
+        self.sampled = 0
+        self.cache_hit = 0
+        self.leaked_total = 0
+
+    def sample_regfile(self, regfile):
+        self.sampled = regfile.stale
+        self.cache_hit = self.sampled * 64
+        self.leaked_total += self.cache_hit
+        return self.leaked_total
+
+crypto_key = 3405691582
+aslr_base = 4196352
+regs = RegFile(16)
+regs.victim_compute(crypto_key, aslr_base)
+regs.domain_switch()
+attacker = Attacker(256)
+leaked = attacker.sample_regfile(regs)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'imull'],
+      description: 'movl loads secret_key (0xCAFEBABE) and aslr_base into register-mapped stack slots during victim_compute; domain_switch\'s movl zeroes them architecturally but the physical register file retains the stale values — attacker_sample\'s movl transiently reads the residue, and imull multiplies it by the probe stride (64) to encode the secret into a cache line index observable via timing',
+    },
+  },
+  {
+    id: 'smb-logoff-race',
+    name: 'SMB SESSION LOGOFF RACE UAF',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Concurrent session logoff and bind race to free and access the same user object, causing a kernel use-after-free reachable over the network.',
+    explanation:
+      'Network protocol session race UAFs occur when concurrent connections share mutable session state without ' +
+      'adequate locking. In the Linux kernel\'s ksmbd (in-kernel SMB3 server), CVE-2025-37899 demonstrates this ' +
+      'class: connection A sends SMB2_LOGOFF to tear down a session while connection B simultaneously sends ' +
+      'SMB2_SESSION_SETUP to bind to that same session. The logoff handler frees sess->user while the setup ' +
+      'handler is mid-flight referencing the same pointer — a textbook use-after-free reachable over the network. ' +
+      'Because ksmbd runs in kernel space, the freed object can be reclaimed via heap spray, giving the attacker ' +
+      'arbitrary code execution with kernel privileges. Discovered by Sean Heelan using AI-assisted static ' +
+      'analysis (OpenAI o3) in May 2025 — o3 detected the bug in 8 of 100 analysis runs — this CVE marks a ' +
+      'milestone in automated vulnerability discovery. NVD scored it 7.8 (High) while cve.org lists 8.8 ' +
+      '(network-reachable). Similar concurrent-session races recur across protocol stacks: CVE-2024-7348 ' +
+      '(PostgreSQL pg_dump object replacement during race window enables arbitrary SQL as superuser) and SCTP ' +
+      'association teardown races that produced multiple kernel CVEs. The root cause is universal: a check-then-use ' +
+      'gap in a concurrent protocol state machine where one thread\'s teardown invalidates another thread\'s ' +
+      'in-flight pointer without synchronization. ' +
+      'In the assembly, movl stores session credentials during setup; logoff\'s movl zeroes them (simulating ' +
+      'kfree of sess->user); bind_read\'s addl then reads from the same stack offsets — after a heap spray ' +
+      'replants attacker values (0xDEADBEEF, 0x400200) in the freed slots, addl returns attacker-controlled ' +
+      'data with no lock or atomic instruction guarding the access window.',
+    code:
+`# CVE pattern: concurrent SMB logoff + bind races on shared session object
+class SmbSession:
+    def __init__(self, sid):
+        self.sid = sid
+        self.user_uid = 0
+        self.user_privs = 0
+        self.active = 0
+        self.bind_count = 0
+
+    def setup(self, uid, privs):
+        self.user_uid = uid
+        self.user_privs = privs
+        self.active = 1
+        return self.active
+
+    def logoff(self):
+        self.user_uid = 0
+        self.user_privs = 0
+        self.active = 0
+        return self.active
+
+    def bind_read(self):
+        creds = self.user_uid + self.user_privs
+        self.bind_count += 1
+        return creds
+
+sess = SmbSession(42)
+sess.setup(1000, 755)
+safe = sess.bind_read()
+sess.logoff()
+stale = sess.bind_read()
+sess.user_uid = 3735928559
+sess.user_privs = 4196352
+hijacked = sess.bind_read()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores user credentials (uid 1000, privs 755) during session setup; logoff\'s movl zeroes them (simulating kfree of sess->user); bind_read\'s addl reads from the same stack offsets after the free — once a heap spray replants 0xDEADBEEF and 0x400200, addl returns attacker-controlled data with no lock guarding the race window',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
