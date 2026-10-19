@@ -96,6 +96,13 @@ class LineMapping(BaseModel):
     # label. Empty for the pyghidra pipeline, which computes no per-line
     # branch map.
     branches: List[Branch] = Field(default_factory=list)
+    # Loop-depth map: how many loops this Python line's assembly runs inside,
+    # recovered from the loop back-edges (the max nesting over the line's asm).
+    # 0 = straight-line code outside every loop; 2 = inside two nested loops, so
+    # the line runs (outer × inner) times. The run-count multiplier the cost and
+    # cycle estimates omit. 0 for the pyghidra pipeline, which computes no
+    # per-line loop depth.
+    loop_depth: int = 0
     # Addressing-mode map: how this line's asm operands split across addressing
     # modes ("immediate", "register", "displacement", "indexed", "segment",
     # "direct") — the mode a reverse-engineer reads first. The "indexed" (scaled
@@ -207,6 +214,29 @@ class BranchSummary(BaseModel):
     unknown: int = 0
 
 
+class LoopHotspot(BaseModel):
+    # One Python line that runs inside at least one loop.
+    #   py_line    — the 1-indexed Python source line.
+    #   loop_depth — how many loops the line's assembly runs inside.
+    py_line: int
+    loop_depth: int
+
+
+class LoopSummary(BaseModel):
+    # Program-wide loop-depth map, recovered from the asm back-edges.
+    #   loop_count — number of loops, i.e. distinct back-edge target labels
+    #                (multiple back-edges to one head — a compound or/and
+    #                condition — count as one loop); one per source for/while.
+    #   max_depth  — deepest loop nesting anywhere in the program (0 = no loops).
+    #   hotspots   — every Python line at depth >= 1 (the lines that run
+    #                repeatedly), ranked by depth descending then line number.
+    # Depth is the run-count multiplier the cost/cycle estimates omit: a costly
+    # line at depth 2 runs (outer × inner) times.
+    loop_count: int = 0
+    max_depth: int = 0
+    hotspots: List[LoopHotspot] = Field(default_factory=list)
+
+
 class AddressingSummary(BaseModel):
     # Program-wide addressing-mode map: each addressing mode ("immediate" /
     # "register" / "displacement" / "indexed" / "segment" / "direct") mapped to
@@ -264,6 +294,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line branch
     # map).
     branch_summary: Optional[BranchSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line loop
+    # depth map).
+    loop_summary: Optional[LoopSummary] = None
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # addressing map).
     addressing_summary: Optional[AddressingSummary] = None
