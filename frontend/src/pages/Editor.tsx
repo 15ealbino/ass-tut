@@ -12575,6 +12575,71 @@ print(hijacked)
       description: 'movl stores user credentials (uid 1000, privs 755) during session setup; logoff\'s movl zeroes them (simulating kfree of sess->user); bind_read\'s addl reads from the same stack offsets after the free — once a heap spray replants 0xDEADBEEF and 0x400200, addl returns attacker-controlled data with no lock guarding the race window',
     },
   },
+  {
+    id: 'hardcoded-creds',
+    name: 'HARD-CODED CREDENTIALS',
+    severity: 'CRITICAL',
+    category: 'Authentication',
+    description: 'Secret keys or passwords embedded as constants in the binary are trivially extractable via disassembly, granting unauthenticated access to all deployed devices.',
+    explanation:
+      'Hard-coded credentials (CWE-798) embed authentication secrets — passwords, API keys, cryptographic material, ' +
+      'JWT signing keys — directly in source code, where they compile into literal constants in the binary\'s .rodata ' +
+      'section or as immediate operands in the instruction stream. Anyone with the firmware image or binary can extract ' +
+      'them with strings, objdump, or Ghidra. Because every device ships the same binary, one extraction compromises ' +
+      'the entire product fleet. The CWE Top 25 (2024) ranks CWE-798 among the most dangerous software weaknesses, ' +
+      'with over 2,100 associated CVEs. CVE-2024-28987 (SolarWinds Web Help Desk) exposed hard-coded credentials that ' +
+      'let remote unauthenticated attackers access internal functionality and modify data — CISA confirmed active ' +
+      'exploitation and added it to the Known Exploited Vulnerabilities catalog. CVE-2024-41794 (Siemens SENTRON 7KT ' +
+      'PAC1260 Data Manager, CVSS 10.0) embedded credentials granting full device control. CVE-2024-9643 (Four-Faith ' +
+      'F3x36 router firmware, CVSS 9.8) allowed complete authentication bypass via firmware-embedded credentials. ' +
+      'IoT and OT devices are the worst offenders: firmware extracted via JTAG, SPI flash, or binwalk routinely reveals ' +
+      'passwords shared across millions of deployed units. ' +
+      'In the assembly, `movl $305419896` loads the hard-coded secret (0x12345678) as a literal immediate operand; ' +
+      '`cmpl` compares user input directly against this constant — the credential is visible to anyone who reads the ' +
+      'disassembly, with no key derivation, obfuscation, or secure element between the constant and the comparison.',
+    code:
+`# CVE pattern: secret embedded as constant — extractable from disassembly
+class Firmware:
+    def __init__(self, secret, admin_hash):
+        self.secret = secret
+        self.admin_hash = admin_hash
+        self.authenticated = 0
+        self.attempts = 0
+
+    def authenticate(self, user_input):
+        self.attempts += 1
+        if user_input == self.secret:
+            self.authenticated = 1
+        return self.authenticated
+
+    def admin_panel(self):
+        result = self.authenticated * self.admin_hash
+        return result
+
+class Reverser:
+    def __init__(self, rodata_base):
+        self.rodata_base = rodata_base
+        self.found_secret = 0
+        self.scanned = 0
+
+    def extract_constant(self, offset):
+        self.found_secret = self.rodata_base + offset
+        self.scanned = 1
+        return self.found_secret
+
+device = Firmware(305419896, 4196352)
+device.authenticate(1094795585)
+rev = Reverser(305419520)
+secret = rev.extract_constant(376)
+device.authenticate(secret)
+admin = device.admin_panel()
+print(admin)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl loads the hard-coded secret (0x12345678) as a literal immediate operand visible in the disassembly; cmpl compares user input directly against this constant — anyone with the firmware image or binary can read the credential from the instruction stream and replay it for full authentication bypass across every deployed device',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
