@@ -12640,6 +12640,75 @@ print(admin)
       description: 'movl loads the hard-coded secret (0x12345678) as a literal immediate operand visible in the disassembly; cmpl compares user input directly against this constant — anyone with the firmware image or binary can read the credential from the instruction stream and replay it for full authentication bypass across every deployed device',
     },
   },
+  {
+    id: 'struct-padding-leak',
+    name: 'STRUCT PADDING LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Uninitialized padding bytes between struct fields leak stale kernel data when copied to userspace, defeating KASLR.',
+    explanation:
+      'Structure padding information leaks (CWE-200 / CWE-226) arise from the C language\'s alignment requirements: ' +
+      'compilers insert invisible padding bytes between struct fields to satisfy natural alignment, and the C standard ' +
+      'explicitly leaves these bytes unspecified. When a kernel function initializes a struct by assigning individual ' +
+      'fields — instead of using memset to zero the entire structure first — the padding bytes retain whatever data ' +
+      'previously occupied that stack or heap memory: kernel text pointers, stack canaries, session tokens, or ' +
+      'cryptographic keys. A subsequent copy_to_user() or netlink message then sends the entire struct, padding ' +
+      'included, to userspace. ' +
+      'CVE-2026-31664 (Linux xfrm/IPsec) leaks kernel heap pointers via uncleared padding in build_polexpire()\'s ' +
+      'netlink message, defeating KASLR for any local user subscribed to the XFRM netlink group. ' +
+      'CVE-2025-40278 and CVE-2025-40279 (Linux traffic control act_ife and act_connmark) both used designated ' +
+      'initializers that left padding bytes intact, leaking heap contents into netlink messages — KMSAN flagged ' +
+      'both as kernel infoleaks. CVE-2010-3881 (QEMU-KVM) exposed host kernel memory to guest VMs through struct ' +
+      'padding in KVM ioctl responses. A USENIX WOOT \'20 study demonstrated that even low-CVSS padding leaks can ' +
+      'be weaponized via deterministic stack spraying to recover full KASLR base addresses and stack canaries. ' +
+      'In the assembly, movl stores field values at their aligned offsets but skips the padding slots between them; ' +
+      'addl in copy_to_user sums all slots including the untouched padding — the stale values (0xFFFF0000 kernel ' +
+      'text pointer, 0x12345678 canary) flow directly into the output, defeating ASLR and leaking secrets.',
+    code:
+`# CVE pattern: struct padding bytes leak stale kernel data to userspace
+class NetlinkMsg:
+    def __init__(self, field_a, field_b, field_c):
+        self.field_a = field_a
+        self.pad0 = 4294901760
+        self.field_b = field_b
+        self.pad1 = 305419896
+        self.field_c = field_c
+        self.pad2 = 4196352
+
+    def init_fields(self, a, b, c):
+        self.field_a = a
+        self.field_b = b
+        self.field_c = c
+        return self.field_a
+
+    def copy_to_user(self):
+        total = self.field_a + self.pad0
+        total += self.field_b + self.pad1
+        total += self.field_c + self.pad2
+        return total
+
+class Attacker:
+    def __init__(self, nlsock):
+        self.nlsock = nlsock
+        self.leaked_ptr = 0
+        self.kaslr_base = 0
+
+    def recv_msg(self, msg):
+        self.leaked_ptr = msg.copy_to_user()
+        self.kaslr_base = self.leaked_ptr - msg.field_a
+        return self.kaslr_base
+
+msg = NetlinkMsg(0, 0, 0)
+msg.init_fields(100, 200, 300)
+attacker = Attacker(3)
+kaslr = attacker.recv_msg(msg)
+print(kaslr)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores field values at aligned offsets but skips padding slots containing stale kernel data (0xFFFF0000, 0x12345678, 0x400200); addl in copy_to_user sums all slots including untouched padding — the stale pointers and canaries flow into the output, defeating KASLR and leaking kernel secrets to unprivileged userspace',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
