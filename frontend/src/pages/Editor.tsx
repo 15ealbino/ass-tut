@@ -12709,6 +12709,92 @@ print(kaslr)
       description: 'movl stores field values at aligned offsets but skips padding slots containing stale kernel data (0xFFFF0000, 0x12345678, 0x400200); addl in copy_to_user sums all slots including untouched padding — the stale pointers and canaries flow into the output, defeating KASLR and leaking kernel secrets to unprivileged userspace',
     },
   },
+  {
+    id: 'l1tf-foreshadow',
+    name: 'L1 TERMINAL FAULT (FORESHADOW)',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'A terminal page fault causes the CPU to speculatively read stale L1 data cache entries from a different security domain, leaking SGX enclave secrets and VM memory.',
+    explanation:
+      'L1 Terminal Fault / Foreshadow (CVE-2018-3615, CVE-2018-3620, CVE-2018-3646 / CWE-200) is a speculative ' +
+      'execution attack on Intel CPUs that exploits the processor\'s behavior when a page table entry (PTE) causes ' +
+      'a terminal fault — the page is marked not-present, reserved-bit-set, or has the accessed/dirty bits cleared. ' +
+      'Instead of immediately halting, the CPU speculatively uses the physical address from the faulting PTE\'s ' +
+      'frame-number bits to index into the L1 data cache and forward whatever data resides there, regardless of which ' +
+      'security domain (enclave, VM, kernel) deposited it. The attacker maps a page with a crafted PTE whose physical ' +
+      'frame number matches the victim\'s target cache line, triggers the terminal fault, and recovers the speculatively ' +
+      'loaded data via a Flush+Reload cache timing side channel. CVE-2018-3615 (CVSS 7.9) targets Intel SGX enclaves: ' +
+      'an attacker on the same core reads sealed enclave secrets — attestation keys, sealed data, private keys — ' +
+      'defeating SGX\'s hardware isolation guarantee. CVE-2018-3620 extracts OS kernel and SMM memory from an ' +
+      'unprivileged process. CVE-2018-3646 enables a malicious VM guest to read another guest\'s or the hypervisor\'s ' +
+      'memory from the shared L1 cache — breaking VM isolation on every major cloud provider. The attack was discovered ' +
+      'by researchers at KU Leuven and independently by Intel, affecting every Intel Core processor from 2008 (Nehalem) ' +
+      'through Coffee Lake. Mitigation requires L1 cache flushing on every VM entry (L1D_FLUSH), microcode updates, ' +
+      'and PTE inversion to prevent physical address leakage through terminal faults. ' +
+      'In the assembly, movl loads the victim\'s secret into a cache-line-aligned stack slot; set_terminal\'s movl ' +
+      'marks the PTE non-present but the physical frame number remains in the entry — cmpl checks the terminal flag ' +
+      'and the speculative path\'s movl reads the stale L1 data; imull multiplies the leaked value by the probe ' +
+      'stride (64) to encode it into a cache line index recoverable via Flush+Reload timing.',
+    code:
+`# CVE pattern: terminal fault speculatively reads stale L1 cache — enclave leak
+class L1Cache:
+    def __init__(self, line_count):
+        self.line_count = line_count
+        self.data = 0
+        self.tag = 0
+        self.valid = 0
+
+    def fill_line(self, phys_addr, secret):
+        self.tag = phys_addr
+        self.data = secret
+        self.valid = 1
+        return self.valid
+
+    def flush(self):
+        self.data = 0
+        self.valid = 0
+        return self.valid
+
+class PageTableEntry:
+    def __init__(self, pfn, present):
+        self.pfn = pfn
+        self.present = present
+        self.accessed = 0
+        self.terminal = 0
+
+    def set_terminal(self):
+        self.present = 0
+        self.terminal = 1
+        return self.terminal
+
+class Attacker:
+    def __init__(self, probe_size):
+        self.probe_size = probe_size
+        self.sampled = 0
+        self.cache_index = 0
+        self.leaked = 0
+
+    def speculate(self, cache, pte):
+        if pte.terminal == 1:
+            self.sampled = cache.data
+        self.cache_index = self.sampled * 64
+        self.leaked = self.sampled
+        return self.leaked
+
+enclave_secret = 3405691582
+l1 = L1Cache(64)
+l1.fill_line(4196352, enclave_secret)
+pte = PageTableEntry(4196352, 1)
+pte.set_terminal()
+attacker = Attacker(256)
+leaked = attacker.speculate(l1, pte)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'imull'],
+      description: 'movl fills the L1 cache line with the enclave secret (0xCAFEBABE) at the victim\'s physical address; set_terminal\'s movl marks the PTE non-present but the physical frame number remains — cmpl checks the terminal flag, and the speculative path\'s movl reads the stale L1 data; imull multiplies the leaked value by the probe stride (64) to encode it into a cache line index recoverable via Flush+Reload timing',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
