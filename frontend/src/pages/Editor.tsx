@@ -12795,6 +12795,93 @@ print(leaked)
       description: 'movl fills the L1 cache line with the enclave secret (0xCAFEBABE) at the victim\'s physical address; set_terminal\'s movl marks the PTE non-present but the physical frame number remains — cmpl checks the terminal flag, and the speculative path\'s movl reads the stale L1 data; imull multiplies the leaked value by the probe stride (64) to encode it into a cache line index recoverable via Flush+Reload timing',
     },
   },
+  {
+    id: 'flop-lvp',
+    name: 'FALSE LOAD OUTPUT PREDICTION (FLOP)',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'The CPU load value predictor guesses wrong data for a memory load, causing dependent speculative operations to compute on attacker-chosen stale values and leak secrets via cache side channels.',
+    explanation:
+      'False Load Output Prediction / FLOP (USENIX Security 2025 / CWE-203) is a speculative execution attack ' +
+      'discovered by researchers at Georgia Tech and Ruhr University Bochum targeting the Load Value Predictor (LVP) ' +
+      'in modern processors — confirmed on Apple M3/M4 and A17 chips. Unlike Spectre, which exploits branch ' +
+      'mispredictions in control flow, FLOP exploits data-dependency predictions: the LVP guesses the value a load ' +
+      'instruction will return before the memory subsystem delivers it, allowing dependent instructions to execute ' +
+      'speculatively on the predicted (wrong) value. An attacker trains the predictor by repeatedly loading a known ' +
+      'constant in a tight loop, then swaps the target pointer to a victim object. The LVP still predicts the trained ' +
+      'constant, but dependent pointer arithmetic and dereferences now operate on the wrong base address — reaching ' +
+      'memory the program would never architecturally access. The transient read results are encoded into cache-line ' +
+      'positions via a Flush+Reload probe array, leaking the secret one byte at a time. The researchers demonstrated ' +
+      'end-to-end browser exploits in Safari and Chrome, recovering location history, calendar events, and credit card ' +
+      'data from cross-origin iframes — all without any user interaction beyond visiting a malicious page. Apple was ' +
+      'notified in September 2024; as of disclosure in January 2025 no microcode or OS patch had been issued. FLOP ' +
+      'affects all Apple chips with an LVP (M3, M4, A17 and later) and the technique generalizes to any processor ' +
+      'implementing aggressive load value prediction. ' +
+      'In the assembly, the training loop\'s movl repeatedly loads the constant into eax, teaching the predictor; ' +
+      'after the pointer swap, movl speculatively returns the trained (wrong) value — imull multiplies it by the ' +
+      'probe stride (256) to index into the Flush+Reload array, encoding the leaked byte into a cache line that ' +
+      'the attacker recovers via timing.',
+    code:
+`# CVE pattern: load value predictor returns trained stale value — cross-origin leak
+class LoadValuePredictor:
+    def __init__(self, history_size):
+        self.history_size = history_size
+        self.trained_val = 0
+        self.confidence = 0
+        self.predicted = 0
+
+    def train(self, constant):
+        for i in range(16):
+            self.trained_val = constant
+            self.confidence += 1
+        return self.confidence
+
+    def predict(self):
+        if self.confidence > 8:
+            self.predicted = self.trained_val
+        return self.predicted
+
+class VictimPage:
+    def __init__(self, secret):
+        self.secret = secret
+        self.base_addr = 4096
+        self.length = 256
+
+    def load_field(self, offset):
+        result = self.secret + offset
+        return result
+
+class Attacker:
+    def __init__(self, probe_size):
+        self.probe_size = probe_size
+        self.probe_hit = 0
+        self.leaked_byte = 0
+        self.cache_idx = 0
+
+    def speculate_load(self, lvp, victim):
+        wrong_val = lvp.predict()
+        self.cache_idx = wrong_val * 256
+        self.leaked_byte = wrong_val
+        return self.leaked_byte
+
+    def flush_reload(self):
+        self.probe_hit = self.cache_idx
+        return self.probe_hit
+
+train_constant = 65
+lvp = LoadValuePredictor(64)
+lvp.train(train_constant)
+victim = VictimPage(3735928559)
+attacker = Attacker(256)
+leaked = attacker.speculate_load(lvp, victim)
+timing = attacker.flush_reload()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull', 'cmpl'],
+      description: 'The training loop\'s movl repeatedly loads the constant (65) into eax, teaching the load value predictor; after the pointer swap to the victim page, movl speculatively returns the trained (wrong) value instead of the real secret — cmpl checks predictor confidence and imull multiplies the mispredicted value by 256 to index the Flush+Reload probe array, encoding the leaked byte into a measurable cache line',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
