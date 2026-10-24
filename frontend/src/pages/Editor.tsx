@@ -12882,6 +12882,78 @@ print(leaked)
       description: 'The training loop\'s movl repeatedly loads the constant (65) into eax, teaching the load value predictor; after the pointer swap to the victim page, movl speculatively returns the trained (wrong) value instead of the real secret — cmpl checks predictor confidence and imull multiplies the mispredicted value by 256 to index the Flush+Reload probe array, encoding the leaked byte into a measurable cache line',
     },
   },
+  {
+    id: 'ssti-template',
+    name: 'SERVER-SIDE TEMPLATE INJECTION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'User input embedded directly into a server-side template expression is evaluated as code, achieving unauthenticated remote code execution.',
+    explanation:
+      'Server-Side Template Injection (SSTI / CWE-1336) occurs when user-controlled input is inserted ' +
+      'directly into a template engine expression — Jinja2, OGNL, Velocity, FreeMarker, Twig — without ' +
+      'sanitization. The template engine evaluates the injected string as code, granting the attacker the ' +
+      'full power of the template runtime: arbitrary method invocation, OS command execution, and file system ' +
+      'access. Unlike SQL injection which targets data stores, SSTI targets the application\'s own code ' +
+      'execution engine. ' +
+      'CVE-2023-22527 (Atlassian Confluence, CVSS 10.0) is the defining example: unauthenticated attackers ' +
+      'injected OGNL expressions into the template_title parameter of the /template/aui/text-inline.vm ' +
+      'endpoint, achieving full RCE on Confluence servers worldwide — CISA added it to the KEV catalog in ' +
+      'January 2024. CVE-2025-49619 (Skyvern, CVSS 8.5) allowed authenticated users to inject Jinja2 ' +
+      'expressions into workflow prompts for blind RCE on the automation backend. CVE-2024-34362 (Vegeta, ' +
+      'CVSS 9.1) exploited Go template injection in HTTP load-testing attack payloads for RCE. SSTI was also ' +
+      'a key component in the Spring4Shell attack chain (CVE-2022-22965). ' +
+      'In the assembly, movl loads the attacker-supplied expression value into the template\'s eval slot; ' +
+      'addl combines it with the base template context without any sandboxing or escaping — the eval_expr\'s ' +
+      'imull executes the injected value as an arithmetic operation, and the result flows directly into ' +
+      'attacker-readable output with no type check or expression whitelist guard.',
+    code:
+`# CVE pattern: user input evaluated as template expression — RCE
+class TemplateEngine:
+    def __init__(self, sandbox):
+        self.sandbox = sandbox
+        self.eval_count = 0
+        self.last_output = 0
+        self.context_base = 0
+
+    def set_context(self, base):
+        self.context_base = base
+        return self.context_base
+
+    def eval_expr(self, user_input):
+        result = self.context_base + user_input
+        self.eval_count += 1
+        return result
+
+    def render(self, expr_result):
+        self.last_output = expr_result * 2
+        return self.last_output
+
+class RequestHandler:
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+        self.served = 0
+        self.response = 0
+
+    def handle(self, engine, user_param):
+        raw = engine.eval_expr(user_param)
+        self.response = engine.render(raw)
+        self.served += 1
+        return self.response
+
+engine = TemplateEngine(0)
+engine.set_context(1000)
+handler = RequestHandler(4196352)
+safe_input = 42
+handler.handle(engine, safe_input)
+malicious = 1094795585
+hijacked = handler.handle(engine, malicious)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['addl', 'imull'],
+      description: 'addl combines the attacker-supplied expression value with the template context base without any escaping or sandbox check; imull in render multiplies the raw eval result — the injected payload (0x41414141) is evaluated as code, not data, and the computed result flows directly into the response with no expression whitelist or type guard',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
