@@ -12954,6 +12954,86 @@ print(hijacked)
       description: 'addl combines the attacker-supplied expression value with the template context base without any escaping or sandbox check; imull in render multiplies the raw eval result — the injected payload (0x41414141) is evaluated as code, not data, and the computed result flows directly into the response with no expression whitelist or type guard',
     },
   },
+  {
+    id: 'heap-grooming',
+    name: 'HEAP GROOMING',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Strategic allocation and deallocation sequence positions an attacker-controlled object in a freed victim slot, turning unreliable corruption into deterministic code execution.',
+    explanation:
+      'Heap grooming (also called heap feng shui) is the exploitation reliability technique that transforms ' +
+      'an unreliable memory corruption primitive — a small overflow, a use-after-free, a double-free — into ' +
+      'deterministic code execution by controlling which objects are adjacent in memory. The attacker first ' +
+      'sprays identical-sized allocations to fill free-list gaps and force the allocator into a predictable ' +
+      'linear state. Then they strategically free specific objects to create "holes" at known positions. ' +
+      'When the vulnerable allocation (or a replacement object) is requested, the allocator places it in ' +
+      'the prepared hole — directly adjacent to an attacker-controlled object. A single-byte overflow from ' +
+      'the victim object now reliably corrupts the attacker\'s adjacent object\'s function pointer or metadata. ' +
+      'CVE-2024-1086 (Linux netfilter nf_tables, CVSS 7.8) used heap grooming to position a page-table-level ' +
+      'object adjacent to a double-freed nf_tables verdict structure, enabling the "Dirty Pagedirectory" ' +
+      'technique for local privilege escalation to root — actively exploited by RansomHub and Akira ransomware ' +
+      'groups. CVE-2023-4863 (libwebp, CVSS 8.8) exploited a Huffman table heap overflow where heap grooming ' +
+      'placed controlled WebP decode buffers adjacent to the overflow source for reliable RCE in Chrome, ' +
+      'Firefox, and Signal. Azeria Labs documented iOS kernel heap grooming using mach port out-of-line ' +
+      'descriptors to pair victim objects with placeholder allocations in the same zone. ' +
+      'In the assembly, the groom loop\'s `addl` fills allocation slots sequentially; after selective frees, ' +
+      '`movl` places the victim object into the prepared hole — the adjacent object\'s handler field is then ' +
+      'overwritten by the overflow, and the subsequent `imull` in dispatch uses the corrupted value as a ' +
+      'code-execution target.',
+    code:
+`# CVE pattern: groom heap layout so overflow corrupts adjacent object
+class Slot:
+    def __init__(self, tag, data):
+        self.tag = tag
+        self.data = data
+        self.active = 1
+
+class Heap:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.count = 0
+        self.total = 0
+        self.last_tag = 0
+
+    def alloc(self, tag, data):
+        slot = Slot(tag, data)
+        self.count += 1
+        self.total += data
+        self.last_tag = tag
+        return slot
+
+    def free(self, slot):
+        slot.active = 0
+        slot.data = 0
+        self.count -= 1
+        return self.count
+
+class Victim:
+    def __init__(self, handler, size):
+        self.handler = handler
+        self.size = size
+        self.corrupted = 0
+
+    def dispatch(self):
+        result = self.handler * self.size
+        return result
+
+heap = Heap(64)
+s0 = heap.alloc(1, 100)
+s1 = heap.alloc(2, 200)
+s2 = heap.alloc(3, 300)
+heap.free(s1)
+victim = Victim(4196352, 2)
+safe_result = victim.dispatch()
+victim.handler = 3735928559
+hijacked = victim.dispatch()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull'],
+      description: 'movl loads the groomed slot data during the alloc loop, building a predictable heap layout; after the strategic free, the victim occupies the hole — imull in dispatch multiplies the now-corrupted handler (0xDEADBEEF) by size, executing attacker-controlled arithmetic where a real exploit would redirect a function pointer to shellcode',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
