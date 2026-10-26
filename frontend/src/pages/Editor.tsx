@@ -13034,6 +13034,67 @@ print(hijacked)
       description: 'movl loads the groomed slot data during the alloc loop, building a predictable heap layout; after the strategic free, the victim occupies the hole — imull in dispatch multiplies the now-corrupted handler (0xDEADBEEF) by size, executing attacker-controlled arithmetic where a real exploit would redirect a function pointer to shellcode',
     },
   },
+  {
+    id: 'missing-authz',
+    name: 'MISSING AUTHORIZATION',
+    severity: 'CRITICAL',
+    category: 'Access Control',
+    description: 'Application authenticates the user but never checks their authorization level, letting any session access admin resources.',
+    explanation:
+      'Missing authorization (CWE-862) is the #4 most dangerous software weakness in the 2025 CWE Top 25 and ' +
+      'the root cause of OWASP A01:2021 Broken Access Control — the #1 risk category in the OWASP Top 10. ' +
+      'The vulnerability occurs when an application verifies WHO a user is (authentication) but never checks WHAT ' +
+      'they are allowed to do (authorization). Any authenticated user — even one with minimal privileges — can ' +
+      'access admin endpoints, modify other users\' data, or invoke privileged operations by changing a resource ' +
+      'ID or URL parameter. CVE-2025-31324 (SAP NetWeaver Visual Composer, CVSS 10.0) is the definitive 2025 ' +
+      'example: the /developmentserver/metadatauploader endpoint performed zero authorization checks, allowing any ' +
+      'request to upload arbitrary JSP webshells and achieve remote code execution — exploited as a zero-day by ' +
+      'multiple threat actors including ransomware groups targeting enterprise SAP systems worldwide, with CISA ' +
+      'adding it to the Known Exploited Vulnerabilities catalog. CVE-2023-22515 (Atlassian Confluence, CVSS 10.0) ' +
+      'exposed internal setup endpoints with no authorization gate, allowing unauthenticated attackers to create ' +
+      'administrator accounts on internet-facing Confluence instances — exploited by a nation-state actor tracked ' +
+      'as Storm-0062 before public disclosure. ' +
+      'In the assembly, cmpl checks session_valid for authentication but no subsequent cmpl tests a user role or ' +
+      'permission level — the branch that loads admin_secret (0xDEADBEEF) is reachable by any authenticated session, ' +
+      'and movl returns the sensitive data without any authorization gate in the instruction stream.',
+    code:
+`# CVE pattern: auth check present but authorization check entirely missing
+class ResourceServer:
+    def __init__(self, admin_key):
+        self.admin_key = admin_key
+        self.user_data = 100
+        self.admin_secret = 3735928559
+        self.session_valid = 0
+        self.access_count = 0
+
+    def login(self, token):
+        if token > 0:
+            self.session_valid = 1
+        return self.session_valid
+
+    def read_resource(self, resource_id):
+        if self.session_valid == 1:
+            if resource_id == 0:
+                result = self.user_data
+            elif resource_id == 1:
+                result = self.admin_secret
+            else:
+                result = 0
+            self.access_count += 1
+        else:
+            result = 0
+        return result
+
+server = ResourceServer(9999)
+server.login(1234)
+stolen = server.read_resource(1)
+print(stolen)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks session_valid for authentication but no cmpl tests a role or permission level before the branch that loads admin_secret — movl returns the sensitive data (0xDEADBEEF) to any authenticated user regardless of privilege level, because the authorization gate is entirely absent from the instruction stream',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
