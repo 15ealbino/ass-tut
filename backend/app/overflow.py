@@ -31,17 +31,19 @@ Scope (deliberately tight, mirroring ``strength.py``'s quiet-signal design):
     and the overwhelmingly common overflow site. Addition / subtraction overflow
     is real but needs operands already near ``INT_MAX``; flagging every ``+``
     would drown the signal, so it is intentionally out of scope.
-  * ``mul-overflow`` fires only when **both** operands are non-literal (a genuine
-    unknown × unknown). A multiply by a literal (``a * 8``) is left to the
-    strength pass — multiplying by a small constant rarely overflows and would
-    just be noise here.
+  * ``mul-overflow`` fires only when **both** operands are non-constant (a genuine
+    unknown × unknown). A multiply by a compile-time constant — a literal (``a *
+    8``) or a folded sub-expression (``a * (4 * 1024)``) — is left to the strength
+    pass; multiplying by a known constant rarely overflows and would just be noise
+    here.
   * ``mul-accumulate`` fires only for an augmented ``*=`` **inside a loop** — the
     accumulator pattern that overflows under repetition. A one-off ``x *= 2`` at
     top level is not flagged.
 
 Risks are derived from the AST, not the assembly, so they are stable across gcc
-versions and never fire on a folded constant expression (``1000 * 1000``), where
-both operands are literals and no runtime overflow can arise.
+versions and never fire on a folded constant expression (``1000 * 1000``, or a
+nested ``a * (4 * 1024)`` whose scaling factor is constant), where the product's
+magnitude is fixed at compile time and no runtime overflow can arise.
 """
 import ast
 from typing import Dict, List, Optional, Tuple
@@ -81,24 +83,26 @@ _MSG_MUL_ACCUMULATE = (
 )
 
 
-def _is_literal(node: ast.expr) -> bool:
-    """True if ``node`` is a compile-time integer literal, including a negated one.
+def _is_constant_expr(node: ast.expr) -> bool:
+    """True if ``node`` is known at compile time: a literal, a unary op on a
+    constant expression, or an arithmetic combination of constant expressions.
 
-    A bare ``ast.Constant`` (``4``) is a literal; so is a unary ``+``/``-`` on a
-    constant (``-4``), which the parser represents as ``UnaryOp(USub, Constant)``
-    rather than a single ``Constant``. Treating the negated form as a literal too
-    keeps ``mul-overflow`` from mis-firing on ``a * -4`` (a constant multiply, not
-    an unknown × unknown). Folded constant-only expressions are thus skipped — no
-    runtime overflow can arise where both operands are known at compile time.
+    A bare ``ast.Constant`` (``4``) is constant; so is a unary ``+``/``-``/``~``
+    on one (``-4``), and — crucially — a *nested* all-constant expression
+    (``2 * 3``, ``4 * 1024``), which the parser leaves as a ``BinOp`` rather than
+    folding. Recursing into ``BinOp`` operands lets ``mul-overflow`` treat
+    ``a * (4 * 1024)`` as the runtime-times-constant multiply it really is (left
+    to the strength pass, like the equivalent ``a * 4096``) instead of mis-reading
+    the parenthesised constant as a second unknown. The result: the hint fires
+    only on a genuine runtime × runtime (unknown × unknown) product, and a fully
+    folded product — at any nesting — is never flagged.
     """
     if isinstance(node, ast.Constant):
         return True
-    if (
-        isinstance(node, ast.UnaryOp)
-        and isinstance(node.op, (ast.USub, ast.UAdd))
-        and isinstance(node.operand, ast.Constant)
-    ):
-        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+        return _is_constant_expr(node.operand)
+    if isinstance(node, ast.BinOp):
+        return _is_constant_expr(node.left) and _is_constant_expr(node.right)
     return False
 
 
@@ -106,15 +110,16 @@ def risk_for_binop(node: ast.BinOp) -> Optional[Tuple[str, str]]:
     """Return ``(kind, message)`` for a single binary-operation node, or ``None``.
 
     Pure and side-effect free so it can be unit-tested without gcc or the AST
-    walk. The one rule: a ``Mult`` whose **both** operands are non-literal (a
+    walk. The one rule: a ``Mult`` whose **both** operands are non-constant (a
     genuine runtime × runtime product) → ``mul-overflow``. Anything else — a
-    non-multiply op, or a multiply where either operand is a literal (``a * 8``,
-    ``1000 * 1000``) — returns ``None``, leaving constant-scaled multiplies to the
-    strength pass and folded constants unflagged.
+    non-multiply op, or a multiply where either operand is a compile-time constant
+    (``a * 8``, ``a * (4 * 1024)``, ``1000 * 1000``) — returns ``None``, leaving
+    constant-scaled multiplies to the strength pass and folded constants
+    unflagged.
     """
     if not isinstance(node.op, ast.Mult):
         return None
-    if _is_literal(node.left) or _is_literal(node.right):
+    if _is_constant_expr(node.left) or _is_constant_expr(node.right):
         return None
     return (KIND_MUL_OVERFLOW, _MSG_MUL_OVERFLOW)
 

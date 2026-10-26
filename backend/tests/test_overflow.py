@@ -109,6 +109,14 @@ def test_risk_for_binop_fires_on_runtime_product(expr):
         "2 * 3",
         "1000 * 1000",
         "-5 * 6",
+        # ── a NESTED constant scaling factor is still a constant multiply, the
+        #    same as `a * 4096` — the parenthesised sub-expression must not be
+        #    mis-read as a second runtime operand ──
+        "a * (4 * 1024)",
+        "(4 * 1024) * a",
+        "n * (2 * 3)",
+        # ── a fully nested constant product overflows nothing at runtime ──
+        "(2 * 3) * (4 * 5)",
         # ── not a multiplication at all ──
         "a + b",
         "a - b",
@@ -216,6 +224,13 @@ def test_collect_empty_for_no_multiplication():
 def test_collect_constant_product_is_not_flagged():
     # A fully constant product is folded by gcc; no runtime overflow can arise.
     assert collect_overflow_risks("x = 1000 * 1000\n") == {}
+
+
+def test_collect_nested_constant_scaling_factor_is_not_flagged():
+    # `n * (4 * 1024)` is a runtime × constant multiply (the same as `n * 4096`),
+    # not an unknown × unknown — the parenthesised constant must not be read as a
+    # second runtime operand. Regression for the nested-literal review finding.
+    assert collect_overflow_risks("size = n * (4 * 1024)\n") == {}
 
 
 def test_collect_syntax_error_returns_empty():
