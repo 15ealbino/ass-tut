@@ -124,6 +124,35 @@ function formatAddressing(counts?: Record<string, number>): string {
   return [...known, ...extra].map(m => `${counts[m]} ${ADDRESSING_LABEL[m] ?? m}`).join(' · ')
 }
 
+// ─── Immediate-operand presentation ────────────────────────────────────────
+// Backend decodes the literal constants each line's asm encodes as immediates —
+// the actual $5 / $9 / $.LC0 values. Where the ADDR chip counts how many
+// operands are immediates, this shows WHICH VALUES they are: the most direct
+// Python→asm link there is (write `x = 5`, see $5 appear), and the place the
+// off-by-one shows up (`for i in range(10)` emits $9, because `i < 10` is lowered
+// to `i <= 9`). The IMM chip lists the values themselves — "5×2 · 7 · 9 · +2 sym"
+// (value×occurrences, then a "+N sym" tail for symbolic $-refs) — and the
+// per-line tooltip shows "imm: 5, 9". Values are sorted ascending by their
+// underlying integer (so -1 < 2 < 10), matching the backend's ordering rather
+// than lexicographic string order.
+function formatImmediateValues(values?: number[]): string {
+  if (!values || values.length === 0) return ''
+  return [...values].sort((a, b) => a - b).join(', ')
+}
+// Render the program-wide value_totals map as "5×2 · 7 · 9" ordered by numeric
+// value, appending a "+N sym" note for symbolic ($.LC0 / $symbol) references.
+function formatImmediateTotals(totals?: Record<string, number>, symbolRefs = 0): string {
+  const parts: string[] = []
+  if (totals) {
+    const entries = Object.entries(totals).sort((a, b) => Number(a[0]) - Number(b[0]))
+    for (const [value, count] of entries) {
+      parts.push(count > 1 ? `${value}×${count}` : `${value}`)
+    }
+  }
+  if (symbolRefs > 0) parts.push(`+${symbolRefs} sym`)
+  return parts.join(' · ')
+}
+
 // ─── Cycle-cost presentation ────────────────────────────────────────────────
 // Backend weights each instruction by an approximate relative cycle cost
 // (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
@@ -13795,6 +13824,26 @@ export default function EditorPage() {
               ADDR:: {formatAddressing(result.addressing_summary.addressing_totals)}
             </span>
           )}
+          {result.immediate_summary && formatImmediateTotals(result.immediate_summary.value_totals, result.immediate_summary.symbol_refs) && (
+            <span
+              title={`Immediate operands — the literal constants the program's asm encodes: ${formatImmediateTotals(result.immediate_summary.value_totals, result.immediate_summary.symbol_refs)}. These are the actual $5 / $9 / $.LC0 values in the machine code — the most direct Python→asm link there is: write 'x = 5' and $5 appears. Watch for the values you did NOT write: 'for i in range(10)' encodes $9, because 'i < 10' is lowered to the 'i <= 9' test 'cmpl $9' — the loop bound in the asm is off-by-one from your source. 'N×M' means value N appears on M instructions; '+K sym' counts symbolic $-operands (a $.LC0 pointer into the read-only string pool, or a $symbol address) that carry no numeric value. Where ADDR:: counts how many operands are immediates, IMM:: shows which values they are.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              IMM:: {formatImmediateTotals(result.immediate_summary.value_totals, result.immediate_summary.symbol_refs)}
+            </span>
+          )}
           {result.cycle_summary && result.cycle_summary.total_cycles > 0 && (
             <span
               title={`Cycle-cost estimate — a latency-weighted sharpening of the raw instruction count. Each instruction carries an approximate relative cost (integer divide ≈20, multiply/call ≈3-4, most staples 1); this is their sum across the program. Compare it with COST:: — the gap shows how much apparent work is a few genuinely expensive operations versus many cheap ones. The costliest Python line is not always the one with the most instructions. NOTE: coarse relative teaching estimates, not cycle-accurate figures.`}
@@ -13888,6 +13937,9 @@ export default function EditorPage() {
             const addrTitle = formatAddressing(mapping.addressing_counts)
               ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
               : ''
+            const immTitle = formatImmediateValues(mapping.immediates)
+              ? ` — imm: ${formatImmediateValues(mapping.immediates)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -13908,7 +13960,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${immTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
