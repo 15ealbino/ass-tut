@@ -174,6 +174,32 @@ function formatHintTotals(totals?: Record<string, number>): string {
     .join(' · ')
 }
 
+// ─── Integer-overflow risk presentation ───────────────────────────────────
+// Backend flags multiplication that can silently overflow the 32-bit C `int`
+// the transpiler emits: a runtime × runtime product (mul-overflow) or an
+// in-place `*=` accumulator inside a loop (mul-accumulate). The marker is the
+// compact glyph shown next to a flagged line in the TRACE legend; the label
+// names the kind in tooltips. Order matches the backend's stable kind order.
+const OVERFLOW_ORDER = ['mul-overflow', 'mul-accumulate'] as const
+const OVERFLOW_MARKER: Record<string, string> = {
+  'mul-overflow': '∞',    // unknown × unknown — product can exceed INT_MAX
+  'mul-accumulate': '×↻', // accumulator in a loop — overflows fast
+}
+const OVERFLOW_LABEL: Record<string, string> = {
+  'mul-overflow': 'runtime × runtime → 32-bit imul can wrap',
+  'mul-accumulate': 'loop `*=` accumulator → overflows fast',
+}
+
+// Render a risk-count map as "runtime × runtime → 32-bit imul can wrap 2 · ..."
+// in the stable OVERFLOW_ORDER, skipping kinds the backend already omitted.
+function formatOverflowTotals(totals?: Record<string, number>): string {
+  if (!totals) return ''
+  return OVERFLOW_ORDER
+    .filter(k => (totals[k] ?? 0) > 0)
+    .map(k => `${OVERFLOW_LABEL[k] ?? k} ${totals[k]}`)
+    .join(' · ')
+}
+
 // ─── Vulnerability catalogue ───────────────────────────────────────────────
 
 interface Vuln {
@@ -13855,6 +13881,26 @@ export default function EditorPage() {
               HINTS:: {result.strength_summary.hints.length}
             </span>
           )}
+          {result.overflow_summary?.risk_totals && formatOverflowTotals(result.overflow_summary.risk_totals) && (
+            <span
+              title={`Integer-overflow risks — multiplication that can silently wrap the 32-bit C int the transpiler emits: ${formatOverflowTotals(result.overflow_summary.risk_totals)}. Python ints are arbitrary precision, but the emitted C int is 32-bit signed (INT_MAX 2,147,483,647); a product above that wraps with no error (CWE-190). Click a flagged line below to see the imul it becomes.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              OVERFLOW:: {result.overflow_summary.risks.length}
+            </span>
+          )}
           {result.python_lines.map((line, i) => {
             const pyLine = i + 1
             const mapping = result.line_map[pyLine] as LineMapping | undefined
@@ -13878,6 +13924,10 @@ export default function EditorPage() {
             const hints = mapping.strength_hints ?? []
             const hintTitle = hints.length
               ? `\n${hints.map(h => `⚡ ${HINT_LABEL[h.kind] ?? h.kind}: ${h.message}`).join('\n')}`
+              : ''
+            const overflow = mapping.overflow_hints ?? []
+            const overflowTitle = overflow.length
+              ? `\n${overflow.map(o => `∞ ${OVERFLOW_LABEL[o.kind] ?? o.kind}: ${o.message}`).join('\n')}`
               : ''
             const branchTitle = formatBranchSenses(mapping.branch_sense_counts)
               ? ` — branch: ${formatBranchSenses(mapping.branch_sense_counts)}`
@@ -13908,7 +13958,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}${overflowTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
@@ -13928,6 +13978,15 @@ export default function EditorPage() {
                     style={{ color: 'var(--cyan)', marginLeft: 3, fontWeight: 700 }}
                   >
                     {HINT_MARKER[h.kind] ?? '⚡'}
+                  </span>
+                ))}
+                {overflow.map(o => (
+                  <span
+                    key={o.kind}
+                    style={{ color: 'var(--red)', marginLeft: 3, fontWeight: 700 }}
+                    title={OVERFLOW_LABEL[o.kind] ?? o.kind}
+                  >
+                    {OVERFLOW_MARKER[o.kind] ?? '∞'}
                   </span>
                 ))}
               </button>
