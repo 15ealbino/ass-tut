@@ -13095,6 +13095,71 @@ print(stolen)
       description: 'cmpl checks session_valid for authentication but no cmpl tests a role or permission level before the branch that loads admin_secret — movl returns the sensitive data (0xDEADBEEF) to any authenticated user regardless of privilege level, because the authorization gate is entirely absent from the instruction stream',
     },
   },
+  {
+    id: 'cr0-wp-flip',
+    name: 'CR0 WRITE-PROTECT DISABLE',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Kernel arbitrary-write primitive clears the CR0.WP bit, disabling CPU write protection so supervisor-mode code can patch read-only pages including the vDSO and kernel text.',
+    explanation:
+      'The x86 CR0 control register\'s WP (Write Protect) bit — bit 16, value 0x10000 — tells the CPU whether ' +
+      'to enforce page-table write protection for ring-0 (supervisor) code. When WP=1, the kernel respects read-only ' +
+      'page permissions; when WP=0, every page becomes writable from supervisor mode regardless of PTE flags. ' +
+      'An attacker who gains a kernel arbitrary-write primitive (via heap overflow, UAF, or OOB write) can clear ' +
+      'CR0.WP with a single write, instantly defeating all page-level write protection. This lets them patch the ' +
+      'vDSO (injecting code every userspace process maps), overwrite kernel text (replacing security checks with NOPs), ' +
+      'or modify modprobe_path for root. The threat was serious enough that Linux 5.1 (2019) added CR pinning — ' +
+      'native_write_cr0() now verifies the WP bit stays set and warns if an exploit tries to clear it. Kees Cook ' +
+      'noted that multiple real-world exploits had used native_write_cr0/cr4 to disable SMEP, SMAP, and WP as part ' +
+      'of their escalation paths. Even with pinning, a ROP chain can bypass the check by jumping directly to a ' +
+      'MOV CR0 instruction, as the kernel hardening discussion explicitly acknowledged. Embedded systems, older ' +
+      'kernels (pre-5.1), and hypervisors without paravirtualized CR pinning remain fully vulnerable. ' +
+      'In the assembly, movl zeroes the CR0 field; cmpl then evaluates wp_enabled as 0, so the branch guarding ' +
+      'the read-only page write falls through — movl writes the attacker payload (0xDEADBEEF) into the vDSO code ' +
+      'slot, patching read-only kernel text because supervisor write protection is disabled.',
+    code:
+`# CVE pattern: kernel write clears CR0.WP — all pages become writable
+class CPU:
+    def __init__(self, cr0, cr3):
+        self.cr0 = cr0
+        self.cr3 = cr3
+        self.wp_enabled = 1
+        self.ring = 0
+
+    def check_wp(self):
+        if self.cr0 >= 65536:
+            self.wp_enabled = 1
+        else:
+            self.wp_enabled = 0
+        return self.wp_enabled
+
+class KernelPage:
+    def __init__(self, vdso_code, readonly):
+        self.vdso_code = vdso_code
+        self.readonly = readonly
+        self.patched = 0
+
+    def supervisor_write(self, cpu, payload):
+        if cpu.wp_enabled == 0:
+            self.vdso_code = payload
+            self.patched = 1
+        return self.patched
+
+cpu = CPU(65536, 4194304)
+vdso = KernelPage(4196352, 1)
+cpu.check_wp()
+vdso.supervisor_write(cpu, 3735928559)
+cpu.cr0 = 0
+cpu.check_wp()
+vdso.supervisor_write(cpu, 3735928559)
+result = vdso.vdso_code + vdso.patched
+print(result)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl zeroes the CR0 field (WP bit cleared); cmpl evaluates wp_enabled as 0 so the read-only guard branch falls through — the next movl writes the attacker payload (0xDEADBEEF) into the vDSO code page, patching kernel text because supervisor write protection is disabled',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
