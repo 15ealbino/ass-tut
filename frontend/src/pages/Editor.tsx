@@ -13160,6 +13160,78 @@ print(result)
       description: 'movl zeroes the CR0 field (WP bit cleared); cmpl evaluates wp_enabled as 0 so the read-only guard branch falls through — the next movl writes the attacker payload (0xDEADBEEF) into the vDSO code page, patching kernel text because supervisor write protection is disabled',
     },
   },
+  {
+    id: 'retspill-stack-reuse',
+    name: 'RETSPILL STACK REUSE',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'User-controlled register values spilled onto the kernel stack become ROP gadget addresses after a control-flow hijack, bypassing SMEP, SMAP, and stack canaries.',
+    explanation:
+      'RetSpill (ACM CCS 2023) exploits the fact that user-space register values are preserved on the kernel ' +
+      'stack across syscall entry. When a user-mode program issues a syscall, the CPU saves registers (rax, rdi, ' +
+      'rsi, rdx, r8–r15) into the pt_regs structure at the top of the kernel stack. As the syscall handler and its ' +
+      'callees execute, the compiler spills additional callee-saved registers onto deeper stack frames — these still ' +
+      'hold the user-controlled values from before the syscall. If an attacker triggers a control-flow hijack bug ' +
+      '(UAF, OOB write) during the syscall, the kernel stack already contains attacker-chosen values at predictable ' +
+      'offsets. A single stack-pivot gadget (e.g. "add rsp, 0x40; ret") lands in the spilled region, and the ret ' +
+      'instruction pops attacker-controlled values as return addresses — forming a complete ROP chain that calls ' +
+      'commit_creds(init_cred) for root, all without injecting any data. The technique bypasses SMEP (no user-page ' +
+      'execution), SMAP (no user-page read), KPTI (kernel pages only), and stack canaries (the canary is never ' +
+      'overwritten — the pivot jumps past it). Researchers built end-to-end root exploits for 20 of 22 real-world ' +
+      'kernel CVEs using this technique. RANDKSTACK adds only ~5 bits of entropy to the kernel stack base, which a ' +
+      'ret-sled or repeated attempts can brute-force. The proposed defense — moving pt_regs to a separate heap ' +
+      'allocation — incurs ~0.6% overhead. ' +
+      'In the assembly, movl loads attacker-chosen gadget addresses into user_rdi, user_rsi, and user_rdx fields ' +
+      '(simulating the pt_regs spill at syscall entry); after the control-flow hijack, pivot\'s addl shifts the ' +
+      'stack pointer past the canary into the spilled region — the subsequent addl in execute_chain sums the ' +
+      'spilled values as if popping them as return addresses, forming the ROP chain to commit_creds(init_cred).',
+    code:
+`# CVE pattern: user regs spilled to kernel stack become ROP chain — root
+class PtRegs:
+    def __init__(self, rax, rdi, rsi, rdx):
+        self.user_rax = rax
+        self.user_rdi = rdi
+        self.user_rsi = rsi
+        self.user_rdx = rdx
+        self.spill_depth = 0
+
+    def syscall_entry(self):
+        self.spill_depth = self.user_rax + self.user_rdi
+        self.spill_depth += self.user_rsi + self.user_rdx
+        return self.spill_depth
+
+class KernelStack:
+    def __init__(self, canary, ret_addr):
+        self.canary = canary
+        self.ret_addr = ret_addr
+        self.rsp_offset = 0
+        self.hijacked = 0
+
+    def pivot(self, offset):
+        self.rsp_offset = offset
+        self.hijacked = 1
+        return self.rsp_offset
+
+    def execute_chain(self, regs):
+        result = regs.user_rdi + regs.user_rsi
+        result += regs.user_rdx
+        return result
+
+gadget_pop_rdi = 4196352
+gadget_commit = 4196608
+init_cred_addr = 4217856
+regs = PtRegs(59, gadget_pop_rdi, gadget_commit, init_cred_addr)
+regs.syscall_entry()
+kstack = KernelStack(305419896, 4196096)
+kstack.pivot(64)
+root_shell = kstack.execute_chain(regs)
+print(root_shell)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl loads attacker-chosen gadget addresses into user_rdi, user_rsi, and user_rdx stack slots (simulating pt_regs spill at syscall entry); pivot\'s addl shifts past the stack canary into the spilled region — execute_chain\'s addl sums the spilled values as popped return addresses, forming a commit_creds(init_cred) ROP chain without overwriting the canary or touching user-space pages',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
