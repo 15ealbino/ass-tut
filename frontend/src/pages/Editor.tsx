@@ -13232,6 +13232,79 @@ print(root_shell)
       description: 'movl loads attacker-chosen gadget addresses into user_rdi, user_rsi, and user_rdx stack slots (simulating pt_regs spill at syscall entry); pivot\'s addl shifts past the stack canary into the spilled region — execute_chain\'s addl sums the spilled values as popped return addresses, forming a commit_creds(init_cred) ROP chain without overwriting the canary or touching user-space pages',
     },
   },
+  {
+    id: 'page-spray',
+    name: 'PAGE-LEVEL UAF SPRAY',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Freed physical page reclaimed by attacker-sprayed allocation through the buddy allocator, turning a page-granularity UAF into credential overwrite for root.',
+    explanation:
+      'Page spray targets the Linux kernel\'s buddy allocator — the page-level memory manager beneath the SLUB ' +
+      'slab allocator. When a kernel bug frees a page that is still mapped or referenced (a page-level UAF), ' +
+      'the page returns to the buddy allocator\'s free lists. The attacker then sprays page-sized allocations ' +
+      '(via sendmsg, msgsnd, or pipe writes) to reclaim that exact physical page with controlled content. ' +
+      'Because the stale reference still points to the same physical address, subsequent kernel reads or writes ' +
+      'through it operate on attacker-controlled data. A common target is the cred structure: if the freed page ' +
+      'held a task\'s credentials, the sprayed page overwrites uid/gid fields with zero, granting root. ' +
+      'CVE-2022-0995 (watch_queue out-of-bounds write) was exploited via the PageJack technique: the OOB write ' +
+      'corrupted a pipe_buffer\'s page pointer, creating a page-UAF that was leveraged to overwrite cred structs ' +
+      'for privilege escalation. CVE-2022-27666 (esp6 stack buffer overflow) similarly enabled page-level ' +
+      'reclamation. A 2024 USENIX Security study by Guo et al. systematically analyzed 21 valid page-spray call ' +
+      'sites across networking and pipe subsystems, proposing the DIRTYPAGE exploit model for this class. Unlike ' +
+      'slab-level cross-cache attacks, page spray bypasses SLUB hardening (random freelists, quarantine) entirely ' +
+      'because it operates one allocator layer below — directly manipulating physical page frames. ' +
+      'In the assembly, movl zeroes the page\'s refcount field (simulating the buddy-allocator free); the spray ' +
+      'loop\'s addl accumulates attacker payload across iterations; movl then loads the sprayed value into the ' +
+      'stale page reference — addl in read() sums the now-attacker-controlled data as if it were legitimate ' +
+      'credential fields, producing uid=0 for root.',
+    code:
+`# CVE pattern: freed page reclaimed by spray — stale ref reads attacker creds
+class Page:
+    def __init__(self, pfn, data):
+        self.pfn = pfn
+        self.data = data
+        self.refcount = 1
+        self.freed = 0
+
+    def read(self):
+        result = self.data + self.pfn
+        return result
+
+class BuddyAlloc:
+    def __init__(self, pool_size):
+        self.pool_size = pool_size
+        self.free_count = 0
+        self.spray_total = 0
+        self.last_spray = 0
+
+    def release(self, page):
+        page.refcount = 0
+        page.freed = 1
+        self.free_count += 1
+        return self.free_count
+
+    def spray(self, payload, count):
+        i = 0
+        while i < count:
+            self.spray_total += payload
+            self.last_spray = payload
+            i += 1
+        return self.last_spray
+
+buddy = BuddyAlloc(65536)
+page = Page(42, 4196352)
+buddy.release(page)
+spray_val = buddy.spray(3735928559, 8)
+page.data = spray_val
+page.pfn = 0
+leaked = page.read()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl zeroes the page refcount and freed flag (returning the page to the buddy allocator); the spray loop\'s addl accumulates the attacker payload (0xDEADBEEF) across 8 iterations; movl then loads the sprayed value into the stale page.data field — addl in read() sums the attacker-controlled data as legitimate credential content, producing uid=0 for root privilege escalation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
