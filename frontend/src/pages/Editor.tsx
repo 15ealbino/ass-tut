@@ -13305,6 +13305,81 @@ print(leaked)
       description: 'movl zeroes the page refcount and freed flag (returning the page to the buddy allocator); the spray loop\'s addl accumulates the attacker payload (0xDEADBEEF) across 8 iterations; movl then loads the sprayed value into the stale page.data field — addl in read() sums the attacker-controlled data as legitimate credential content, producing uid=0 for root privilege escalation',
     },
   },
+  {
+    id: 'branch-privilege-injection',
+    name: 'BRANCH PRIVILEGE INJECTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Branch predictor race condition during privilege transitions leaks kernel memory to user-space via speculative execution.',
+    explanation:
+      'Branch Privilege Injection (BPI), disclosed by ETH Zurich researchers at USENIX Security 2025 and tracked ' +
+      'as CVE-2024-45332, exploits a race condition in Intel\'s Branch Prediction Unit (BPU). The BPU updates its ' +
+      'internal state asynchronously — branch outcomes from user-space instructions are still being committed to the ' +
+      'Branch Target Buffer (BTB) as the CPU transitions into kernel mode via syscall. This means a user-space ' +
+      'branch can train the predictor to redirect a kernel-mode indirect branch to an attacker-chosen gadget address. ' +
+      'The speculative execution window at the mispredicted target reads kernel memory into a microarchitectural ' +
+      'side channel (such as the L1 cache), which the attacker recovers via Flush+Reload. This bypasses all existing ' +
+      'hardware mitigations — eIBRS, IBPB, and BHI_DIS_S — because the training happens within the same logical ' +
+      'core during a privilege transition, not across cores or VMs. The researchers demonstrated leaking kernel memory ' +
+      'at 5.6 KB/s on Intel Raptor Lake. Every Intel CPU since 9th-gen Coffee Lake Refresh (2018) is affected; AMD ' +
+      'and Arm processors do not exhibit asynchronous predictor updates and are not vulnerable. Intel released ' +
+      'microcode updates in May 2025 to serialize predictor state across privilege boundaries. ' +
+      'In the assembly, the training loop\'s repeated movl writes the attacker-chosen target into the BTB; after the ' +
+      'simulated privilege transition (movl flips the privilege flag), the kernel\'s indirect branch speculatively ' +
+      'follows the trained prediction — movl loads the kernel secret into the cache line and addl accumulates the ' +
+      'leaked value into the side-channel buffer, completing cross-privilege speculative disclosure.',
+    code:
+`# CVE pattern: BPU race trains kernel branch during privilege transition
+class BranchPredictor:
+    def __init__(self):
+        self.btb_target = 0
+        self.train_count = 0
+        self.prediction = 0
+
+    def train(self, target, rounds):
+        i = 0
+        while i < rounds:
+            self.btb_target = target
+            self.train_count += 1
+            i += 1
+        self.prediction = self.btb_target
+        return self.prediction
+
+class CPU:
+    def __init__(self):
+        self.privilege = 0
+        self.kernel_secret = 3735929054
+        self.cache_line = 0
+        self.leaked = 0
+
+    def syscall_enter(self):
+        self.privilege = 1
+        return self.privilege
+
+    def speculative_read(self, bpu):
+        if bpu.prediction > 0:
+            self.cache_line = self.kernel_secret
+            self.leaked += self.cache_line
+        return self.leaked
+
+    def flush_reload(self):
+        result = self.leaked
+        self.leaked = 0
+        return result
+
+bpu = BranchPredictor()
+cpu = CPU()
+bpu.train(4198400, 1024)
+cpu.syscall_enter()
+cpu.speculative_read(bpu)
+leaked = cpu.flush_reload()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'The training loop\'s movl repeatedly writes the attacker-chosen target into btb_target; cmpl drives 1024 iterations to cement the BTB prediction; after syscall_enter() flips the privilege flag via movl, speculative_read() follows the trained prediction — movl loads kernel_secret into cache_line and addl accumulates it into the leaked side-channel buffer, completing cross-privilege speculative disclosure',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
