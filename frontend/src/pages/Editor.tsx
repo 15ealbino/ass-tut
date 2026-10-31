@@ -13380,6 +13380,73 @@ print(leaked)
       description: 'The training loop\'s movl repeatedly writes the attacker-chosen target into btb_target; cmpl drives 1024 iterations to cement the BTB prediction; after syscall_enter() flips the privilege flag via movl, speculative_read() follows the trained prediction — movl loads kernel_secret into cache_line and addl accumulates it into the leaked side-channel buffer, completing cross-privilege speculative disclosure',
     },
   },
+  {
+    id: 'dll-search-hijack',
+    name: 'DLL SEARCH ORDER HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Application loads a shared library from an attacker-writable directory before the legitimate system path, executing malicious code with the application\'s privileges.',
+    explanation:
+      'DLL/shared-object search order hijacking (CWE-427) exploits the way operating systems resolve library ' +
+      'names to file paths. On Windows, LoadLibrary() walks a default search order — application directory, ' +
+      'current working directory, system directories — and loads the first matching DLL it finds. On Linux, the ' +
+      'dynamic linker (ld.so) checks LD_LIBRARY_PATH, RPATH/RUNPATH, and /etc/ld.so.cache before /usr/lib. ' +
+      'If any earlier directory in the search order is writable by an attacker, they plant a malicious library ' +
+      'with the same name as the legitimate one; the loader picks it up first and executes its initialization ' +
+      'code (DllMain or __attribute__((constructor))) with the host process\'s privilege level. When the victim ' +
+      'process is a SYSTEM service, installer, or setuid binary, the attacker achieves local privilege escalation. ' +
+      'CVE-2024-39708 (Delinea Privilege Manager) allowed unprivileged users to escalate to SYSTEM because the ' +
+      'agent service loaded a DLL from C:\\Windows\\Temp — a directory writable by standard users — before checking ' +
+      'system directories. CVE-2025-9164 (Docker Desktop Installer, CVSS 8.8) searched the user\'s Downloads ' +
+      'folder before system paths, enabling LPE via a planted DLL. CVE-2025-22458 (Ivanti Endpoint Manager) ' +
+      'loaded DLLs from the Vulscan update directory without path qualification, and a SYSTEM-level scheduled task ' +
+      'executed the planted library. MITRE ranks CWE-427 in the 2024 CWE Top 25 most dangerous weaknesses. ' +
+      'In the assembly, cmpl checks each search-path entry in priority order; movl loads the first non-zero ' +
+      'entry — the attacker\'s planted library address in slot 0 — directly into the execution target without ' +
+      'signature verification or path validation; addl combines it with the host privilege level, simulating ' +
+      'the malicious DllMain running with SYSTEM rights.',
+    code:
+`# CVE pattern: loader picks attacker DLL from untrusted search path first
+class SearchPath:
+    def __init__(self, cwd, app_dir, sys_dir):
+        self.cwd = cwd
+        self.app_dir = app_dir
+        self.sys_dir = sys_dir
+        self.count = 3
+
+class DynLoader:
+    def __init__(self, priv_level):
+        self.priv_level = priv_level
+        self.loaded_addr = 0
+        self.loaded = 0
+
+    def resolve(self, path):
+        if path.cwd > 0:
+            self.loaded_addr = path.cwd
+        elif path.app_dir > 0:
+            self.loaded_addr = path.app_dir
+        else:
+            self.loaded_addr = path.sys_dir
+        self.loaded = 1
+        return self.loaded_addr
+
+    def run_init(self):
+        result = self.loaded_addr + self.priv_level
+        return result
+
+malicious_dll = 3735928559
+legit_lib = 4196352
+search = SearchPath(malicious_dll, 0, legit_lib)
+loader = DynLoader(9999)
+loader.resolve(search)
+hijacked = loader.run_init()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'cmpl checks each search-path slot in priority order; movl loads the first non-zero entry — the attacker\'s planted library address (0xDEADBEEF) from the CWD slot — directly into loaded_addr without signature validation; addl in run_init combines the hijacked address with the host\'s privilege level, simulating the malicious DllMain/constructor executing with SYSTEM rights',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
