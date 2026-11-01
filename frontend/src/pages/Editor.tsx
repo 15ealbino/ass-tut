@@ -13447,6 +13447,65 @@ print(hijacked)
       description: 'cmpl checks each search-path slot in priority order; movl loads the first non-zero entry — the attacker\'s planted library address (0xDEADBEEF) from the CWD slot — directly into loaded_addr without signature validation; addl in run_init combines the hijacked address with the host\'s privilege level, simulating the malicious DllMain/constructor executing with SYSTEM rights',
     },
   },
+  {
+    id: 'crypto-nonce-reuse',
+    name: 'CRYPTO NONCE REUSE',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Reusing a nonce with the same key in AES-GCM produces identical keystreams, letting an attacker recover plaintext and forge authentication tags.',
+    explanation:
+      'AES-GCM and all CTR-mode ciphers generate a deterministic keystream from the (key, nonce) pair. ' +
+      'If the same pair encrypts two messages, both ciphertexts share the identical keystream; XORing ' +
+      'the ciphertexts cancels it, revealing the XOR of the two plaintexts. If one plaintext is known ' +
+      'or guessable, the other is recovered directly. Joux\'s "forbidden attack" goes further: two ' +
+      'ciphertexts sharing a nonce leak the GHASH authentication key H, enabling the attacker to forge ' +
+      'valid tags for arbitrary messages — breaking both confidentiality and integrity. ' +
+      'CVE-2026-59099 (Apereo CAS, CVSS 9.3) used a fixed all-zero AES-GCM IV for every encryption, ' +
+      'letting unauthenticated attackers decrypt session state via known-plaintext analysis. ' +
+      'CVE-2026-81019 (wolfProvider pre-1.2.2) set the explicit GCM nonce once at TLS key setup and ' +
+      'never incremented it, reusing the same nonce for every record. CVE-2017-13077 (KRACK) forced ' +
+      'WPA2 four-way handshake nonce reuse by replaying message 3, breaking Wi-Fi confidentiality. ' +
+      'In the assembly, movl loads the same nonce value for both encrypt calls; imull and addl compute ' +
+      'an identical keystream; subl on the two ciphertexts cancels the repeated keystream entirely, ' +
+      'leaving the secret plaintext exposed in the result register.',
+    code:
+`# CVE pattern: GCM nonce reused — keystream repeats, plaintext leaks
+class Cipher:
+    def __init__(self, key):
+        self.key = key
+        self.nonce = 0
+        self.stream = 0
+
+    def set_nonce(self, n):
+        self.nonce = n
+
+    def encrypt(self, plaintext):
+        ks = self.key * self.nonce
+        ks += 31337
+        self.stream = ks
+        ct = plaintext + ks
+        return ct
+
+key = 57005
+secret = 387159
+known = 65535
+
+c = Cipher(key)
+c.set_nonce(42)
+ct1 = c.encrypt(secret)
+
+c.set_nonce(42)
+ct2 = c.encrypt(known)
+
+leak = ct1 - ct2
+recovered = leak + known
+print(recovered)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull', 'addl', 'subl'],
+      description: 'movl loads the same nonce value (42) for both encrypt calls; imull and addl compute an identical keystream from key*nonce+31337; subl on the two ciphertexts cancels the repeated keystream entirely, leaving the secret plaintext exposed in the result register',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
