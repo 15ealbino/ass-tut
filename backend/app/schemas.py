@@ -104,6 +104,16 @@ class LineMapping(BaseModel):
     # Counts are of operands; only nonzero modes are present. Empty for the
     # pyghidra pipeline, which computes no per-line addressing map.
     addressing_counts: Dict[str, int] = Field(default_factory=dict)
+    # Immediate-operand map: the literal constants this Python line bakes into its
+    # machine code, split by kind ("decimal" $5 / "hex" $0x10 / "symbol" an address
+    # constant like $.LC0). `immediate_counts` counts immediate operands (zeros
+    # omitted, stable order decimal < hex < symbol); `immediate_values` lists the
+    # DISTINCT numeric values the line embeds (decimal + hex folded to int, sorted
+    # ascending; symbol immediates have no value and are excluded). Where
+    # addressing_counts only tells you an operand is an immediate, these name the
+    # constant. Empty for the pyghidra pipeline, which computes no per-line map.
+    immediate_counts: Dict[str, int] = Field(default_factory=dict)
+    immediate_values: List[int] = Field(default_factory=list)
 
 
 class Hotspot(BaseModel):
@@ -218,6 +228,22 @@ class AddressingSummary(BaseModel):
     addressing_totals: Dict[str, int] = Field(default_factory=dict)
 
 
+class ImmediateSummary(BaseModel):
+    # Program-wide immediate-operand map. Complements AddressingSummary: that pass
+    # only counts how many operands are immediates; this one names the constants.
+    #   immediate_totals — each immediate kind ("decimal" / "hex" / "symbol")
+    #                      mapped to the number of immediate operands of that kind,
+    #                      in stable display order (decimal < hex < symbol) with
+    #                      zero kinds omitted. Empty when the program has no
+    #                      immediate operands at all.
+    #   distinct_values  — every distinct NUMERIC value the program bakes in
+    #                      (decimal + hex immediates folded to int), sorted
+    #                      ascending. A "symbol" immediate ($.LC0) is an address
+    #                      constant with no numeric value and is not listed here.
+    immediate_totals: Dict[str, int] = Field(default_factory=dict)
+    distinct_values: List[int] = Field(default_factory=list)
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -267,6 +293,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # addressing map).
     addressing_summary: Optional[AddressingSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line
+    # immediate-operand map).
+    immediate_summary: Optional[ImmediateSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
