@@ -75,6 +75,14 @@ export interface LineMapping {
   // (%gs:/%fs:) mode is the stack-canary access -fstack-protector-strong emits.
   // Counts are of operands; only nonzero modes are present.
   addressing_counts?: Record<string, number>
+  // Immediate-operand map: the literal constants this line bakes into its machine
+  // code, split by kind (decimal $5 / hex $0x10 / symbol an address constant like
+  // $.LC0). immediate_counts counts immediate operands (zeros omitted); the
+  // immediate_values list is the distinct numeric values the line embeds (decimal
+  // + hex folded to int, sorted). Where addressing_counts only says an operand IS
+  // an immediate, these name the constant — your `x = 5` baked in as `$5`.
+  immediate_counts?: Record<string, number>
+  immediate_values?: number[]
 }
 
 export interface StrengthHint {
@@ -190,6 +198,18 @@ export interface AddressingSummary {
   addressing_totals: Record<string, number>
 }
 
+export interface ImmediateSummary {
+  // Program-wide immediate-operand map. Complements AddressingSummary, which only
+  // counts how many operands are immediates: immediate_totals maps each kind
+  // (decimal / hex / symbol) to its operand count in stable display order
+  // (decimal < hex < symbol, zeros omitted); distinct_values lists every distinct
+  // numeric value the program bakes in (decimal + hex folded to int, sorted
+  // ascending). A "symbol" immediate ($.LC0) is an ADDRESS constant with no
+  // numeric value, so it is counted but not listed in distinct_values.
+  immediate_totals: Record<string, number>
+  distinct_values: number[]
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -220,6 +240,8 @@ export interface CompileResponse {
   branch_summary?: BranchSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
   addressing_summary?: AddressingSummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  immediate_summary?: ImmediateSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
   // Source-level arithmetic strength hints (transpile pipeline); null/absent for

@@ -124,6 +124,36 @@ function formatAddressing(counts?: Record<string, number>): string {
   return [...known, ...extra].map(m => `${counts[m]} ${ADDRESSING_LABEL[m] ?? m}`).join(' · ')
 }
 
+// ─── Immediate-operand presentation ─────────────────────────────────────────
+// Where the addressing map only COUNTS how many operands are immediates, this
+// names the constants: each immediate operand is a decimal value ($5), a hex
+// value ($0x10), or a symbolic ADDRESS constant ($.LC0 — the address of a string
+// / printf format string in read-only data, not a numeric value). The dec/hex vs
+// sym split is the first read an RE makes on an operand — is this a value or a
+// pointer? — and the recovered numeric values let you read your own `x = 5`
+// straight out of the machine code, alongside the constants the compiler
+// synthesized that you never typed. Rendered "2 dec · 1 sym" in the IMM chip and
+// per-line tooltips, zero kinds omitted (matches the backend map).
+const IMMEDIATE_ORDER = ['decimal', 'hex', 'symbol'] as const
+const IMMEDIATE_LABEL: Record<string, string> = {
+  decimal: 'dec',
+  hex: 'hex',
+  symbol: 'sym',
+}
+function formatImmediates(counts?: Record<string, number>): string {
+  if (!counts) return ''
+  const known = IMMEDIATE_ORDER.filter(k => (counts[k] ?? 0) > 0) as string[]
+  const extra = Object.keys(counts)
+    .filter(k => !(IMMEDIATE_ORDER as readonly string[]).includes(k) && counts[k] > 0)
+    .sort()
+  return [...known, ...extra].map(k => `${counts[k]} ${IMMEDIATE_LABEL[k] ?? k}`).join(' · ')
+}
+// Render the distinct numeric constants a line / the program bakes in, compactly.
+function formatImmediateValues(values?: number[]): string {
+  if (!values || values.length === 0) return ''
+  return values.join(', ')
+}
+
 // ─── Cycle-cost presentation ────────────────────────────────────────────────
 // Backend weights each instruction by an approximate relative cycle cost
 // (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
@@ -14281,6 +14311,26 @@ export default function EditorPage() {
               ADDR:: {formatAddressing(result.addressing_summary.addressing_totals)}
             </span>
           )}
+          {result.immediate_summary?.immediate_totals && formatImmediates(result.immediate_summary.immediate_totals) && (
+            <span
+              title={`Immediate operands — the literal constants baked into the program's machine code: ${formatImmediates(result.immediate_summary.immediate_totals)}. dec = a decimal value ($5), hex = a hex value ($0x10), sym = a symbolic ADDRESS constant ($.LC0 — the address of a string / printf format string in read-only data, NOT a numeric value). Distinct numeric values baked in: ${formatImmediateValues(result.immediate_summary.distinct_values) || 'none'}. Reading constants off a disassembly is a day-one reverse-engineering skill: 'x = 5' bakes in $5, and the compiler also writes constants you never typed (the $0 of an implicit 'return 0'). This names the constants the ADDR:: chip only counts.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              IMM:: {formatImmediates(result.immediate_summary.immediate_totals)}
+            </span>
+          )}
           {result.cycle_summary && result.cycle_summary.total_cycles > 0 && (
             <span
               title={`Cycle-cost estimate — a latency-weighted sharpening of the raw instruction count. Each instruction carries an approximate relative cost (integer divide ≈20, multiply/call ≈3-4, most staples 1); this is their sum across the program. Compare it with COST:: — the gap shows how much apparent work is a few genuinely expensive operations versus many cheap ones. The costliest Python line is not always the one with the most instructions. NOTE: coarse relative teaching estimates, not cycle-accurate figures.`}
@@ -14374,6 +14424,12 @@ export default function EditorPage() {
             const addrTitle = formatAddressing(mapping.addressing_counts)
               ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
               : ''
+            const immValues = mapping.immediate_values ?? []
+            const immTitle = formatImmediates(mapping.immediate_counts)
+              ? ` — imm: ${formatImmediates(mapping.immediate_counts)}${
+                  immValues.length ? ` [${immValues.join(', ')}]` : ''
+                }`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -14394,7 +14450,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${immTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
