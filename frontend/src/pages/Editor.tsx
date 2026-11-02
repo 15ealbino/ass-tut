@@ -13506,6 +13506,81 @@ print(recovered)
       description: 'movl loads the same nonce value (42) for both encrypt calls; imull and addl compute an identical keystream from key*nonce+31337; subl on the two ciphertexts cancels the repeated keystream entirely, leaving the secret plaintext exposed in the result register',
     },
   },
+  {
+    id: 'voltage-fault-injection',
+    name: 'VOLTAGE FAULT INJECTION',
+    severity: 'CRITICAL',
+    category: 'Hardware Exploitation',
+    description: 'Software-controlled CPU undervolting corrupts ALU results inside a secure enclave, leaking cryptographic keys via differential fault analysis.',
+    explanation:
+      'Voltage fault injection (VFI / CWE-1332) exploits the CPU\'s dynamic voltage and frequency scaling (DVFS) ' +
+      'interface to momentarily undervolt the processor during a security-critical computation — such as an AES round ' +
+      'or RSA modular exponentiation inside an Intel SGX or ARM TrustZone enclave. The brief voltage drop causes a ' +
+      'single ALU instruction (typically a multiply or shift) to produce a bit-flipped result; the enclave has no way ' +
+      'to detect the fault because it trusts the CPU\'s arithmetic. Using Differential Fault Analysis (DFA), the ' +
+      'attacker compares the faulted ciphertext against the correct ciphertext — the difference reveals internal round ' +
+      'key bytes, and with as few as two faulted encryptions the full AES-128 key is recoverable. ' +
+      'CVE-2019-11157 (Plundervolt) was the first software-only VFI attack: a privileged process writes to the ' +
+      'MSR 0x150 voltage offset register, undervolting by ~260 mV for microseconds during SGX enclave execution. ' +
+      'The researchers demonstrated full AES-NI key recovery and RSA-CRT signature corruption on all SGX-enabled ' +
+      'Intel Core processors from Skylake onward. V0LTpwn (USENIX Security 2020) extended the technique to corrupt ' +
+      'non-cryptographic enclave computations — pointer arithmetic and bounds checks — enabling code execution inside ' +
+      'the enclave. VoltPillager (USENIX Security 2021) showed that Intel\'s software MSR lockdown could be bypassed ' +
+      'via hardware access to the PMBus voltage regulator, restoring the attack on patched systems. On ARM, CLKscrew ' +
+      '(2017) and VoltJockey (2020) achieved analogous faults in TrustZone by manipulating DVFS from the normal world. ' +
+      'In the assembly, `imull` performs the critical multiply (simulating an AES MixColumns step); the faulted result ' +
+      'differs from the correct result by exactly the bit-flip introduced by undervolting — `subl` computes this ' +
+      'difference, and `addl` combines it with the known plaintext to recover the round key byte. No integrity check ' +
+      '(`cmpl` against an expected MAC) appears between the multiply and the output, so the fault propagates silently.',
+    code:
+`# CVE pattern: undervolt flips ALU bit — DFA recovers AES key
+class AESRound:
+    def __init__(self, key, plaintext):
+        self.key = key
+        self.plaintext = plaintext
+        self.state = 0
+        self.result = 0
+
+    def mix_columns(self):
+        self.state = self.plaintext * self.key
+        self.state += 27
+        self.result = self.state
+        return self.result
+
+class VoltageController:
+    def __init__(self, nominal_mv):
+        self.nominal = nominal_mv
+        self.offset = 0
+        self.faulted = 0
+
+    def undervolt(self, drop_mv):
+        self.offset = drop_mv
+        self.faulted = 1
+        return self.offset
+
+    def inject_fault(self, value, bit_pos):
+        mask = 1
+        i = 0
+        while i < bit_pos:
+            mask *= 2
+            i += 1
+        corrupted = value + mask
+        return corrupted
+
+aes = AESRound(57005, 48879)
+correct = aes.mix_columns()
+vc = VoltageController(1100)
+vc.undervolt(260)
+faulted = vc.inject_fault(correct, 16)
+diff = faulted - correct
+recovered_key = diff + aes.plaintext
+print(recovered_key)
+`,
+    badAsm: {
+      patterns: ['imull', 'subl', 'addl'],
+      description: 'imull performs the critical multiply (simulating an AES MixColumns step) producing the correct result; inject_fault\'s addl introduces a single bit-flip via the computed mask — subl computes the difference between faulted and correct outputs, and addl combines it with the known plaintext to recover the round key byte; no cmpl integrity check appears between the multiply and the output, so the voltage-induced fault propagates silently through the enclave',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
