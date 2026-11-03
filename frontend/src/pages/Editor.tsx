@@ -13581,6 +13581,74 @@ print(recovered_key)
       description: 'imull performs the critical multiply (simulating an AES MixColumns step) producing the correct result; inject_fault\'s addl introduces a single bit-flip via the computed mask — subl computes the difference between faulted and correct outputs, and addl combines it with the known plaintext to recover the round key byte; no cmpl integrity check appears between the multiply and the output, so the voltage-induced fault propagates silently through the enclave',
     },
   },
+  {
+    id: 'tcp-ipopt-uaf',
+    name: 'TCP IP OPTIONS UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'IPv4 TCP destructors free IP options with plain kfree() while RCU readers still reference them, allowing a retransmitted SYN to touch freed memory.',
+    explanation:
+      'CVE-2026-98432 (CVSS 9.8) is a use-after-free in the Linux kernel\'s IPv4 TCP stack that has persisted ' +
+      'since Linux 4.4. The bug is in two destructors — inet_sock_destruct() and tcp_v4_reqsk_destructor() — ' +
+      'which free stored IP options (inet_opt and ireq_opt) with a plain kfree() while the options structure ' +
+      'can still be reached by concurrent RCU readers. When a SYN packet carrying IPv4 Record Route or Timestamp ' +
+      'options arrives at a listening TCP port, the kernel copies these options into an inet_opt structure. If the ' +
+      'connection is torn down and the destructor fires, the options memory is immediately freed. However, a ' +
+      'retransmitted SYN or the syncookie ACK path can still reference the freed structure through an RCU-protected ' +
+      'pointer. The freed memory may be reallocated to a different object, and the stale pointer now reads ' +
+      'attacker-influenced bytes — a classic UAF primitive that can be escalated to remote code execution. ' +
+      'The fix (upstream commit e3f33b0a1d89) replaces kfree with kfree_rcu, deferring the free until all RCU ' +
+      'readers have completed their critical sections. ' +
+      'In the assembly, `movl` reads from stack offsets that were zeroed by the destructor (simulating kfree); ' +
+      'the subsequent `imull` and `addl` operate on these stale zero values — at runtime an attacker who wins the ' +
+      'race gets their heap spray data read instead, turning the stale read into a controlled pointer.',
+    code:
+`# CVE pattern: kfree() without RCU grace — SYN retransmit reads freed IP opts
+class InetOpt:
+    def __init__(self, rr_flag, ts_val):
+        self.rr_flag = rr_flag
+        self.ts_val = ts_val
+        self.opt_len = rr_flag + ts_val
+        self.freed = 0
+
+    def read_opts(self):
+        result = self.opt_len * self.rr_flag
+        result += self.ts_val
+        return result
+
+class TcpReqSock:
+    def __init__(self, syn_opts):
+        self.ireq_opt = syn_opts.opt_len
+        self.retries = 0
+        self.state = 1
+
+    def destruct_reqsk(self, opts):
+        opts.rr_flag = 0
+        opts.ts_val = 0
+        opts.opt_len = 0
+        opts.freed = 1
+        self.state = 0
+        return 0
+
+    def syn_retransmit(self, opts):
+        self.retries += 1
+        stale = opts.read_opts()
+        self.ireq_opt = stale
+        return stale
+
+syn_opt = InetOpt(1, 3)
+req = TcpReqSock(syn_opt)
+before = syn_opt.read_opts()
+req.destruct_reqsk(syn_opt)
+after = req.syn_retransmit(syn_opt)
+leaked = before - after
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'imull', 'addl'],
+      description: 'movl reads from stack offsets that were zeroed by destruct_reqsk (simulating kfree of IP options) — the structure is freed but the RCU-protected pointer still resolves to it; imull multiplies the stale opt_len (now 0) by rr_flag, and addl combines it with the stale ts_val — an attacker who reclaims the freed slab object controls these values, turning the stale reads into a controlled pointer usable for remote code execution',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
