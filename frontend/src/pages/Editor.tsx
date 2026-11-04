@@ -13649,6 +13649,74 @@ print(leaked)
       description: 'movl reads from stack offsets that were zeroed by destruct_reqsk (simulating kfree of IP options) — the structure is freed but the RCU-protected pointer still resolves to it; imull multiplies the stale opt_len (now 0) by rr_flag, and addl combines it with the stale ts_val — an attacker who reclaims the freed slab object controls these values, turning the stale reads into a controlled pointer usable for remote code execution',
     },
   },
+  {
+    id: 'pwnescape-vm-leak',
+    name: 'PWNESCAPE VM ESCAPE',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'A checksum completion flaw in the host IPv4 stack lets a guest VM rewrite header bytes and read host kernel memory.',
+    explanation:
+      'CVE-2026-99999 (CVSS 9.3), dubbed PwnEscape, is a guest-to-host escape that hid in the Linux kernel\'s ' +
+      'IPv4 networking stack for 18 years (since kernel 2.6.27). When a guest VM sends a packet with hardware ' +
+      'checksum offload metadata, the host\'s ip_summed completion path trusts the guest-supplied partial checksum ' +
+      'and writes two attacker-controlled bytes back into an already-validated IPv4 header buffer. Because the ' +
+      'header sits in a shared skb (socket buffer) that the host later routes or forwards, the corrupted fields ' +
+      '(typically the destination address or total-length) cause the host networking stack to misparse the packet ' +
+      'envelope. The misparse shifts the data-offset pointer into adjacent kernel slab memory, and subsequent ' +
+      'reads copy roughly 32 bytes of host heap data into the guest-visible payload — a reliable cross-VM ' +
+      'information leak. Repeated at high packet rates the guest can sweep large regions of host memory, ' +
+      'harvesting ASLR pointers, crypto keys, or neighboring tenant data. A researcher at PWNAI demonstrated ' +
+      'full root code execution on the host by chaining the leak with a controlled skb header overwrite. ' +
+      'The fix (merged 2026-10-14) validates the checksum metadata against the actual header length before ' +
+      'completion, preventing the out-of-bounds write. ' +
+      'In the assembly, the attacker-controlled csum_delta is added to the header via `addl` without bounds ' +
+      'checking; the subsequent `movl` reads from the corrupted offset past the header, leaking adjacent memory.',
+    code:
+`# CVE pattern: guest checksum offload tricks host into OOB header rewrite
+class SkBuff:
+    def __init__(self, hdr_len, payload):
+        self.hdr_len = hdr_len
+        self.payload = payload
+        self.ip_summed = 0
+        self.csum_delta = 0
+
+    def set_offload(self, delta):
+        self.ip_summed = 1
+        self.csum_delta = delta
+        return self.ip_summed
+
+class HostStack:
+    def __init__(self, heap_secret):
+        self.heap_secret = heap_secret
+        self.route_buf = 0
+
+    def ip_csum_complete(self, skb):
+        if skb.ip_summed == 1:
+            skb.hdr_len = skb.hdr_len + skb.csum_delta
+        total = skb.hdr_len + skb.payload
+        return total
+
+    def forward_skb(self, skb):
+        offset = skb.hdr_len
+        if offset > skb.payload:
+            leaked = self.heap_secret
+        else:
+            leaked = 0
+        self.route_buf = leaked
+        return leaked
+
+pkt = SkBuff(20, 100)
+pkt.set_offload(200)
+host = HostStack(3735928559)
+host.ip_csum_complete(pkt)
+leak = host.forward_skb(pkt)
+print(leak)
+`,
+    badAsm: {
+      patterns: ['addl', 'movl', 'cmpl'],
+      description: 'addl blindly adds the guest-controlled csum_delta to hdr_len without bounds checking — the corrupted offset exceeds the actual packet; cmpl then compares the inflated offset against payload size, and the taken branch causes movl to read from the heap_secret slot (adjacent host slab memory), leaking host kernel data back to the guest VM',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
