@@ -13717,6 +13717,81 @@ print(leak)
       description: 'addl blindly adds the guest-controlled csum_delta to hdr_len without bounds checking — the corrupted offset exceeds the actual packet; cmpl then compares the inflated offset against payload size, and the taken branch causes movl to read from the heap_secret slot (adjacent host slab memory), leaking host kernel data back to the guest VM',
     },
   },
+  {
+    id: 'slap-load-addr-predict',
+    name: 'SLAP LOAD ADDRESS PREDICTION',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'The CPU speculatively predicts a load\'s target address, transiently reading from the wrong memory location and leaking its contents via cache side channels.',
+    explanation:
+      'SLAP (Speculative Load Address Prediction), disclosed at IEEE S&P 2025 by Kim, Genkin, and Yarom, ' +
+      'targets the Load Address Predictor (LAP) present in Apple Silicon M2/A15 and later. The LAP is a ' +
+      'microarchitectural optimization that predicts the effective address of an upcoming load instruction ' +
+      'based on prior memory access patterns — when the pattern is stable (e.g. linked-list traversal), the ' +
+      'CPU issues the load speculatively before the true address is computed. An attacker trains the LAP by ' +
+      'feeding a predictable pointer chain, then redirects the actual pointer to a different object. The LAP ' +
+      'still predicts the OLD address, so the transient load fetches data from the stale (attacker-chosen) ' +
+      'location. Although the architectural result is squashed on misprediction, the fetched cache line leaves ' +
+      'a timing footprint recoverable via Flush+Reload or Prime+Probe. Researchers demonstrated cross-origin ' +
+      'data theft from Safari and Chrome, extracting Gmail inbox contents, Amazon order history, and Reddit ' +
+      'activity from a malicious webpage — no user interaction beyond visiting the page. Unlike Spectre-v1 ' +
+      '(which mistrains a branch predictor), SLAP mistrains the address predictor itself, making existing ' +
+      'Spectre mitigations insufficient. Apple acknowledged the flaw in January 2025 but initially provided ' +
+      'no software mitigation, as a full fix requires microcode or silicon changes to the LAP unit. ' +
+      'In the assembly, the first `movl` loads a pointer from the linked-list node (the LAP-predicted ' +
+      'address); the second `movl` dereferences it to read the secret — on misprediction, both operate on ' +
+      'stale addresses, and the cache-line residue from the transient read is the leak.',
+    code:
+`# CVE pattern: LAP misprediction leaks cross-origin data (SLAP, IEEE S&P 2025)
+class Node:
+    def __init__(self, val, nxt):
+        self.val = val
+        self.nxt = nxt
+
+class LapPredictor:
+    def __init__(self):
+        self.predicted_addr = 0
+        self.trained = 0
+
+    def train(self, addr):
+        self.predicted_addr = addr
+        self.trained += 1
+        return self.trained
+
+    def predict(self):
+        return self.predicted_addr
+
+class TransientRead:
+    def __init__(self):
+        self.cache_line = 0
+        self.leaked = 0
+
+    def speculative_load(self, lap, real_addr, secret):
+        guess = lap.predict()
+        if guess != real_addr:
+            self.cache_line = secret
+            self.leaked = 1
+        else:
+            self.cache_line = 0
+        return self.cache_line
+
+secret_node = Node(3735928559, 0)
+safe_node = Node(42, 0)
+lap = LapPredictor()
+i = 0
+while i < 8:
+    lap.train(safe_node.val)
+    i += 1
+safe_node.nxt = secret_node.val
+reader = TransientRead()
+leak = reader.speculative_load(lap, safe_node.nxt, secret_node.val)
+print(leak)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'the first movl loads the pointer from the LAP-predicted (stale) address instead of the real target — it fetches the old node; the second movl dereferences this stale pointer and reads secret_node.val into a register; cmpl detects the misprediction but the transient cache-line fetch has already occurred, leaking the secret via Flush+Reload timing',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
