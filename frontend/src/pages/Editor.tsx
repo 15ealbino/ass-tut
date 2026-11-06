@@ -13792,6 +13792,80 @@ print(leak)
       description: 'the first movl loads the pointer from the LAP-predicted (stale) address instead of the real target — it fetches the old node; the second movl dereferences this stale pointer and reads secret_node.val into a register; cmpl detects the misprediction but the transient cache-line fetch has already occurred, leaking the secret via Flush+Reload timing',
     },
   },
+  {
+    id: 'srbds-crosstalk',
+    name: 'SRBDS CROSS-CORE LEAK',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Shared microarchitectural staging buffer leaks RDRAND/RDSEED output and SGX enclave keys across CPU cores to an unprivileged attacker.',
+    explanation:
+      'Special Register Buffer Data Sampling (SRBDS / CrossTalk, CVE-2020-0543) exploits a shared staging ' +
+      'buffer inside Intel CPUs that holds results from offcore microcoded instructions — RDRAND, RDSEED, ' +
+      'and SGX EGETKEY. When one core executes RDRAND, only part of the staging buffer is refreshed; stale ' +
+      'values from prior reads on OTHER cores survive in the untouched portion. An attacker on a sibling ' +
+      'core primes the buffer with a known pattern (e.g. CPUID 0x80000002), waits for the victim core to ' +
+      'execute RDRAND or EGETKEY, then reads the buffer again — the changed bytes reveal the victim\'s ' +
+      'secret random output or enclave key material. This breaks the fundamental isolation guarantee of SGX: ' +
+      'researchers extracted full ECDSA signing keys from SGX enclaves cross-core. Unlike earlier MDS attacks ' +
+      '(RIDL, Fallout, ZombieLoad) which leak data within a single core\'s buffers, CrossTalk leaks data ' +
+      'between physical cores, defeating per-core HT mitigations. Intel Skylake through Coffee Lake Refresh ' +
+      'and Xeon E3 processors are affected. Intel\'s microcode fix serializes the staging buffer so stale ' +
+      'data is overwritten before it can be sampled, but at a measurable performance cost to RDRAND throughput. ' +
+      'In the assembly, the attacker\'s movl stores a known marker into the staging buffer slot; after the ' +
+      'victim\'s RDRAND runs on a different core, the attacker\'s second movl reads back the now-changed bytes — ' +
+      'the addl delta between the marker and the readback reveals the victim\'s secret entropy.',
+    code:
+`# CVE pattern: cross-core staging buffer leaks RDRAND output (SRBDS)
+class StagingBuffer:
+    def __init__(self, width):
+        self.width = width
+        self.slot0 = 0
+        self.slot1 = 0
+        self.stale = 0
+
+    def prime(self, marker):
+        self.slot0 = marker
+        self.slot1 = marker
+        self.stale = 0
+        return self.slot0
+
+    def victim_rdrand(self, secret):
+        self.slot0 = secret
+        self.stale = 1
+        return self.slot0
+
+    def attacker_read(self):
+        leaked = self.slot0 + self.slot1
+        return leaked
+
+class Attacker:
+    def __init__(self, core_id):
+        self.core_id = core_id
+        self.samples = 0
+        self.recovered = 0
+
+    def sample(self, buf, marker):
+        readback = buf.attacker_read()
+        delta = readback - marker
+        if delta != 0:
+            self.recovered = delta
+        self.samples += 1
+        return self.recovered
+
+marker = 1094795585
+sgx_key = 3735928559
+buf = StagingBuffer(64)
+buf.prime(marker)
+buf.victim_rdrand(sgx_key)
+attacker = Attacker(1)
+leaked = attacker.sample(buf, marker)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'subl'],
+      description: 'movl stores the known marker into the staging buffer slot (prime); after victim_rdrand overwrites slot0 with the secret, the attacker\'s movl reads both slots back and addl sums them — subl computes the delta against the marker, revealing the victim core\'s RDRAND output or SGX enclave key material',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
