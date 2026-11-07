@@ -13866,6 +13866,73 @@ print(leaked)
       description: 'movl stores the known marker into the staging buffer slot (prime); after victim_rdrand overwrites slot0 with the secret, the attacker\'s movl reads both slots back and addl sums them — subl computes the delta against the marker, revealing the victim core\'s RDRAND output or SGX enclave key material',
     },
   },
+  {
+    id: 'fd-reuse-confusion',
+    name: 'FD REUSE CONFUSION',
+    severity: 'CRITICAL',
+    category: 'Privilege Escalation',
+    description: 'A closed file descriptor is recycled by the kernel and silently rebound to a privileged resource, letting stale references read or write the wrong file.',
+    explanation:
+      'File descriptor reuse confusion (CWE-672) occurs when a program closes a descriptor in one thread ' +
+      'while another thread still caches the integer FD value. The kernel immediately recycles that number: ' +
+      'the next open(), socket(), or accept() call in any thread of the same process can receive the same ' +
+      'integer. The stale reference now silently operates on a completely different resource — potentially a ' +
+      'privileged file, a listening socket, or a device node. CVE-2021-4083 demonstrated this in the Linux ' +
+      'kernel\'s Unix domain socket garbage collector: a race between close() and fget() let a local user ' +
+      'trigger a read-after-free on the socket file structure, escalating to root. In setuid programs the ' +
+      'pattern is even more dangerous — CVE-2002-0820 showed that closing FDs 0/1/2 before exec of a setuid ' +
+      'binary lets the privileged process reopen them to sensitive files, and the program unknowingly writes ' +
+      'to them via printf or perror. In the assembly, the stale FD value persists in a register or stack slot ' +
+      'after the close: the movl that loads the old descriptor feeds the same integer into the next syscall ' +
+      'wrapper, but the kernel has already rebound that slot to the attacker\'s target resource — the cmpl ' +
+      'that would catch the error is absent, so execution continues with the wrong file.',
+    code:
+`# CVE pattern: stale FD reused after close (CVE-2021-4083)
+class FileTable:
+    def __init__(self, size):
+        self.size = size
+        self.slot0 = 0
+        self.slot1 = 0
+        self.slot2 = 0
+        self.next_fd = 3
+
+    def open_file(self, priv_level):
+        fd = self.next_fd
+        if fd == 3:
+            self.slot0 = priv_level
+        elif fd == 4:
+            self.slot1 = priv_level
+        self.next_fd = fd + 1
+        return fd
+
+    def close_fd(self, fd):
+        if fd == 3:
+            self.slot0 = 0
+        elif fd == 4:
+            self.slot1 = 0
+        self.next_fd = fd
+        return 0
+
+    def write_fd(self, fd, data):
+        if fd == 3:
+            self.slot0 = data
+        elif fd == 4:
+            self.slot1 = data
+        return data
+
+ft = FileTable(256)
+user_fd = ft.open_file(1)
+ft.close_fd(user_fd)
+priv_fd = ft.open_file(99)
+stale = user_fd
+leaked = ft.write_fd(stale, 1337)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl'],
+      description: 'movl loads the stale file descriptor integer from the stack slot where close() already released it — the kernel has rebound that FD number to a privileged resource; the absent cmpl means no error check catches the reuse, so the subsequent write syscall sends attacker data to the privileged file',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
