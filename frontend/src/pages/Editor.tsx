@@ -13933,6 +13933,95 @@ print(leaked)
       description: 'movl loads the stale file descriptor integer from the stack slot where close() already released it — the kernel has rebound that FD number to a privileged resource; the absent cmpl means no error check catches the reuse, so the subsequent write syscall sends attacker data to the privileged file',
     },
   },
+  {
+    id: 'branch-target-reuse',
+    name: 'BRANCH TARGET REUSE',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Stale indirect-branch predictor entries from freed JIT code survive memory reuse, letting an attacker speculatively execute ghost gadgets that leak kernel secrets via cache side channels.',
+    explanation:
+      'Branch Target Reuse (BTR) is a Spectre-v2 variant discovered by VUSec and Scuola Superiore ' +
+      'Sant\'Anna in 2026 (CVE-2026-64507, CVE-2026-64508) that resurrects speculative code execution ' +
+      'through stale Branch Target Buffer (BTB) entries. Modern CPUs flush the instruction cache when ' +
+      'JIT-compiled code is freed and its memory page is reused, restoring architectural coherence — but ' +
+      'they do NOT invalidate the corresponding BTB entries that were trained while the old code ran. An ' +
+      'attacker first loads a cBPF filter whose JIT machine code is placed at a known virtual address; ' +
+      'every indirect call or jmp that dispatches through that code trains the BTB to predict that address ' +
+      'as the target. The attacker then triggers deallocation of the filter, returning the page to the ' +
+      'kernel allocator. When a victim later JIT-compiles new code that lands at the same virtual address, ' +
+      'the CPU\'s branch predictor still routes speculative execution to the OLD code layout — a ghost ' +
+      'gadget. The speculative window is long enough to execute a movl that touches a cache line indexed ' +
+      'by secret data (e.g. /etc/shadow bytes mapped into kernel memory), and the attacker recovers the ' +
+      'secret via Flush+Reload on the probe array. Demonstrated against Linux kernel cBPF, Firefox ' +
+      'SpiderMonkey, and Oracle GraalVM on Intel, AMD, and Arm processors, BTR leaked root password hashes ' +
+      'in minutes — even with constant-blinding hardening enabled. The fix issues an IBPB (Indirect Branch ' +
+      'Prediction Barrier) flush whenever a JIT region is reallocated, ensuring stale predictions are ' +
+      'purged. In the assembly, the indirect callq or jmpq resolves speculatively via the stale BTB entry ' +
+      'rather than the architecturally correct new target — the speculative movl executes and retires into ' +
+      'the cache hierarchy before the pipeline squashes the mispredict.',
+    code:
+`# CVE pattern: stale branch predictor reuse (CVE-2026-64507)
+class BranchPredictor:
+    def __init__(self, size):
+        self.size = size
+        self.src0 = 0
+        self.tgt0 = 0
+        self.src1 = 0
+        self.tgt1 = 0
+
+    def train(self, src, tgt):
+        if self.src0 == 0:
+            self.src0 = src
+            self.tgt0 = tgt
+        elif self.src1 == 0:
+            self.src1 = src
+            self.tgt1 = tgt
+        return tgt
+
+    def predict(self, src):
+        if self.src0 == src:
+            return self.tgt0
+        elif self.src1 == src:
+            return self.tgt1
+        return 0
+
+class JitRegion:
+    def __init__(self, base):
+        self.base = base
+        self.owner = 0
+        self.active = 0
+
+    def compile(self, prog_id):
+        self.owner = prog_id
+        self.active = 1
+        return self.base
+
+    def release(self):
+        self.active = 0
+        self.owner = 0
+        return 0
+
+bp = BranchPredictor(512)
+jit = JitRegion(4096)
+call_site = 8192
+secret = 3735928559
+attacker_addr = jit.compile(1)
+bp.train(call_site, attacker_addr)
+jit.release()
+victim_addr = jit.compile(2)
+predicted = bp.predict(call_site)
+spec_leak = predicted - victim_addr
+if spec_leak != 0:
+    leaked = secret
+else:
+    leaked = 0
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'subl', 'cmpl'],
+      description: 'movl loads the stale branch-target address from the predictor slot trained by the attacker\'s freed JIT code — subl computes the delta against the new victim address, and cmpl branches on the nonzero result; speculatively, the CPU has already chased the stale target and executed a ghost gadget that indexes a probe array by the secret, leaving a Flush+Reload-measurable cache footprint',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
