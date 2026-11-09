@@ -124,6 +124,31 @@ function formatAddressing(counts?: Record<string, number>): string {
   return [...known, ...extra].map(m => `${counts[m]} ${ADDRESSING_LABEL[m] ?? m}`).join(' · ')
 }
 
+// ─── EFLAGS-effect presentation ─────────────────────────────────────────────
+// Backend sorts each instruction by its EFLAGS role: set-cmp (a dedicated
+// cmp/test flag setter), set-alu (arithmetic that sets flags as a side effect),
+// or use (a flag consumer — a conditional jump / setcc / cmov). This surfaces
+// the invisible producer→consumer link a `jcc` rides on: the flags it reads
+// appear in no operand, so reading backward from a jump to the compare that set
+// its flags is a core reverse-engineering skill. Rendered "1 cmp · 1 use" in the
+// EFLAGS chip and per-line tooltips, zero roles omitted (matches the backend map).
+// Labelled EFLAGS (not FLAGS) to stay distinct from the cost pass's per-line
+// `flags`/"expensive" set rendered alongside it in the same tooltip.
+const FLAG_EFFECT_ORDER = ['set-cmp', 'set-alu', 'use'] as const
+const FLAG_EFFECT_LABEL: Record<string, string> = {
+  'set-cmp': 'cmp',
+  'set-alu': 'alu',
+  use: 'use',
+}
+function formatFlagEffects(counts?: Record<string, number>): string {
+  if (!counts) return ''
+  const known = FLAG_EFFECT_ORDER.filter(r => (counts[r] ?? 0) > 0) as string[]
+  const extra = Object.keys(counts)
+    .filter(r => !(FLAG_EFFECT_ORDER as readonly string[]).includes(r) && counts[r] > 0)
+    .sort()
+  return [...known, ...extra].map(r => `${counts[r]} ${FLAG_EFFECT_LABEL[r] ?? r}`).join(' · ')
+}
+
 // ─── Cycle-cost presentation ────────────────────────────────────────────────
 // Backend weights each instruction by an approximate relative cycle cost
 // (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
@@ -14786,6 +14811,26 @@ export default function EditorPage() {
               ADDR:: {formatAddressing(result.addressing_summary.addressing_totals)}
             </span>
           )}
+          {result.flag_summary?.flag_totals && formatFlagEffects(result.flag_summary.flag_totals) && (
+            <span
+              title={`EFLAGS map — how the program's instructions split by their flag role: ${formatFlagEffects(result.flag_summary.flag_totals)}. cmp = a dedicated cmp/test flag setter; alu = arithmetic (add/sub/and/shift/...) that sets flags as a side effect; use = a flag consumer (a conditional jump / setcc / cmov). x86 conditional control flow rides on EFLAGS, which appears in NO operand: a 'jge' reads flags a prior 'cmpl' set, with nothing in the jump's text naming the comparison. Reading backward from a jump to the instruction that set its flags is a core reverse-engineering skill. In a healthy program 'cmp' tracks 'use' (each jump has its compare); an 'alu' instruction landing between a compare and its jump would silently clobber the flags the branch depends on — the hazard this map trains the eye to see.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              EFLAGS:: {formatFlagEffects(result.flag_summary.flag_totals)}
+            </span>
+          )}
           {result.cycle_summary && result.cycle_summary.total_cycles > 0 && (
             <span
               title={`Cycle-cost estimate — a latency-weighted sharpening of the raw instruction count. Each instruction carries an approximate relative cost (integer divide ≈20, multiply/call ≈3-4, most staples 1); this is their sum across the program. Compare it with COST:: — the gap shows how much apparent work is a few genuinely expensive operations versus many cheap ones. The costliest Python line is not always the one with the most instructions. NOTE: coarse relative teaching estimates, not cycle-accurate figures.`}
@@ -14879,6 +14924,9 @@ export default function EditorPage() {
             const addrTitle = formatAddressing(mapping.addressing_counts)
               ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
               : ''
+            const eflagsTitle = formatFlagEffects(mapping.flag_effect_counts)
+              ? ` — eflags: ${formatFlagEffects(mapping.flag_effect_counts)}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -14899,7 +14947,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${eflagsTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
