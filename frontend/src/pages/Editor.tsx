@@ -131,7 +131,9 @@ function formatAddressing(counts?: Record<string, number>): string {
 // the invisible producer→consumer link a `jcc` rides on: the flags it reads
 // appear in no operand, so reading backward from a jump to the compare that set
 // its flags is a core reverse-engineering skill. Rendered "1 cmp · 1 use" in the
-// FLAGS chip and per-line tooltips, zero roles omitted (matches the backend map).
+// EFLAGS chip and per-line tooltips, zero roles omitted (matches the backend map).
+// Labelled EFLAGS (not FLAGS) to stay distinct from the cost pass's per-line
+// `flags`/"expensive" set rendered alongside it in the same tooltip.
 const FLAG_EFFECT_ORDER = ['set-cmp', 'set-alu', 'use'] as const
 const FLAG_EFFECT_LABEL: Record<string, string> = {
   'set-cmp': 'cmp',
@@ -14826,7 +14828,7 @@ export default function EditorPage() {
                 cursor: 'help',
               }}
             >
-              FLAGS:: {formatFlagEffects(result.flag_summary.flag_totals)}
+              EFLAGS:: {formatFlagEffects(result.flag_summary.flag_totals)}
             </span>
           )}
           {result.cycle_summary && result.cycle_summary.total_cycles > 0 && (
@@ -14923,7 +14925,7 @@ export default function EditorPage() {
               ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
               : ''
             const eflagsTitle = formatFlagEffects(mapping.flag_effect_counts)
-              ? ` — flags: ${formatFlagEffects(mapping.flag_effect_counts)}`
+              ? ` — eflags: ${formatFlagEffects(mapping.flag_effect_counts)}`
               : ''
             return (
               <button

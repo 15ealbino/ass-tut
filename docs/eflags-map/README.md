@@ -77,8 +77,10 @@ It reports two things:
 1. Write Python in the editor and compile (the default `transpile` pipeline).
 2. Look at the **TRACE** legend bar along the bottom. Alongside the existing
    `COST::`, `MIX::`, `REGS::`, `MEM::`, `SENSE::`, and `ADDR::` chips, a new
-   `FLAGS:: N cmp · N alu · N use` chip shows the program-wide flag-role split.
-3. Hover any per-line chip: its tooltip now includes `flags: …` alongside the
+   `EFLAGS:: N cmp · N alu · N use` chip shows the program-wide flag-role split.
+   (Labelled `EFLAGS::`, not `FLAGS::`, to stay distinct from the cost pass's
+   per-line `flags`/"expensive" markers.)
+3. Hover any per-line chip: its tooltip now includes `eflags: …` alongside the
    instruction count, cost, mix, registers, memory, addressing, and branch
    senses.
 4. Experiment. A straight-line program has **no** `use` role at all — nothing
@@ -139,7 +141,7 @@ assembly** — no extra compilation. It lives in its own module,
    `backend/app/schemas.py` (defaulting to empty, so the pyghidra pipeline —
    which computes no per-line flag map — still validates), mirrored in the
    frontend types in `frontend/src/api.ts`, and rendered by
-   `frontend/src/pages/Editor.tsx` as the `FLAGS::` chip and the enriched
+   `frontend/src/pages/Editor.tsx` as the `EFLAGS::` chip and the enriched
    per-line tooltips.
 
 **Counting convention:** counts are of **instructions**, each contributing its
