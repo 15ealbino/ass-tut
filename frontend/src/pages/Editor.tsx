@@ -14022,6 +14022,70 @@ print(leaked)
       description: 'movl loads the stale branch-target address from the predictor slot trained by the attacker\'s freed JIT code — subl computes the delta against the new victim address, and cmpl branches on the nonzero result; speculatively, the CPU has already chased the stale target and executed a ghost gadget that indexes a probe array by the secret, leaving a Flush+Reload-measurable cache footprint',
     },
   },
+  {
+    id: 'bounds-check-elim',
+    name: 'BOUNDS CHECK ELIMINATION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'JIT compiler removes a bounds check after profiling shows it always passes, enabling direct out-of-bounds access when the attacker later supplies an OOB index.',
+    explanation:
+      'Bounds Check Elimination (BCE) is a JIT compiler optimization gone wrong: the optimizer profiles ' +
+      'a hot loop and observes that an array bounds check always passes, so it removes the check entirely ' +
+      'from the compiled machine code. The attacker first trains the JIT by repeatedly calling the function ' +
+      'with in-bounds indices, then supplies an out-of-bounds index on the optimized hot path — the check ' +
+      'that would have caught it no longer exists in the generated code. Unlike Spectre (where the check ' +
+      'exists but the CPU speculates past it), BCE removes the check architecturally — the OOB access ' +
+      'succeeds without side channels or timing tricks, yielding a direct read/write primitive. ' +
+      'CVE-2024-29943 (SpiderMonkey IonMonkey JIT, CVSS 9.8, Pwn2Own Vancouver 2024) allowed Manfred Paul ' +
+      'to bypass range-based bounds checking entirely via an integer range inconsistency in ' +
+      'MObjectKeysLength::computeRange, achieving RCE in Firefox before 124.0.1. CVE-2024-7965 (V8, ' +
+      'exploited in the wild, CISA KEV August 2024) used an inappropriate implementation in V8\'s optimizing ' +
+      'compiler to trigger heap corruption via a crafted HTML page — Chrome patched it in 128.0.6613.84. ' +
+      'CVE-2025-4919 (Firefox IonMonkey, Pwn2Own Berlin 2025) exploited a similar range analysis flaw for ' +
+      'renderer-process compromise. Google removed bounds-check elimination from V8\'s TurboFan entirely in ' +
+      '2024 after repeated bypasses proved the optimization fundamentally unsafe for security-critical code. ' +
+      'In the assembly, profile_get\'s `cmpl` and conditional `jge` enforce the bounds check; but ' +
+      'hot_get\'s compiled code contains no comparison or branch — `imull` multiplies the raw index by the ' +
+      'element stride and `addl` computes the final offset without any guard, reading far past the buffer ' +
+      'boundary into adjacent secret data.',
+    code:
+`# CVE pattern: JIT profiles bounds check away — direct OOB access
+class TypedArray:
+    def __init__(self, length):
+        self.length = length
+        self.data0 = 65
+        self.data1 = 66
+        self.secret_key = 3405691582
+        self.saved_rip = 4196352
+        self.optimized = 0
+
+    def profile_get(self, index):
+        if index < self.length:
+            result = self.data0 + index
+        else:
+            result = 0
+        return result
+
+    def hot_get(self, index):
+        offset = index * 8
+        result = self.data0 + offset
+        self.optimized = 1
+        return result
+
+arr = TypedArray(2)
+i = 0
+while i < 6:
+    arr.profile_get(0)
+    arr.profile_get(1)
+    i += 1
+leaked = arr.hot_get(99)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['imull', 'addl'],
+      description: 'profile_get\'s cmpl and jge enforce the bounds check during profiling; hot_get\'s compiled code has NO comparison — imull multiplies the raw OOB index (99) by 8 and addl adds the offset directly to the base address, reading 792 bytes past the buffer into adjacent secret_key and saved_rip without any guard instruction',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
