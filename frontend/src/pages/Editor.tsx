@@ -14086,6 +14086,90 @@ print(leaked)
       description: 'profile_get\'s cmpl and jge enforce the bounds check during profiling; hot_get\'s compiled code has NO comparison — imull multiplies the raw OOB index (99) by 8 and addl adds the offset directly to the base address, reading 792 bytes past the buffer into adjacent secret_key and saved_rip without any guard instruction',
     },
   },
+  {
+    id: 'tee-dram-snoop',
+    name: 'TEE DRAM BUS SNOOP',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Physical attacker snoops DDR5 memory bus traffic to extract secrets from hardware-encrypted TEE enclaves by exploiting deterministic AES-XTS ciphertext.',
+    explanation:
+      'TEE.Fail (Georgia Tech / Purdue / Synkhronix, 2025) demonstrates that Trusted Execution Environments ' +
+      '(TEEs) relying solely on DDR5 Total Memory Encryption (TME / SME) for confidentiality are fundamentally ' +
+      'broken against a physical adversary with bus-level access. DDR5 RDIMMs encrypt each cache line using ' +
+      'AES-XTS, but the encryption is deterministic — the same plaintext written to the same physical address ' +
+      'always produces the same ciphertext, because the XTS tweak is derived solely from the physical address ' +
+      'and a static platform key. An attacker with a sub-$1,000 logic analyzer tapped onto the DDR5 bus can ' +
+      'passively observe ciphertext patterns over time. By correlating ciphertexts with known-plaintext writes ' +
+      '(e.g., zero-filled pages, predictable page-table entries, or OS-initialized structures whose layout is ' +
+      'public), the attacker recovers the XTS tweak for each physical address, then decrypts arbitrary enclave ' +
+      'memory — including VCEK seeds, attestation private keys, and sealed application secrets. The attack was ' +
+      'demonstrated against Intel 5th-gen Xeon Scalable (SGX / TDX) and AMD Zen 5 EPYC (SEV-SNP) processors, ' +
+      'and researchers showed it could compromise NVIDIA GPU confidential-computing attestation chains by ' +
+      'extracting the host CPU\'s root signing key. Neither vendor\'s memory encryption includes integrity ' +
+      'protection or replay resistance in the affected configurations (AMD advisory SB-7036 acknowledges the ' +
+      'class). Because the attack is entirely passive — only reading bus signals — it leaves no software-visible ' +
+      'trace, making it undetectable by the enclave or the hypervisor. In the assembly, encrypt_store\'s addl ' +
+      'applies the static XTS tweak to the plaintext word; calibrate\'s subl reverses a known-plaintext pair to ' +
+      'recover the tweak, and extract_secret\'s subl subtracts it from the snooped enclave ciphertext, leaving ' +
+      'the raw vcek_seed in a general-purpose register — the full enclave secret exposed by arithmetic reversal.',
+    code:
+`# CVE pattern: TEE.Fail — DDR5 bus snooping breaks enclave memory confidentiality
+class DDR5Mem:
+    def __init__(self):
+        self.xts_tweak = 1431655765
+        self.bus_line = 0
+
+    def encrypt_store(self, plaintext):
+        self.bus_line = plaintext + self.xts_tweak
+        return self.bus_line
+
+class Enclave:
+    def __init__(self):
+        self.vcek_seed = 3735928559
+        self.attest_nonce = 3405691582
+        self.sealed = 0
+
+    def store_sealed(self, ct):
+        self.sealed = ct
+        return self.sealed
+
+class BusSniffer:
+    def __init__(self):
+        self.captured_ct = 0
+        self.tweak_recovered = 0
+        self.secret_out = 0
+
+    def snoop(self, ct_on_bus):
+        self.captured_ct = ct_on_bus
+        return self.captured_ct
+
+    def calibrate(self, known_pt, known_ct):
+        self.tweak_recovered = known_ct - known_pt
+        return self.tweak_recovered
+
+    def extract_secret(self, target_ct):
+        self.secret_out = target_ct - self.tweak_recovered
+        return self.secret_out
+
+mem = DDR5Mem()
+enc = Enclave()
+sniffer = BusSniffer()
+seed_val = enc.vcek_seed
+secret_ct = mem.encrypt_store(seed_val)
+enc.store_sealed(secret_ct)
+sniffer.snoop(secret_ct)
+calib_pt = 256
+calib_ct = mem.encrypt_store(calib_pt)
+sniffer.calibrate(calib_pt, calib_ct)
+leaked = sniffer.extract_secret(secret_ct)
+if leaked == seed_val:
+    print(leaked)
+`,
+    badAsm: {
+      patterns: ['addl', 'subl'],
+      description: 'encrypt_store\'s addl applies the static XTS tweak deterministically — identical plaintext at the same address always yields identical ciphertext on the DDR5 bus; calibrate\'s subl reverses the known-plaintext pair to recover the tweak value, and extract_secret\'s subl subtracts the recovered tweak from the captured enclave ciphertext, leaving the raw vcek_seed (0xDEADBEEF) in a register — the full enclave secret exposed by a single arithmetic reversal',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
