@@ -14170,6 +14170,82 @@ if leaked == seed_val:
       description: 'encrypt_store\'s addl applies the static XTS tweak deterministically — identical plaintext at the same address always yields identical ciphertext on the DDR5 bus; calibrate\'s subl reverses the known-plaintext pair to recover the tweak value, and extract_secret\'s subl subtracts the recovered tweak from the captured enclave ciphertext, leaving the raw vcek_seed (0xDEADBEEF) in a register — the full enclave secret exposed by a single arithmetic reversal',
     },
   },
+  {
+    id: 'ovswrap-nla-trunc',
+    name: 'OVSWRAP NLA TRUNCATION',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Netlink attribute 16-bit length truncation in the Open vSwitch kernel datapath corrupts adjacent slab metadata, enabling unprivileged-to-root escalation.',
+    explanation:
+      'CVE-2026-64531 ("OVSwrap") is a 13-year-old logic bug in the Linux kernel\'s Open vSwitch (OVS) ' +
+      'datapath discovered by Asim Manizada. OVS stores generated flow actions as Netlink attributes whose ' +
+      'nla_len field is 16 bits wide, capping any single nested attribute at 65,535 bytes. When an unprivileged ' +
+      'user crafts flow rules whose nested actions total more than 64 KiB, the length silently wraps to zero ' +
+      'or a small value — the kernel then treats bytes past the truncated boundary as new attribute headers, ' +
+      'parsing attacker-controlled data as kernel Netlink metadata. This misparse corrupts adjacent slab ' +
+      'objects, letting the attacker overwrite kernel credential structures or slab free-list pointers. ' +
+      'A public exploit ships pre-built records for roughly 800 kernel builds and achieves a reliable root ' +
+      'shell. The OVS kernel module loads automatically via user namespaces on most distributions even when ' +
+      'OVS is not configured or running, giving the bug near-universal reach (CVSS 7.8). ' +
+      'In the assembly, add_actions\'s addl accumulates the total nested size past 65 535; set_length\'s ' +
+      'idivl (the modulo by 65 536) produces the truncated nla_len in the remainder register; the conditional ' +
+      'movl then writes the overflow delta into the slab metadata offset, simulating the kernel misparse that ' +
+      'redirects slab allocation to an attacker-chosen address for privilege escalation.',
+    code:
+`# CVE pattern: CVE-2026-64531 OVSwrap — nla_len 16-bit truncation
+class NlAttr:
+    def __init__(self, data_len):
+        self.data_len = data_len
+        self.nla_len = 0
+        self.corrupted = 0
+
+    def set_length(self, total):
+        self.nla_len = total % 65536
+        return self.nla_len
+
+class OvsAction:
+    def __init__(self):
+        self.nested_size = 0
+        self.action_count = 0
+
+    def add_actions(self, count, size_each):
+        i = 0
+        while i < count:
+            self.nested_size += size_each
+            self.action_count += 1
+            i += 1
+        return self.nested_size
+
+class KernelSlab:
+    def __init__(self):
+        self.metadata = 3735928559
+        self.next_free = 3405691582
+        self.canary = 305419896
+
+    def check_integrity(self):
+        if self.metadata == 3735928559:
+            return 1
+        return 0
+
+ovs = OvsAction()
+attr = NlAttr(0)
+slab = KernelSlab()
+total = ovs.add_actions(20, 4096)
+wrapped = attr.set_length(total)
+if wrapped < total:
+    overflow_off = total - wrapped
+    slab.metadata = overflow_off
+    slab.next_free = 1094795585
+    attr.corrupted = 1
+if attr.corrupted == 1:
+    if slab.check_integrity() == 0:
+        print(slab.next_free)
+`,
+    badAsm: {
+      patterns: ['addl', 'idivl', 'movl'],
+      description: 'add_actions\'s addl accumulates nested action sizes past 65 535; set_length\'s idivl extracts the 16-bit remainder, silently truncating the real length; the conditional movl then writes the overflow delta into the slab metadata offset — at runtime this is the kernel misparse that lets attacker-controlled bytes overwrite the next-free pointer, redirecting slab allocation to an attacker-chosen address for root escalation',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
