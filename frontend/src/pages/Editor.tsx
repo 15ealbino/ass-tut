@@ -14246,6 +14246,77 @@ if attr.corrupted == 1:
       description: 'add_actions\'s addl accumulates nested action sizes past 65 535; set_length\'s idivl extracts the 16-bit remainder, silently truncating the real length; the conditional movl then writes the overflow delta into the slab metadata offset — at runtime this is the kernel misparse that lets attacker-controlled bytes overwrite the next-free pointer, redirecting slab allocation to an attacker-chosen address for root escalation',
     },
   },
+  {
+    id: 'tcp-inet-opt-uaf',
+    name: 'TCP INET_OPT USE-AFTER-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'TCP child socket frees IP options via kfree() without RCU grace period, letting a retransmit path dereference the freed options for remote code execution.',
+    explanation:
+      'CVE-2026-98432 (CVSS 9.8) is a use-after-free in the Linux kernel\'s IPv4 TCP stack triggered during ' +
+      'connection setup. When a SYN arrives with IP options, the kernel copies them into inet_opt on the child ' +
+      'socket. inet_sock_destruct() frees inet_opt with a plain kfree(), but the retransmit path in ' +
+      'ip_options_build() can still reference the same pointer — TCP child sockets lack SOCK_RCU_FREE, so no ' +
+      'RCU grace period separates the free from the last read. A remote unauthenticated attacker sends crafted ' +
+      'SYN packets with IP options to a listening socket; when two CPUs process the request socket and child ' +
+      'socket concurrently, one CPU frees inet_opt while the other reads it during SYN-ACK retransmission, ' +
+      'dereferencing freed heap memory. The freed slab chunk is reclaimed by another allocation under attacker ' +
+      'control, and ip_options_build() copies attacker-chosen bytes into the IP header — corrupting outgoing ' +
+      'packets or, with heap grooming, achieving kernel code execution. The flaw existed in every kernel from ' +
+      '4.4 through 6.12 (nine years) and was fixed upstream by freeing inet_opt and ireq_opt after an RCU ' +
+      'grace period via kfree_rcu(). MPTCP listeners were the initial exploitation target, but the bug is in ' +
+      'the core IPv4 path and affects any TCP listener processing options. CWE-825 (Expired Pointer Dereference). ' +
+      'In the assembly, movl stores the IP options pointer into the child socket\'s inet_opt field; free_opts\'s ' +
+      'movl zeroes inet_opt (simulating kfree); retransmit_synack\'s addl reads from the same stack offset — ' +
+      'the freed slot now contains attacker-sprayed data, and the result flows into the outgoing packet header ' +
+      'with no RCU guard between the free and the read.',
+    code:
+`# CVE pattern: CVE-2026-98432 — inet_opt freed without RCU, retransmit UAF
+class InetOpt:
+    def __init__(self, opt_data, opt_len):
+        self.opt_data = opt_data
+        self.opt_len = opt_len
+        self.freed = 0
+
+    def build_header(self):
+        result = self.opt_data + self.opt_len
+        return result
+
+class ChildSocket:
+    def __init__(self, state):
+        self.state = state
+        self.inet_opt = 0
+        self.rcu_free = 0
+
+    def copy_opts(self, opts):
+        self.inet_opt = opts.opt_data
+        return self.inet_opt
+
+    def free_opts(self, opts):
+        opts.opt_data = 0
+        opts.opt_len = 0
+        opts.freed = 1
+        self.inet_opt = 0
+        return opts.freed
+
+    def retransmit_synack(self, opts):
+        result = opts.opt_data + opts.opt_len
+        return result
+
+syn_opts = InetOpt(305419896, 40)
+child = ChildSocket(1)
+child.copy_opts(syn_opts)
+child.free_opts(syn_opts)
+syn_opts.opt_data = 3735928559
+syn_opts.opt_len = 3405691582
+leaked = child.retransmit_synack(syn_opts)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the IP options data into the child socket\'s inet_opt field; free_opts\'s movl zeroes opt_data and opt_len (simulating kfree without RCU); the attacker sprays the freed slot and retransmit_synack\'s addl reads from the same stack offset — the freed values (0xDEADBEEF + 0xCAFEBABE) flow into the outgoing SYN-ACK header, achieving remote kernel memory corruption with no authentication required',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
