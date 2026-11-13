@@ -14317,6 +14317,89 @@ print(leaked)
       description: 'movl stores the IP options data into the child socket\'s inet_opt field; free_opts\'s movl zeroes opt_data and opt_len (simulating kfree without RCU); the attacker sprays the freed slot and retransmit_synack\'s addl reads from the same stack offset — the freed values (0xDEADBEEF + 0xCAFEBABE) flow into the outgoing SYN-ACK header, achieving remote kernel memory corruption with no authentication required',
     },
   },
+  {
+    id: 'gpu-driver-uaf',
+    name: 'GPU DRIVER USE-AFTER-FREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'GPU kernel driver frees a buffer object while the GPU command queue still references it, letting a malicious app reclaim the page with controlled data for kernel read/write.',
+    explanation:
+      'GPU driver use-after-free (CWE-416) targets the kernel-mode GPU memory manager — the component that ' +
+      'maps, tracks, and frees GPU buffer objects (BOs) on behalf of userspace applications. When the driver ' +
+      'miscounts references or fails to synchronize between the CPU free path and the GPU command submission path, ' +
+      'a buffer object is freed while the GPU hardware or a pending ioctl still holds a pointer to its backing pages. ' +
+      'The attacker triggers the free, reclaims the physical page via cross-cache slab spraying or page-level ' +
+      'reclamation, and the stale GPU mapping now points to attacker-controlled data in kernel space. ' +
+      'CVE-2023-4211 (ARM Mali Bifrost/Valhall/5th Gen kernel driver, actively exploited in the wild per CISA KEV) ' +
+      'allowed improper GPU memory processing operations to access already-freed memory — a local unprivileged app ' +
+      'on Android could escalate to kernel. CVE-2022-20186 (Mali driver) gave a researcher arbitrary kernel ' +
+      'read/write, achieving root and disabling SELinux on a Pixel 6. CVE-2025-0072 (Mali) bypassed ARM\'s Memory ' +
+      'Tagging Extension (MTE) to reach kernel code execution. CVE-2026-0001 (Mali) is a recent UAF that lets a ' +
+      'local unprivileged process read and write kernel memory. Google and ARM have noted that most exploitable GPU ' +
+      'bugs sit in kernel-mode modules written in memory-unsafe C, making the attack surface enormous on Android ' +
+      'where nearly all devices use either Mali or Qualcomm Adreno GPUs. ' +
+      'In the assembly, movl stores the buffer object\'s data pointer and refcount into stack slots; free_bo\'s movl ' +
+      'zeroes the data and sets freed = 1 without checking the GPU command queue\'s pending reference; reclaim\'s ' +
+      'movl writes 0xDEADBEEF into the same slot — gpu_execute\'s addl reads the stale pointer and sums the ' +
+      'attacker-controlled payload, simulating kernel memory corruption through the dangling GPU mapping.',
+    code:
+`# CVE pattern: GPU BO freed while command queue holds stale mapping
+class GpuBuffer:
+    def __init__(self, page_addr, size):
+        self.page_addr = page_addr
+        self.size = size
+        self.refcount = 1
+        self.freed = 0
+
+    def map_to_gpu(self):
+        self.refcount += 1
+        return self.page_addr
+
+    def unmap(self):
+        self.refcount -= 1
+        return self.refcount
+
+class CmdQueue:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.pending = 0
+        self.stale_ptr = 0
+        self.result = 0
+
+    def submit(self, buf):
+        self.stale_ptr = buf.page_addr
+        self.pending += 1
+        return self.pending
+
+    def gpu_execute(self):
+        self.result = self.stale_ptr + self.pending
+        return self.result
+
+def free_bo(buf):
+    buf.page_addr = 0
+    buf.size = 0
+    buf.freed = 1
+    return buf.freed
+
+def reclaim(buf, payload):
+    buf.page_addr = payload
+    return buf.page_addr
+
+bo = GpuBuffer(4196352, 4096)
+queue = CmdQueue(64)
+gpu_addr = bo.map_to_gpu()
+queue.submit(bo)
+bo.unmap()
+free_bo(bo)
+reclaim(bo, 3735928559)
+leaked = queue.gpu_execute()
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the buffer object\'s page_addr into the command queue\'s stale_ptr; free_bo\'s movl zeroes page_addr without draining the pending GPU command; reclaim\'s movl writes 0xDEADBEEF into the freed slot — gpu_execute\'s addl reads from stale_ptr which now contains attacker-controlled data, simulating kernel memory corruption through the dangling GPU buffer mapping',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
