@@ -14400,6 +14400,69 @@ print(leaked)
       description: 'movl stores the buffer object\'s page_addr into the command queue\'s stale_ptr; free_bo\'s movl zeroes page_addr without draining the pending GPU command; reclaim\'s movl writes 0xDEADBEEF into the freed slot — gpu_execute\'s addl reads from stale_ptr which now contains attacker-controlled data, simulating kernel memory corruption through the dangling GPU buffer mapping',
     },
   },
+  {
+    id: 'confused-deputy',
+    name: 'CONFUSED DEPUTY',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Privileged service blindly acts on attacker-crafted IPC request using its own elevated permissions, granting unauthorized access or code execution.',
+    explanation:
+      'The confused deputy (CWE-441) is a privilege escalation paradigm where a trusted, high-privilege service ' +
+      'performs an action on behalf of a low-privilege caller without verifying that the caller is authorized to ' +
+      'request it. The service uses its own credentials — not the caller\'s — so the attacker inherits the ' +
+      'service\'s full authority. First described by Norm Hardy in 1988 at DEC, the pattern is now behind a ' +
+      'large share of Android and browser privilege escalations. CVE-2026-0008 (Android 16, CVSS 8.4) is a ' +
+      'multi-location confused deputy that grants local privilege escalation with no user interaction — a ' +
+      'malicious co-installed app sends a crafted Intent to a system service that executes the request as SYSTEM ' +
+      'without checking the caller\'s UID. CVE-2026-106188 (Chrome for Android, CVSS 9.6) exploits a confused ' +
+      'deputy in Chrome\'s SignIn component: a co-installed app reaches a privileged IPC endpoint that performs ' +
+      'authentication actions using Chrome\'s own session tokens. CVE-2024-0044 (Android installer) let an ' +
+      'unprivileged app trick the package installer into writing to arbitrary paths using the installer\'s ' +
+      'system-level file permissions — actively exploited in the wild. ' +
+      'In the assembly, movl loads the attacker-supplied target_id and action into the service\'s stack frame; ' +
+      'cmpl checks is_running (whether the service is alive) but never checks caller_perms against the required ' +
+      'privilege level — addl in execute combines the service\'s own elevated base_priv with the attacker\'s ' +
+      'requested action, performing the privileged operation unconditionally.',
+    code:
+`# CVE pattern: privileged service acts on unchecked IPC — caller inherits authority
+class Service:
+    def __init__(self, base_priv, capacity):
+        self.base_priv = base_priv
+        self.capacity = capacity
+        self.is_running = 1
+        self.last_result = 0
+
+    def execute(self, target_id, action):
+        if self.is_running == 1:
+            self.last_result = self.base_priv + action
+        return self.last_result
+
+    def read_result(self):
+        result = self.last_result + self.base_priv
+        return result
+
+class Caller:
+    def __init__(self, uid, perms):
+        self.uid = uid
+        self.perms = perms
+        self.escalated = 0
+
+    def craft_request(self, target, action):
+        self.escalated = target + action
+        return self.escalated
+
+svc = Service(4196352, 64)
+attacker = Caller(1000, 0)
+req = attacker.craft_request(0, 3735928559)
+svc.execute(attacker.uid, req)
+hijacked = svc.read_result()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'addl'],
+      description: 'cmpl checks only is_running (whether the service is alive) but never validates caller_perms against the required privilege level; addl in execute combines the service\'s elevated base_priv with the attacker\'s unchecked action value — the privileged operation runs unconditionally using the service\'s own authority, granting the unprivileged caller escalated access',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
