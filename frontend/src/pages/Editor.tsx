@@ -14463,6 +14463,83 @@ print(hijacked)
       description: 'cmpl checks only is_running (whether the service is alive) but never validates caller_perms against the required privilege level; addl in execute combines the service\'s elevated base_priv with the attacker\'s unchecked action value — the privileged operation runs unconditionally using the service\'s own authority, granting the unprivileged caller escalated access',
     },
   },
+  {
+    id: 'alloc-mismatch',
+    name: 'ALLOCATOR MISMATCH',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Memory freed through the wrong deallocator corrupts allocator metadata, enabling heap corruption and arbitrary code execution.',
+    explanation:
+      'Mismatched memory management (CWE-762) occurs when memory allocated by one routine is released by an ' +
+      'incompatible one — for example, pairing malloc() with C++ delete, or returning pool-allocated memory to ' +
+      'the general-purpose heap. Each allocator maintains its own bookkeeping (free lists, chunk headers, pool ' +
+      'bitmaps), so freeing through the wrong path poisons the receiving allocator\'s internal structures with ' +
+      'addresses from a foreign memory region. CVE-2023-45510 (tsMuxer) paired operator new[] with scalar ' +
+      'operator delete, corrupting the heap chunk chain and enabling attacker-controlled writes. A 2024 ' +
+      'llama.cpp Android JNI defect allocated with malloc() and released with C++ delete across builds ' +
+      'b1886–b7445, silently corrupting the C++ allocator\'s free list on every LLM inference call — the bug ' +
+      'persisted for over a year before discovery. The pattern is especially dangerous with slab or pool ' +
+      'allocators: the foreign address lands in a free list whose geometry it does not match, so the next ' +
+      'allocation from that list returns a pointer that overlaps another allocator\'s control metadata, ' +
+      'yielding an arbitrary write primitive. ' +
+      'In the assembly, subl subtracts the heap\'s hdr_size from a pool-allocated address that was never ' +
+      'heap-managed, producing a pointer into the pool\'s own memory region; movl writes this corrupted value ' +
+      'into free_head; the next alloc\'s cmpl sees free_head is nonzero and addl adds hdr_size back — returning ' +
+      'an address that overlaps pool metadata, giving the attacker a write primitive over the pool\'s state.',
+    code:
+`# CVE pattern: pool memory freed through heap deallocator corrupts metadata
+class PoolAlloc:
+    def __init__(self, base, slot_size, count):
+        self.base = base
+        self.slot_size = slot_size
+        self.count = count
+        self.next_free = 0
+        self.guard = base + slot_size * count
+
+    def get_slot(self):
+        addr = self.base + self.next_free * self.slot_size
+        self.next_free += 1
+        return addr
+
+    def release(self, addr):
+        self.next_free -= 1
+        self.guard = addr
+        return self.guard
+
+class HeapAlloc:
+    def __init__(self, base, hdr_size):
+        self.base = base
+        self.hdr_size = hdr_size
+        self.top = base
+        self.free_head = 0
+
+    def alloc(self, size):
+        result = 0
+        if self.free_head > 0:
+            result = self.free_head + self.hdr_size
+            self.free_head = 0
+        else:
+            result = self.top + self.hdr_size
+            self.top += self.hdr_size + size
+        return result
+
+    def dealloc(self, addr):
+        self.free_head = addr - self.hdr_size
+        return self.free_head
+
+pool = PoolAlloc(4096, 64, 16)
+heap = HeapAlloc(1048576, 16)
+slot = pool.get_slot()
+buf = heap.alloc(128)
+wrong = heap.dealloc(slot)
+overlap = heap.alloc(64)
+print(overlap)
+`,
+    badAsm: {
+      patterns: ['subl', 'addl'],
+      description: 'subl subtracts hdr_size from the pool-allocated address passed to dealloc — an address that was never heap-managed — producing a pointer into the pool\'s own memory region; movl stores this corrupted value in free_head; the next alloc\'s cmpl sees free_head is nonzero and addl adds hdr_size back, returning an address that overlaps pool allocator metadata — writes through this pointer give the attacker control over the pool\'s allocation state',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
