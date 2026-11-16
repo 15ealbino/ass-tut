@@ -13,6 +13,7 @@ from typing import Dict, List, Set, Tuple
 
 from app.addressing import analyze_addressing
 from app.asm_glossary import build_asm_glossary
+from app.flags import analyze_flag_effects
 from app.strength import analyze_strength
 from app.cycle_cost import analyze_cycles
 from app.transpiler import TranspileError, build_line_map, transpile
@@ -1106,6 +1107,12 @@ async def compile_python(python_source: str) -> dict:
     # reads first, with the scaled-index form the fingerprint of array access.
     # Independent of the passes above; runs over the same already-mapped asm.
     addressing_summary = analyze_addressing(line_map, asm_lines)
+    # Classify each Python line's instructions by EFLAGS role (set-cmp / set-alu
+    # / use) — the invisible producer→consumer link a conditional jump rides on.
+    # The flag-side complement to the branch-flow and branch-sense passes, which
+    # name the jump but not where the flags it reads were set. Independent of the
+    # passes above; runs over the same already-mapped display asm.
+    flag_summary = analyze_flag_effects(line_map, asm_lines)
     # Plain-English glossary of the distinct mnemonics actually emitted.
     asm_glossary = build_asm_glossary(asm_lines)
     # Source-level arithmetic strength hints: annotate each Python line whose
@@ -1130,6 +1137,7 @@ async def compile_python(python_source: str) -> dict:
         "cycle_summary": cycle_summary,
         "branch_summary": branch_summary,
         "addressing_summary": addressing_summary,
+        "flag_summary": flag_summary,
         "asm_glossary": asm_glossary,
         "strength_summary": strength_summary,
     }
