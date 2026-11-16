@@ -104,6 +104,14 @@ class LineMapping(BaseModel):
     # Counts are of operands; only nonzero modes are present. Empty for the
     # pyghidra pipeline, which computes no per-line addressing map.
     addressing_counts: Dict[str, int] = Field(default_factory=dict)
+    # Immediate-constant map: the distinct NUMERIC immediate values this Python
+    # line's asm embeds (e.g. [3, 42] for a `movl $42` plus a strength-reduced
+    # `sall $3`), sorted ascending. Where addressing_counts counts immediate
+    # operands, this recovers their values — the literals a learner reads off the
+    # disassembly (source constants vs. compiler-synthesised shift counts/masks).
+    # Symbolic/address immediates ($.LC0) are excluded. Empty when the line has no
+    # numeric literals, and empty for the pyghidra pipeline.
+    immediate_values: List[int] = Field(default_factory=list)
 
 
 class Hotspot(BaseModel):
@@ -218,6 +226,19 @@ class AddressingSummary(BaseModel):
     addressing_totals: Dict[str, int] = Field(default_factory=dict)
 
 
+class ImmediateSummary(BaseModel):
+    # Program-wide immediate-constant map: each distinct NUMERIC immediate value
+    # embedded anywhere in the compiled asm, mapped to the number of instructions
+    # that embed it (a value named twice in one instruction counts once), ordered
+    # by value ascending. `distinct` is the number of distinct values. Empty /
+    # zero when the program embeds no numeric literals, and for the pyghidra
+    # pipeline, which computes no per-line immediate map. These are the literal
+    # constants readable straight off the disassembly — source values plus the
+    # compiler-synthesised shift counts and masks of -O0 strength reduction.
+    value_totals: Dict[int, int] = Field(default_factory=dict)
+    distinct: int = 0
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -267,6 +288,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # addressing map).
     addressing_summary: Optional[AddressingSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line
+    # immediate-constant map).
+    immediate_summary: Optional[ImmediateSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
