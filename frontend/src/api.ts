@@ -54,6 +54,11 @@ export interface LineMapping {
   // the compiler strength-reduces (a power-of-two multiply/divide → shift / AND)
   // or cannot (a runtime divisor → a real idiv). Empty when nothing fires.
   strength_hints?: StrengthHint[]
+  // Integer-overflow risk hints: source-level notes for this line whose
+  // multiplication can silently wrap the 32-bit C `int` the transpiler emits —
+  // a runtime × runtime product ("mul-overflow") or an in-place `*=` accumulator
+  // inside a loop ("mul-accumulate"). Empty when nothing fires.
+  overflow_hints?: OverflowHint[]
   // Branch-sense map: how this line's conditional jumps split by sense
   // (signed / unsigned / equality / unconditional / other). Only nonzero senses
   // are present. The signed-vs-unsigned split is the comparison-safety signal.
@@ -96,6 +101,28 @@ export interface StrengthSummary {
   // omitted); hints lists every flagged line, ordered by (py_line, kind).
   hint_totals: Record<string, number>
   hints: StrengthSummaryEntry[]
+}
+
+export interface OverflowHint {
+  // "mul-overflow" | "mul-accumulate" — a stable label for grouping / marking.
+  kind: string
+  // Plain-English note tying the Python multiplication to the 32-bit imul it
+  // becomes and the silent signed-overflow wrap past INT_MAX.
+  message: string
+}
+
+export interface OverflowSummaryEntry {
+  py_line: number
+  kind: string
+  message: string
+}
+
+export interface OverflowSummary {
+  // Program-wide integer-overflow risk hints. risk_totals maps each kind to the
+  // number of lines carrying it (ordered mul-overflow, mul-accumulate; zeros
+  // omitted); risks lists every flagged line, ordered by (py_line, kind).
+  risk_totals: Record<string, number>
+  risks: OverflowSummaryEntry[]
 }
 
 export interface Branch {
@@ -225,6 +252,9 @@ export interface CompileResponse {
   // Source-level arithmetic strength hints (transpile pipeline); null/absent for
   // pyghidra, which has no per-line Python→asm mapping to hang hints off.
   strength_summary?: StrengthSummary | null
+  // Source-level integer-overflow risk hints (transpile pipeline); null/absent
+  // for pyghidra (no per-line Python→asm mapping to hang hints off).
+  overflow_summary?: OverflowSummary | null
 }
 
 export type CompileMethod = 'transpile' | 'pyghidra'

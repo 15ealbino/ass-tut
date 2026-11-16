@@ -14,6 +14,7 @@ from typing import Dict, List, Set, Tuple
 from app.addressing import analyze_addressing
 from app.asm_glossary import build_asm_glossary
 from app.strength import analyze_strength
+from app.overflow import analyze_overflow
 from app.cycle_cost import analyze_cycles
 from app.transpiler import TranspileError, build_line_map, transpile
 
@@ -1114,6 +1115,12 @@ async def compile_python(python_source: str) -> dict:
     # divisor stays a real idiv). Keyed off the Python source (not the asm), so
     # it runs over the same line_map without needing the display asm.
     strength_summary = analyze_strength(line_map, python_source)
+    # Source-level integer-overflow risk hints: flag each Python line whose
+    # multiplication can silently wrap the 32-bit C `int` the transpiler emits —
+    # a runtime × runtime product, or an in-place `*=` accumulator inside a loop
+    # (the factorial/power pattern). Keyed off the Python source (not the asm),
+    # the correctness/security complement to the strength pass's cost lens.
+    overflow_summary = analyze_overflow(line_map, python_source)
 
     return {
         "python_lines": lines,
@@ -1132,4 +1139,5 @@ async def compile_python(python_source: str) -> dict:
         "addressing_summary": addressing_summary,
         "asm_glossary": asm_glossary,
         "strength_summary": strength_summary,
+        "overflow_summary": overflow_summary,
     }
