@@ -14540,6 +14540,80 @@ print(overlap)
       description: 'subl subtracts hdr_size from the pool-allocated address passed to dealloc — an address that was never heap-managed — producing a pointer into the pool\'s own memory region; movl stores this corrupted value in free_head; the next alloc\'s cmpl sees free_head is nonzero and addl adds hdr_size back, returning an address that overlaps pool allocator metadata — writes through this pointer give the attacker control over the pool\'s allocation state',
     },
   },
+  {
+    id: 'kernel-stack-exhaust',
+    name: 'KERNEL STACK EXHAUSTION',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Deeply nested input triggers unbounded stack growth in kernel code, overflowing the tiny fixed-size kernel stack into adjacent slab objects for code execution.',
+    explanation:
+      'Kernel stack exhaustion (CWE-674 / CWE-121) exploits the fact that kernel-mode stacks are tiny ' +
+      'and non-growable: 8KB on x86 (two pages) or 16KB with KASAN. Unlike userspace stacks that grow on ' +
+      'demand via page faults, the kernel stack is a single kmalloc allocation — when it overflows, it ' +
+      'silently corrupts whatever slab object or thread_info structure sits in the adjacent memory. ' +
+      'Each nested function call\'s prologue (push %rbp; sub $N, %rsp) consumes 48–256 bytes of stack; with ' +
+      'deeply nested input — recursive protocol headers, chained netlink attributes, or nested parser states — ' +
+      'as few as 50 frames can exhaust the entire 8KB stack. ' +
+      'CVE-2022-0435 (Linux TIPC, CVSS 8.8) is the critical example: a crafted TIPC packet with more than 64 ' +
+      'nested domain member nodes caused unbounded stack growth in tipc_mon_rcv(), overwriting adjacent kernel ' +
+      'heap objects with attacker-controlled data for remote code execution — the TIPC module only needed to ' +
+      'be loaded, not actively configured. CVE-2024-1151 (Open vSwitch) caused kernel stack overflow via deeply ' +
+      'nested netlink attributes with no depth validation in the OVS kernel module. CVE-2023-52735 (BPF sockmap) ' +
+      'triggered unbounded recursive protocol callbacks that overflowed the kernel stack. ' +
+      'GCC\'s -fstack-clash-protection probes only for large single-frame allocations, not accumulated small ones, ' +
+      'so gradual frame-by-frame growth bypasses it entirely. CONFIG_VMAP_STACK (default since Linux 4.9) maps ' +
+      'the kernel stack with a guard page that detects overflow via page fault — but without it (common on ' +
+      'embedded and older kernels), the overflow is silent and exploitable. Even with VMAP_STACK, the guard page ' +
+      'only turns the exploit into a kernel panic (denial of service), not a safe recovery. ' +
+      'In the assembly, each iteration\'s addl accumulates frame usage against the fixed 8KB stack size; after ' +
+      'enough iterations cmpl shows used > size and the overflow flag is set — the subsequent movl writes ' +
+      '0xDEADBEEF into the adjacent slab object\'s callback field, redirecting the next kernel function pointer ' +
+      'invocation to attacker-chosen code.',
+    code:
+`# CVE pattern: deep nesting overflows fixed 8KB kernel stack into slab
+class KernelStack:
+    def __init__(self, size, guard):
+        self.size = size
+        self.used = 0
+        self.guard = guard
+        self.frame_count = 0
+        self.overflowed = 0
+
+    def push_frame(self, frame_size):
+        self.used += frame_size
+        self.frame_count += 1
+        if self.used > self.size:
+            self.overflowed = 1
+        return self.used
+
+class AdjacentSlab:
+    def __init__(self, handler, data):
+        self.handler = handler
+        self.data = data
+        self.callback = handler
+        self.corrupted = 0
+
+    def invoke(self):
+        result = self.callback + self.data
+        return result
+
+kstack = KernelStack(8192, 4096)
+victim = AdjacentSlab(4196352, 256)
+i = 0
+while i < 48:
+    kstack.push_frame(192)
+    i += 1
+if kstack.overflowed == 1:
+    victim.callback = 3735928559
+    victim.corrupted = 1
+hijacked = victim.invoke()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl', 'movl'],
+      description: 'addl accumulates frame usage (192 bytes per nested call) against the fixed 8KB kernel stack size without depth checking; after 48 frames cmpl shows used > size — the overflow reaches the adjacent slab object\'s stack slots, and movl writes 0xDEADBEEF into the callback field, redirecting the next kernel function pointer invocation to attacker-chosen code',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
