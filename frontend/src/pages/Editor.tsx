@@ -14614,6 +14614,78 @@ print(hijacked)
       description: 'addl accumulates frame usage (192 bytes per nested call) against the fixed 8KB kernel stack size without depth checking; after 48 frames cmpl shows used > size — the overflow reaches the adjacent slab object\'s stack slots, and movl writes 0xDEADBEEF into the callback field, redirecting the next kernel function pointer invocation to attacker-chosen code',
     },
   },
+  {
+    id: 'sysret-escalation',
+    name: 'SYSRET PRIVILEGE ESCALATION',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Non-canonical return address triggers #GP exception during SYSRET while still in ring 0, letting the exception handler run with attacker-controlled stack.',
+    explanation:
+      'SYSRET privilege escalation (CVE-2012-0217 / CWE-264) exploits a subtle Intel CPU hardware behavior: the ' +
+      'SYSRET instruction returns from kernel mode to user mode by loading RIP from RCX, but if RCX contains a ' +
+      'non-canonical address (bits 48–63 do not sign-extend bit 47), the CPU raises a #GP(0) exception BEFORE ' +
+      'transitioning to CPL 3. The exception handler thus executes in ring 0 (kernel mode) but with RSP pointing ' +
+      'to the user-controlled stack frame — the attacker pre-loads this stack with ROP gadgets or shellcode ' +
+      'addresses, achieving kernel-mode code execution from an unprivileged process. Discovered by Rafal Wojtczuk, ' +
+      'the bug affected Xen (XSA-7, guest-to-hypervisor escape), FreeBSD (FreeBSD-SA-12:04), Windows (MS12-042, ' +
+      'local privilege escalation to SYSTEM), and NetBSD. AMD CPUs are immune because AMD\'s SYSRET raises the #GP ' +
+      'in CPL 3 (user mode). Linux had independently fixed the same class in 2006 as CVE-2006-0744. The kernel-side ' +
+      'fix validates RCX canonicality before SYSRET and falls back to the slower IRETQ path, which correctly ' +
+      'switches privilege levels before faulting. A Metasploit module exists for the FreeBSD variant. ' +
+      'In the assembly, movl loads the non-canonical address into the rip slot; cmpl in sysret compares against a ' +
+      'threshold but misses the sign-extension rule — the fault fires in ring 0 and addl in gp_handler combines ' +
+      'the attacker\'s gadget address with CPL 0 privilege, simulating kernel execution on a user-controlled stack.',
+    code:
+`# CVE pattern: non-canonical RIP triggers #GP in ring 0 during SYSRET
+class CPUState:
+    def __init__(self, kernel_rsp):
+        self.kernel_rsp = kernel_rsp
+        self.user_rsp = 0
+        self.cpl = 0
+        self.rip = 0
+        self.faulted = 0
+
+    def load_regs(self, user_rsp, user_rip):
+        self.user_rsp = user_rsp
+        self.rip = user_rip
+        return self.rip
+
+    def sysret(self):
+        if self.rip > 2147483647:
+            self.faulted = 1
+        else:
+            self.cpl = 3
+        return self.cpl
+
+    def gp_handler(self):
+        result = self.user_rsp + self.cpl
+        return result
+
+class Exploit:
+    def __init__(self, gadget_addr):
+        self.gadget = gadget_addr
+        self.stack_pivot = 0
+        self.triggered = 0
+
+    def craft_stack(self, pivot_addr):
+        self.stack_pivot = pivot_addr
+        self.triggered = 1
+        return self.stack_pivot
+
+non_canonical_rip = 2147483648
+cpu = CPUState(4196352)
+exploit = Exploit(3735928559)
+exploit.craft_stack(1342177280)
+cpu.load_regs(exploit.gadget, non_canonical_rip)
+cpu.sysret()
+hijacked = cpu.gp_handler()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl', 'addl'],
+      description: 'movl loads the non-canonical address (0x80000000, representing bit 47 set) into the rip slot; cmpl in sysret compares against the threshold but the CPU\'s canonicality check fires a #GP in ring 0 — addl in gp_handler combines the attacker\'s gadget address (0xDEADBEEF) with CPL 0, simulating kernel-mode execution on the user-controlled stack',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
