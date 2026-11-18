@@ -14686,6 +14686,83 @@ print(hijacked)
       description: 'movl loads the non-canonical address (0x80000000, representing bit 47 set) into the rip slot; cmpl in sysret compares against the threshold but the CPU\'s canonicality check fires a #GP in ring 0 — addl in gp_handler combines the attacker\'s gadget address (0xDEADBEEF) with CPL 0, simulating kernel-mode execution on the user-controlled stack',
     },
   },
+  {
+    id: 'longjmp-hijack',
+    name: 'LONGJMP BUFFER OVERWRITE',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Corrupting a setjmp/longjmp save buffer overwrites the stored program counter, redirecting execution to attacker-chosen code when longjmp restores context.',
+    explanation:
+      'Longjmp buffer overwrite (CWE-121 / CWE-471) exploits the C runtime\'s non-local jump mechanism: ' +
+      'setjmp() snapshots the current register state — including EIP/RIP (the program counter), ESP/RSP, ' +
+      'and EBP/RBP — into a jmp_buf structure, and longjmp() restores it wholesale. If an attacker can ' +
+      'overflow a stack or heap buffer that is adjacent to or overlaps with a jmp_buf, they overwrite the ' +
+      'saved program counter with an arbitrary address. When longjmp() fires, it pops the corrupted EIP ' +
+      'value and jumps directly to the attacker\'s payload — bypassing stack canaries entirely because no ' +
+      'return instruction is involved. ' +
+      'CVE-2013-4788 is the canonical example: glibc\'s PTR_MANGLE macro was supposed to XOR-encrypt ' +
+      'pointers in jmp_buf with a random guard value, but in statically linked binaries the guard was ' +
+      'never initialized (it stayed zero), so mangling was a no-op. This affected all static executables ' +
+      'compiled with glibc 2.4 through 2.17 on every architecture — an attacker could compute the exact ' +
+      'value to write into the jmp_buf to redirect longjmp to any address. The wu-ftpd MAPPING_CHDIR ' +
+      'exploit (CVE-1999-0878, CVSS 10.0) used a similar technique to gain remote root by overwriting a ' +
+      'jmp_buf via crafted directory names. NIST SARD test case 1505 demonstrates the class directly. ' +
+      'Modern glibc hardens jmp_buf with PTR_MANGLE (XOR + rotate), and __longjmp_chk validates that the ' +
+      'target stack frame still exists — but legacy code, embedded systems, and static binaries often lack ' +
+      'these mitigations. ' +
+      'In the assembly, movl stores register snapshots (EBX, ESI, EDI, EBP, ESP, EIP) into the jmp_buf ' +
+      'structure during setjmp; the attacker\'s overflow replaces the saved EIP slot — when longjmp fires, ' +
+      'movl loads the corrupted address into the return target and addl in the restore path combines it ' +
+      'with the attacker\'s chosen offset, landing execution at 0xDEADBEEF (shellcode) without ever hitting ' +
+      'a RET instruction or its stack canary check.',
+    code:
+`# CVE pattern: jmp_buf overflow hijacks saved EIP on longjmp restore
+class JmpBuf:
+    def __init__(self):
+        self.saved_ebx = 0
+        self.saved_esi = 0
+        self.saved_edi = 0
+        self.saved_ebp = 0
+        self.saved_esp = 0
+        self.saved_eip = 0
+
+    def setjmp(self, ebx, esi, edi, ebp, esp, eip):
+        self.saved_ebx = ebx
+        self.saved_esi = esi
+        self.saved_edi = edi
+        self.saved_ebp = ebp
+        self.saved_esp = esp
+        self.saved_eip = eip
+        return 0
+
+    def longjmp(self, val):
+        result = self.saved_eip + val
+        return result
+
+class Exploit:
+    def __init__(self, shellcode_addr):
+        self.target = shellcode_addr
+        self.padding = 0
+        self.triggered = 0
+
+    def overflow_into_jmpbuf(self, buf, fill_bytes):
+        self.padding = fill_bytes
+        buf.saved_eip = self.target
+        self.triggered = 1
+        return buf.saved_eip
+
+buf = JmpBuf()
+buf.setjmp(1, 2, 3, 4196352, 4259840, 4198400)
+exploit = Exploit(3735928559)
+exploit.overflow_into_jmpbuf(buf, 64)
+hijacked = buf.longjmp(1)
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl', 'cmpl'],
+      description: 'movl stores each register snapshot (EBX, ESI, EDI, EBP, ESP, EIP) into the jmp_buf during setjmp; the overflow in overflow_into_jmpbuf replaces the saved_eip slot with 0xDEADBEEF via another movl — when longjmp fires, movl loads the corrupted EIP and addl combines it with the longjmp return value, landing execution at the attacker\'s shellcode address without ever executing a RET or checking a stack canary',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
