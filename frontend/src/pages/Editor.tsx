@@ -14763,6 +14763,79 @@ print(hijacked)
       description: 'movl stores each register snapshot (EBX, ESI, EDI, EBP, ESP, EIP) into the jmp_buf during setjmp; the overflow in overflow_into_jmpbuf replaces the saved_eip slot with 0xDEADBEEF via another movl — when longjmp fires, movl loads the corrupted EIP and addl combines it with the longjmp return value, landing execution at the attacker\'s shellcode address without ever executing a RET or checking a stack canary',
     },
   },
+  {
+    id: 'gofetch-dmp',
+    name: 'GOFETCH DMP SIDE CHANNEL',
+    severity: 'CRITICAL',
+    category: 'Information Disclosure',
+    description: 'Hardware data-memory-dependent prefetcher treats intermediate crypto values as pointers, leaking secret key bits through cache timing.',
+    explanation:
+      'GoFetch exploits the Data Memory-dependent Prefetcher (DMP) found in Apple M1/M2/M3 and some Intel ' +
+      'processors. Unlike classical prefetchers that predict based on access patterns, the DMP examines data ' +
+      'VALUES in memory — if an intermediate value during cryptographic computation resembles a valid pointer ' +
+      '(falls within a mapped address range), the DMP speculatively dereferences it, bringing a new cache line ' +
+      'into L1. An attacker crafts chosen inputs so that the victim\'s constant-time crypto routine produces ' +
+      'pointer-like intermediates ONLY when the attacker\'s key-bit guess is correct. By measuring cache-line ' +
+      'residency via flush+reload or prime+probe, the attacker recovers one bit at a time, extracting full RSA, ' +
+      'Diffie-Hellman, and post-quantum (CRYSTALS-Kyber, CRYSTALS-Dilithium) keys. Presented at USENIX Security ' +
+      '2024, GoFetch won the Pwnie Award for Best Cryptographic Attack. It defeats every constant-time ' +
+      'implementation because the DMP operates below the ISA — no branch or memory-access pattern differs, yet ' +
+      'the prefetcher still leaks through microarchitectural side effects. The flaw is unpatchable in hardware ' +
+      'on M1/M2; on M3, disabling the DIT (Data Independent Timing) bit mitigates it at a performance cost. ' +
+      'In the assembly, movl loads the intermediate product into a register; if that value is pointer-like, the ' +
+      'DMP fires a speculative load whose cache footprint is visible via cmpl-based timing comparisons. The addl ' +
+      'that accumulates recovered bits reveals how many rounds leaked key material.',
+    code:
+`# CVE pattern: DMP prefetcher leaks key bits via pointer-like intermediates
+class CryptoState:
+    def __init__(self, secret_key):
+        self.key = secret_key
+        self.round_val = 0
+        self.bits_exposed = 0
+
+    def mix_round(self, chosen_input, bit_pos):
+        self.round_val = chosen_input * bit_pos
+        self.round_val += self.key
+        return self.round_val
+
+class DmpOracle:
+    def __init__(self, page_base):
+        self.base = page_base
+        self.limit = page_base + 65536
+        self.cache_hit = 0
+        self.recovered = 0
+
+    def check_pointer_like(self, value):
+        result = 0
+        if value >= self.base:
+            if value < self.limit:
+                result = 1
+        return result
+
+    def probe_cache(self, intermediate):
+        self.cache_hit = self.check_pointer_like(intermediate)
+        if self.cache_hit == 1:
+            self.recovered += 1
+        return self.cache_hit
+
+crypto = CryptoState(48879)
+oracle = DmpOracle(16384)
+extracted = 0
+bit = 0
+while bit < 16:
+    guess = 1
+    intermediate = crypto.mix_round(guess, bit)
+    hit = oracle.probe_cache(intermediate)
+    if hit == 1:
+        extracted += 1
+    bit += 1
+print(extracted)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'addl'],
+      description: 'movl loads the intermediate crypto product into a register — if that value falls in a pointer-like range, the DMP fires a speculative dereference whose cache residency is exposed by cmpl timing comparisons; addl accumulating recovered bits shows how many rounds leaked key material',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
