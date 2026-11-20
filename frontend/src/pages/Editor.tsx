@@ -14836,6 +14836,86 @@ print(extracted)
       description: 'movl loads the intermediate crypto product into a register — if that value falls in a pointer-like range, the DMP fires a speculative dereference whose cache residency is exposed by cmpl timing comparisons; addl accumulating recovered bits shows how many rounds leaked key material',
     },
   },
+  {
+    id: 'ioctl-callback-hijack',
+    name: 'IOCTL CALLBACK HIJACK',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'An unvalidated IOCTL handler passes attacker-controlled pointers to a kernel callback, enabling arbitrary kernel function invocation from user space.',
+    explanation:
+      'IOCTL (I/O Control) handlers are the primary interface between user-mode programs and kernel drivers. ' +
+      'When a driver\'s dispatch routine trusts user-supplied buffer contents without validation, an attacker ' +
+      'can inject an arbitrary function pointer that the kernel dereferences and calls at ring 0. ' +
+      'CVE-2024-21338 is the textbook case: Windows\' appid.sys (the AppLocker driver) exposed IOCTL code ' +
+      '0x22A018 whose handler passed a user-controlled pointer through the call chain ' +
+      'AipSmartHashImageFile → AppHashComputeImageHashInternal, invoking it as a kernel callback. The Lazarus ' +
+      'Group exploited this zero-day in the wild to corrupt the PreviousMode field of the calling thread\'s ' +
+      'KTHREAD structure, converting a local-service process into one that can issue kernel-mode system calls. ' +
+      'This gave them an arbitrary kernel read/write primitive without loading any third-party driver — going ' +
+      'beyond the classic BYOVD (Bring Your Own Vulnerable Driver) technique. Avast discovered the live ' +
+      'exploit chain powering an updated FudModule rootkit. Microsoft patched it in February 2024 by adding ' +
+      'an ExGetPreviousMode check to block user-initiated IOCTLs from reaching the callback path. The class ' +
+      'is widespread: CVE-2023-36802 (MSKSSRV.SYS), CVE-2021-21551 (Dell dbutil), and CVE-2020-17382 ' +
+      '(MSI Ambient Link) all share the same root cause — a kernel IOCTL handler that dereferences an ' +
+      'attacker-supplied pointer without validating its origin. ' +
+      'In the assembly, movl loads the attacker-supplied function pointer from the IOCTL input buffer into a ' +
+      'register; call or the indirect-jump equivalent dereferences it at ring 0. The cmpl that was supposed ' +
+      'to validate the pointer range is either missing or checks only part of the address, so the attacker\'s ' +
+      'value passes through unchecked and executes as a kernel callback.',
+    code:
+`# CVE pattern: IOCTL handler trusts user pointer as kernel callback
+class IoctlBuffer:
+    def __init__(self, code, callback_addr):
+        self.ioctl_code = code
+        self.callback_ptr = callback_addr
+        self.buf_size = 0
+        self.status = 0
+
+class KThread:
+    def __init__(self):
+        self.previous_mode = 1
+        self.access_mode = 0
+        self.corrupted = 0
+
+    def set_kernel_mode(self):
+        self.previous_mode = 0
+        self.corrupted = 1
+        return self.previous_mode
+
+class Driver:
+    def __init__(self):
+        self.dispatch_ok = 0
+        self.target_code = 139816
+        self.calls_made = 0
+
+    def validate_ioctl(self, code):
+        result = 0
+        if code == self.target_code:
+            result = 1
+        return result
+
+    def dispatch_ioctl(self, buf, thread):
+        valid = self.validate_ioctl(buf.ioctl_code)
+        if valid == 1:
+            self.calls_made += 1
+            thread.set_kernel_mode()
+            self.dispatch_ok = 1
+        return self.dispatch_ok
+
+driver = Driver()
+thread = KThread()
+payload = IoctlBuffer(139816, 3735928559)
+driver.dispatch_ioctl(payload, thread)
+read_val = 0
+if thread.previous_mode == 0:
+    read_val = payload.callback_ptr
+print(read_val)
+`,
+    badAsm: {
+      patterns: ['movl', 'cmpl', 'call'],
+      description: 'movl loads the attacker-controlled callback pointer from the IOCTL input buffer into a register; cmpl validates only the IOCTL code but never checks the pointer origin — the dispatch path invokes the callback at ring 0, and when it corrupts PreviousMode via movl writing zero to the KTHREAD field, subsequent kernel-mode reads become attacker-controlled',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
