@@ -14916,6 +14916,86 @@ print(read_val)
       description: 'movl loads the attacker-controlled callback pointer from the IOCTL input buffer into a register; cmpl validates only the IOCTL code but never checks the pointer origin — the dispatch path invokes the callback at ring 0, and when it corrupts PreviousMode via movl writing zero to the KTHREAD field, subsequent kernel-mode reads become attacker-controlled',
     },
   },
+  {
+    id: 'vgic-its-escape',
+    name: 'VGIC-ITS VM ESCAPE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Double-put refcount race in KVM\'s vGIC-ITS translation cache frees an IRQ descriptor while the host still references it, enabling guest-to-host kernel code execution.',
+    explanation:
+      'vGIC-ITS VM escape (CWE-911) is a use-after-free in the KVM/arm64 virtual interrupt controller\'s ' +
+      'Interrupt Translation Service (ITS) emulation. When a guest issues GIC MMIO operations that invalidate ' +
+      'the translation cache, vgic_its_invalidate_cache() drops a reference on each cached vgic_irq struct — ' +
+      'but a race condition causes the same entry to be put twice, decrementing the refcount below its true ' +
+      'value. When the refcount reaches zero the host kernel frees the vgic_irq object while other code paths ' +
+      'still hold pointers to it. The guest then triggers those code paths to dereference the freed struct, ' +
+      'reading and writing attacker-controlled data sprayed into the reclaimed slab slot — achieving arbitrary ' +
+      'host kernel read/write from inside a virtual machine. ' +
+      'CVE-2026-46316 ("ITScape", CVSS 9.3) is the first publicly demonstrated guest-to-host escape targeting ' +
+      'KVM/arm64. Researcher Hyunwoo Kim disclosed the flaw on June 10, 2026, with a working proof-of-concept ' +
+      'that escapes to host root from guest EL1 (kernel) privilege via QEMU/KVM. The bug existed from commit ' +
+      '8201d1028caa (April 2024) through 13031fb6b835 (June 2026) — over two years in mainline. The fix ensures ' +
+      'the translation cache drops a reference only for the specific erased entry, not for every entry in an ' +
+      'iteration. Multi-tenant arm64 cloud hosts running untrusted guest VMs are the primary target. ' +
+      'In the assembly, addl decrements the refcount field twice for the same IRQ object inside the invalidation ' +
+      'loop; cmpl sees refcount == 0 and movl zeroes the struct (simulating free) — but invoke_irq\'s addl still ' +
+      'reads from the same stack offset where the guest has sprayed 0xDEADBEEF via slab reclamation, turning the ' +
+      'double-put into host kernel code execution.',
+    code:
+`# CVE pattern: vGIC-ITS double-put frees IRQ — guest escapes to host
+class VgicIrq:
+    def __init__(self, irq_id, handler):
+        self.irq_id = irq_id
+        self.handler = handler
+        self.refcount = 2
+        self.freed = 0
+
+    def get_ref(self):
+        self.refcount += 1
+        return self.refcount
+
+    def put_ref(self):
+        self.refcount -= 1
+        if self.refcount == 0:
+            self.freed = 1
+            self.handler = 0
+        return self.refcount
+
+    def invoke_irq(self):
+        result = self.handler + self.irq_id
+        return result
+
+class TranslationCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.entries = 0
+        self.invalidated = 0
+
+    def add_entry(self, irq):
+        irq.get_ref()
+        self.entries += 1
+        return self.entries
+
+    def invalidate(self, irq):
+        irq.put_ref()
+        irq.put_ref()
+        self.invalidated += 1
+        return self.invalidated
+
+cache = TranslationCache(16)
+irq = VgicIrq(32, 4196352)
+cache.add_entry(irq)
+cache.invalidate(irq)
+irq.handler = 3735928559
+irq.irq_id = 4196608
+hijacked = irq.invoke_irq()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['addl', 'cmpl', 'movl'],
+      description: 'addl decrements the vgic_irq refcount twice inside the invalidation loop (double-put); cmpl sees refcount == 0 and movl zeroes the handler field (simulating kfree) — but invoke_irq\'s addl reads from the same stack offset where the guest has sprayed 0xDEADBEEF via slab reclamation, achieving host kernel code execution from inside a VM',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
