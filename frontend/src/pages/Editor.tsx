@@ -14996,6 +14996,68 @@ print(hijacked)
       description: 'addl decrements the vgic_irq refcount twice inside the invalidation loop (double-put); cmpl sees refcount == 0 and movl zeroes the handler field (simulating kfree) — but invoke_irq\'s addl reads from the same stack offset where the guest has sprayed 0xDEADBEEF via slab reclamation, achieving host kernel code execution from inside a VM',
     },
   },
+  {
+    id: 'csrf-forgery',
+    name: 'CROSS-SITE REQUEST FORGERY',
+    severity: 'CRITICAL',
+    category: 'Injection',
+    description: 'State-changing endpoint processes an authenticated request without validating its origin, letting an attacker forge requests on behalf of a logged-in victim.',
+    explanation:
+      'Cross-Site Request Forgery (CWE-352, ranked #9 in the 2024 CWE Top 25) tricks a victim\'s browser into ' +
+      'submitting a state-changing HTTP request to a vulnerable application while the victim is authenticated. ' +
+      'The browser automatically attaches cookies and session credentials to same-site requests; if the server ' +
+      'validates only the session cookie and not an anti-CSRF token or Origin header, a forged request from an ' +
+      'attacker\'s page is indistinguishable from a legitimate one. The attacker crafts a hidden <form> or fetch() ' +
+      'on their page targeting the victim application\'s endpoint — when the victim visits the attacker\'s page, ' +
+      'the browser fires the request with full credentials attached. ' +
+      'CVE-2019-16759 (vBulletin, CVSS 9.8) combined CSRF with template injection to achieve unauthenticated ' +
+      'RCE on tens of thousands of forum installations — an attacker\'s page triggered the admin\'s browser to ' +
+      'POST a widget template containing PHP code, which the server executed. CVE-2024-27564 (OpenAI ChatGPT) ' +
+      'allowed CSRF-based account takeover by forging requests to the session management endpoint. CVE-2026-69082 ' +
+      '(CTI-Transmute) accepted state-destroying DELETE operations via GET, letting a single image tag in an email ' +
+      'delete all administrative users. SameSite cookie attributes (Lax/Strict) and synchronizer token patterns are ' +
+      'the primary defenses; without them every authenticated endpoint is a CSRF target. ' +
+      'In the assembly, `cmpl` checks only the auth flag (session validity) with no subsequent `cmpl` for a CSRF ' +
+      'token before the state-changing `movl` writes — the missing comparison instruction between the auth check ' +
+      'and the privileged write is the visible manifestation of absent origin validation.',
+    code:
+`# CVE pattern: no anti-CSRF token check — forged request accepted
+class UserSession:
+    def __init__(self, uid, balance):
+        self.uid = uid
+        self.balance = balance
+        self.auth = 1
+        self.token = 305419896
+
+class Endpoint:
+    def __init__(self, limit):
+        self.limit = limit
+        self.transfers = 0
+        self.total_moved = 0
+
+    def transfer(self, session, amount):
+        if session.auth == 1:
+            session.balance -= amount
+            self.total_moved += amount
+            self.transfers += 1
+        return self.transfers
+
+    def get_total(self):
+        result = self.total_moved + self.transfers
+        return result
+
+victim = UserSession(42, 50000)
+ep = Endpoint(10000)
+forged_amount = 9999
+ep.transfer(victim, forged_amount)
+stolen = ep.get_total()
+print(stolen)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks only the session auth flag (1 vs 0) — no second cmpl validates a CSRF token; movl writes the modified balance directly after the auth branch, meaning any authenticated request changes state regardless of origin — an attacker\'s forged cross-origin POST carries the victim\'s cookies and passes the sole auth check',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
