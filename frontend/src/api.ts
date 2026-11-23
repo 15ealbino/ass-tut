@@ -75,6 +75,13 @@ export interface LineMapping {
   // (%gs:/%fs:) mode is the stack-canary access -fstack-protector-strong emits.
   // Counts are of operands; only nonzero modes are present.
   addressing_counts?: Record<string, number>
+  // EFLAGS-effect map: how this line's instructions split by their flag role
+  // ("set-cmp" = a dedicated cmp/test flag setter, "set-alu" = arithmetic that
+  // sets flags as a side effect, "use" = a flag consumer like a conditional
+  // jump / setcc / cmov). Surfaces the invisible EFLAGS dependency a jcc rides
+  // on — the flags it reads carry in no operand. Counts are of instructions;
+  // only nonzero roles are present.
+  flag_effect_counts?: Record<string, number>
 }
 
 export interface StrengthHint {
@@ -190,6 +197,15 @@ export interface AddressingSummary {
   addressing_totals: Record<string, number>
 }
 
+export interface FlagSummary {
+  // Program-wide EFLAGS-effect map: each flag role ("set-cmp" / "set-alu" /
+  // "use") mapped to the number of instructions in that role, in stable display
+  // order with zero roles omitted. In a healthy comparison-driven program
+  // "set-cmp" tracks "use" (each conditional jump has a compare that feeds it);
+  // "set-alu" counts arithmetic that writes flags as a side effect.
+  flag_totals: Record<string, number>
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -220,6 +236,8 @@ export interface CompileResponse {
   branch_summary?: BranchSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
   addressing_summary?: AddressingSummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  flag_summary?: FlagSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
   // Source-level arithmetic strength hints (transpile pipeline); null/absent for

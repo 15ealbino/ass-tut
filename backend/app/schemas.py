@@ -104,6 +104,14 @@ class LineMapping(BaseModel):
     # Counts are of operands; only nonzero modes are present. Empty for the
     # pyghidra pipeline, which computes no per-line addressing map.
     addressing_counts: Dict[str, int] = Field(default_factory=dict)
+    # EFLAGS-effect map: how this line's instructions split by their flag role
+    # ("set-cmp" = a dedicated cmp/test flag setter, "set-alu" = arithmetic that
+    # sets flags as a side effect, "use" = a flag consumer like a conditional
+    # jump / setcc / cmov). Surfaces the invisible EFLAGS dependency a jcc rides
+    # on — the flags it reads carry in no operand. Counts are of instructions;
+    # only nonzero roles are present. Empty for the pyghidra pipeline, which
+    # computes no per-line flag map.
+    flag_effect_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class Hotspot(BaseModel):
@@ -218,6 +226,19 @@ class AddressingSummary(BaseModel):
     addressing_totals: Dict[str, int] = Field(default_factory=dict)
 
 
+class FlagSummary(BaseModel):
+    # Program-wide EFLAGS-effect map: each flag role
+    # ("set-cmp" / "set-alu" / "use") mapped to the number of instructions in
+    # that role, in stable display order with zero roles omitted. Empty when the
+    # program has no flag traffic at all. In a healthy comparison-driven program
+    # "set-cmp" tracks "use" (each conditional jump has a compare that feeds it);
+    # "set-alu" counts arithmetic that writes flags as a side effect — the
+    # instructions that could silently clobber a compare's flags if reordered
+    # between it and its jump. (Distinct from BranchSenseSummary, which names the
+    # jump's signed/unsigned sense, and BranchSummary, which names its direction.)
+    flag_totals: Dict[str, int] = Field(default_factory=dict)
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -267,6 +288,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # addressing map).
     addressing_summary: Optional[AddressingSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line EFLAGS
+    # map).
+    flag_summary: Optional[FlagSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
