@@ -13,6 +13,7 @@ from typing import Dict, List, Set, Tuple
 
 from app.addressing import analyze_addressing
 from app.asm_glossary import build_asm_glossary
+from app.constructs import analyze_constructs
 from app.strength import analyze_strength
 from app.cycle_cost import analyze_cycles
 from app.transpiler import TranspileError, build_line_map, transpile
@@ -1114,6 +1115,11 @@ async def compile_python(python_source: str) -> dict:
     # divisor stays a real idiv). Keyed off the Python source (not the asm), so
     # it runs over the same line_map without needing the display asm.
     strength_summary = analyze_strength(line_map, python_source)
+    # Classify each mapped Python line by construct kind (assign / for / if /
+    # def / return / …) — the near-end-of-pipeline complement to the asm-scan
+    # passes. Keyed off the Python AST (no asm needed); names the statement each
+    # line is, and the frontend pairs that kind with the asm shape it lowers to.
+    construct_summary = analyze_constructs(line_map, python_source)
 
     return {
         "python_lines": lines,
@@ -1132,4 +1138,5 @@ async def compile_python(python_source: str) -> dict:
         "addressing_summary": addressing_summary,
         "asm_glossary": asm_glossary,
         "strength_summary": strength_summary,
+        "construct_summary": construct_summary,
     }

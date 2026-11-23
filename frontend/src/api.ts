@@ -75,6 +75,12 @@ export interface LineMapping {
   // (%gs:/%fs:) mode is the stack-canary access -fstack-protector-strong emits.
   // Counts are of operands; only nonzero modes are present.
   addressing_counts?: Record<string, number>
+  // Construct map: the kind of Python statement this line is — "assign",
+  // "augassign", "for", "while", "if", "funcdef", "classdef", "return", "break",
+  // "continue", "call", "import", or "expr"; empty string when unclassified.
+  // Derived from the Python AST; the frontend pairs the kind with the asm shape
+  // it lowers to (a for → backward jump, an if → forward branch-around, …).
+  construct_kind?: string
 }
 
 export interface StrengthHint {
@@ -190,6 +196,14 @@ export interface AddressingSummary {
   addressing_totals: Record<string, number>
 }
 
+export interface ConstructSummary {
+  // Program-wide construct map: each statement kind ("assign", "for", "if",
+  // "funcdef", …) mapped to the number of mapped Python lines of that kind, in
+  // stable display order with zero kinds omitted. A one-glance read of the
+  // program's structural shape.
+  construct_totals: Record<string, number>
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -225,6 +239,8 @@ export interface CompileResponse {
   // Source-level arithmetic strength hints (transpile pipeline); null/absent for
   // pyghidra, which has no per-line Python→asm mapping to hang hints off.
   strength_summary?: StrengthSummary | null
+  // Construct map (transpile pipeline); null/absent for pyghidra.
+  construct_summary?: ConstructSummary | null
 }
 
 export type CompileMethod = 'transpile' | 'pyghidra'

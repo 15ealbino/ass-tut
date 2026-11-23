@@ -124,6 +124,49 @@ function formatAddressing(counts?: Record<string, number>): string {
   return [...known, ...extra].map(m => `${counts[m]} ${ADDRESSING_LABEL[m] ?? m}`).join(' · ')
 }
 
+// ─── Construct presentation ─────────────────────────────────────────────────
+// Backend classifies each mapped Python line by the statement it IS (assign /
+// for / if / def / return / …), derived from the AST. The value of naming the
+// construct is that each kind lowers to a recognisable asm SHAPE — a for is a
+// backward conditional jump (the loop back-edge), an if is a forward jump
+// around its body (branch-around), a def is a prologue/epilogue — so the label
+// points the eye straight at that shape in the ASM pane. Rendered "3 assign · 1
+// for · 1 if" in the FORM chip; the per-line tooltip adds the asm-shape hint.
+const CONSTRUCT_ORDER = [
+  'funcdef', 'classdef', 'assign', 'augassign', 'for', 'while', 'if',
+  'call', 'return', 'break', 'continue', 'import', 'expr',
+] as const
+const CONSTRUCT_LABEL: Record<string, string> = {
+  funcdef: 'def', classdef: 'class', assign: 'assign', augassign: 'aug-assign',
+  for: 'for', while: 'while', if: 'if', call: 'call', return: 'return',
+  break: 'break', continue: 'continue', import: 'import', expr: 'expr',
+}
+// One-line asm-shape hint per construct — the bridge from the Python keyword to
+// the machine code it becomes, tying this pass to the branch-flow / cost passes.
+const CONSTRUCT_ASM_HINT: Record<string, string> = {
+  funcdef: 'prologue/epilogue — push %ebp … leave; ret',
+  classdef: 'struct layout plus its methods',
+  assign: 'compute, then store to a stack slot',
+  augassign: 'load · compute · store round-trip through one slot',
+  for: 'range loop → a backward conditional jump (the loop back-edge)',
+  while: 'test, then a backward conditional jump',
+  if: 'a forward conditional jump around the body (branch-around)',
+  call: 'push args, call, then read the result',
+  return: 'load the value into %eax, then leave/ret',
+  break: 'an unconditional jump out of the loop',
+  continue: 'a jump back to the loop test',
+  import: 'a C shim — no code of its own at the use site',
+  expr: 'expression evaluated, result discarded',
+}
+function formatConstructTotals(totals?: Record<string, number>): string {
+  if (!totals) return ''
+  const known = CONSTRUCT_ORDER.filter(k => (totals[k] ?? 0) > 0) as string[]
+  const extra = Object.keys(totals)
+    .filter(k => !(CONSTRUCT_ORDER as readonly string[]).includes(k) && totals[k] > 0)
+    .sort()
+  return [...known, ...extra].map(k => `${totals[k]} ${CONSTRUCT_LABEL[k] ?? k}`).join(' · ')
+}
+
 // ─── Cycle-cost presentation ────────────────────────────────────────────────
 // Backend weights each instruction by an approximate relative cycle cost
 // (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
@@ -15891,6 +15934,26 @@ export default function EditorPage() {
               HINTS:: {result.strength_summary.hints.length}
             </span>
           )}
+          {result.construct_summary?.construct_totals && formatConstructTotals(result.construct_summary.construct_totals) && (
+            <span
+              title={`Construct map — the kind of Python statement on each mapped line: ${formatConstructTotals(result.construct_summary.construct_totals)}. Each construct lowers to a recognisable asm shape, so naming it points the eye straight at that shape in the ASM pane: a 'for' becomes a BACKWARD conditional jump (the loop back-edge), an 'if'/'elif' a FORWARD jump around its body (the branch-around), a 'def' a prologue/epilogue (push %ebp … leave; ret), a 'return' loads %eax then returns, a 'break' is an unconditional jump out of the loop. Reading those shapes off a disassembly — loop = backward branch, if/else = forward-around — is a day-one reverse-engineering skill; this chip is the Python-keyword→asm-shape key. Hover a line below for its own shape hint.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              FORM:: {formatConstructTotals(result.construct_summary.construct_totals)}
+            </span>
+          )}
           {result.python_lines.map((line, i) => {
             const pyLine = i + 1
             const mapping = result.line_map[pyLine] as LineMapping | undefined
@@ -15924,6 +15987,9 @@ export default function EditorPage() {
             const addrTitle = formatAddressing(mapping.addressing_counts)
               ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
               : ''
+            const formTitle = mapping.construct_kind
+              ? ` — form: ${CONSTRUCT_LABEL[mapping.construct_kind] ?? mapping.construct_kind}${CONSTRUCT_ASM_HINT[mapping.construct_kind] ? ` (${CONSTRUCT_ASM_HINT[mapping.construct_kind]})` : ''}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -15944,7 +16010,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${formTitle}${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (
