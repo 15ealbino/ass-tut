@@ -15058,6 +15058,79 @@ print(stolen)
       description: 'cmpl checks only the session auth flag (1 vs 0) — no second cmpl validates a CSRF token; movl writes the modified balance directly after the auth branch, meaning any authenticated request changes state regardless of origin — an attacker\'s forged cross-origin POST carries the victim\'s cookies and passes the sole auth check',
     },
   },
+  {
+    id: 'compat-syscall-bypass',
+    name: 'COMPAT SYSCALL BYPASS',
+    severity: 'CRITICAL',
+    category: 'Code Execution',
+    description: 'Dual syscall interfaces on x86-64 let an attacker invoke blocked operations via the legacy int 0x80 path, whose different numbering evades seccomp-BPF sandbox filters.',
+    explanation:
+      'On x86-64 Linux two syscall interfaces coexist: the native syscall instruction uses 64-bit ' +
+      'syscall numbers (e.g. write = 1) while the legacy int 0x80 path uses the 32-bit compat table ' +
+      '(write = 4). Seccomp-BPF filters inspect the syscall number from a single register, but if the ' +
+      'filter only checks the 64-bit numbering, an attacker can invoke the SAME kernel function through ' +
+      'int 0x80 with its different number and bypass the filter entirely. CVE-2015-2830 showed the ' +
+      'Linux kernel\'s TS_COMPAT flag handling let 64-bit tasks issue int 0x80 calls that bypassed ' +
+      'audit and seccomp checks. CVE-2009-0834 was an earlier variant where 32-bit-emulation syscalls ' +
+      'on 64-bit kernels evaded syscall audit rules. On Windows the same principle is called Heaven\'s ' +
+      'Gate: a 64-bit process switches its code segment to 32-bit mode (or vice versa) to call ' +
+      'ntdll syscall stubs the sandbox doesn\'t hook. The x32 ABI (syscall numbers with bit 30 set) ' +
+      'adds a third numbering plane. Modern mitigations require checking SECCOMP_DATA.arch and ' +
+      'filtering all three tables, but many sandboxes still only filter the native 64-bit table.',
+    code: `\
+class SeccompFilter:
+    def __init__(self):
+        self.blocked_64 = 0
+        self.log = 0
+
+    def add_rule(self, nr_64):
+        self.blocked_64 = nr_64
+        self.log = self.log + 1
+
+    def check(self, nr, is_compat):
+        if is_compat == 0:
+            if nr == self.blocked_64:
+                return 0
+        return 1
+
+class SandboxedProc:
+    def __init__(self):
+        self.write_buf = 0
+        self.escaped = 0
+
+    def syscall_64(self, filt, payload):
+        ok = filt.check(1, 0)
+        if ok == 0:
+            print(0)
+            return 0
+        self.write_buf = payload
+        return 1
+
+    def int80_compat(self, filt, payload):
+        ok = filt.check(4, 1)
+        if ok == 0:
+            print(0)
+            return 0
+        self.write_buf = payload
+        self.escaped = 1
+        return 1
+
+seccomp = SeccompFilter()
+seccomp.add_rule(1)
+proc = SandboxedProc()
+blocked = proc.syscall_64(seccomp, 3735928559)
+print(blocked)
+bypassed = proc.int80_compat(seccomp, 3735928559)
+print(bypassed)
+proc.int80_compat(seccomp, 3735928559)
+leaked = proc.write_buf + proc.escaped
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl compares the syscall number against the blocked value (1) — the 64-bit path matches and the branch denies the write; the compat int 0x80 path passes nr=4, cmpl does not match, and movl writes the attacker\'s payload (0xDEADBEEF) into the write buffer — the sandbox is bypassed because the filter only checks 64-bit syscall numbers, not the 32-bit compat table',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
