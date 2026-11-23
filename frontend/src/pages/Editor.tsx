@@ -124,6 +124,22 @@ function formatAddressing(counts?: Record<string, number>): string {
   return [...known, ...extra].map(m => `${counts[m]} ${ADDRESSING_LABEL[m] ?? m}`).join(' · ')
 }
 
+// ─── Immediate-value presentation ───────────────────────────────────────────
+// Where the addressing map COUNTS how many operands are immediates, this names
+// their VALUES: the numeric constants ($5, $100, $-1) each line's asm embeds.
+// Pillar 1 — the literal you typed, traced from source to asm: `x = 5` → `$5`.
+// Pillar 2 — the bound a guard hinges on, read straight off the disassembly:
+// `if i < 100` → `cmpl $99, …` (gcc normalises the bound), so an off-by-one or
+// wrong buffer size is visible; an assignment literal is emitted verbatim.
+// Backend already orders the labels by numeric value ascending (negatives first);
+// Object.entries preserves that insertion order, so no re-sort is needed here.
+function formatImmediateTotals(totals?: Record<string, number>): string {
+  if (!totals) return ''
+  return Object.entries(totals)
+    .map(([label, count]) => (count > 1 ? `${label} ×${count}` : label))
+    .join(' · ')
+}
+
 // ─── Cycle-cost presentation ────────────────────────────────────────────────
 // Backend weights each instruction by an approximate relative cycle cost
 // (divide ~20, multiply/call ~3-4, most staples 1) and sums them per line, so
@@ -15851,6 +15867,26 @@ export default function EditorPage() {
               CYCLES:: {formatCycles(result.cycle_summary.total_cycles)}
             </span>
           )}
+          {result.immediate_summary?.immediate_totals && result.immediate_summary.distinct > 0 && (
+            <span
+              title={`Immediate-value map — the numeric constants the program's asm embeds: ${formatImmediateTotals(result.immediate_summary.immediate_totals)}. Where ADDR:: counts how many operands are immediates, this names their VALUES. Every literal you typed appears as a '$N' immediate — 'x = 5' becomes 'movl $5, …' — so you can trace a constant from Python straight to the assembly; values you did NOT write (a '$0' return, a '$1' loop step) are the compiler's own. The constant a guard compares against is the bound the check hinges on, readable right here — so an off-by-one bound or a buffer size that doesn't match its array stands out (note: gcc normalises a comparison bound, so 'if i < 100' shows as 'cmpl $99, …'; an assignment literal like 'x = 5' is emitted verbatim as '$5'). Symbolic address-of operands ($.LC0, $main) are excluded — these are the numbers, not pointers.`}
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border-mid)',
+                borderRadius: 2,
+                padding: '0 6px',
+                letterSpacing: '0.08em',
+                marginRight: 6,
+                whiteSpace: 'nowrap',
+                fontFamily: 'Fira Code, monospace',
+                cursor: 'help',
+              }}
+            >
+              IMM:: {result.immediate_summary.distinct} VALS
+            </span>
+          )}
           {result.asm_glossary && result.asm_glossary.length > 0 && (
             <span
               title={`Instruction glossary — what each distinct x86 mnemonic in the ASM pane means:\n\n${formatGlossary(result.asm_glossary)}`}
@@ -15924,6 +15960,10 @@ export default function EditorPage() {
             const addrTitle = formatAddressing(mapping.addressing_counts)
               ? ` — addr: ${formatAddressing(mapping.addressing_counts)}`
               : ''
+            const imms = mapping.immediates ?? []
+            const immTitle = imms.length
+              ? ` — imm: ${imms.join(', ')}`
+              : ''
             return (
               <button
                 key={pyLine}
@@ -15944,7 +15984,7 @@ export default function EditorPage() {
                   boxShadow: isActive ? `0 0 6px ${mapping.color}55` : 'none',
                   transition: 'all 0.1s',
                 }}
-                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${branchTitle}${flagTitle}${hintTitle}`}
+                title={`Line ${pyLine}: ${line} — ${count} asm instr${cycTitle}${mixTitle}${regsTitle}${memTitle}${addrTitle}${immTitle}${branchTitle}${flagTitle}${hintTitle}`}
               >
                 L{pyLine}: {line.trim().slice(0, 24)}{line.trim().length > 24 ? '…' : ''}
                 {count > 0 && (

@@ -75,6 +75,12 @@ export interface LineMapping {
   // (%gs:/%fs:) mode is the stack-canary access -fstack-protector-strong emits.
   // Counts are of operands; only nonzero modes are present.
   addressing_counts?: Record<string, number>
+  // Immediate-value map: the distinct NUMERIC immediate constants this line's asm
+  // embeds, as "$N" labels ordered by value ascending (e.g. ["$-1", "$0", "$100"]).
+  // Where addressing_counts.immediate counts how many operands are immediates, this
+  // names their values — the literal you typed, and the bound a cmp tests against,
+  // made readable off the asm. Symbolic address-of operands ($.LC0, $main) excluded.
+  immediates?: string[]
 }
 
 export interface StrengthHint {
@@ -190,6 +196,15 @@ export interface AddressingSummary {
   addressing_totals: Record<string, number>
 }
 
+export interface ImmediateSummary {
+  // Program-wide immediate-value map: each "$N" immediate label mapped to the
+  // number of instructions that reference it, ordered by numeric value ascending
+  // (negatives first). The companion to the addressing map's immediate count —
+  // this names the actual constants. `distinct` is the number of distinct values.
+  immediate_totals: Record<string, number>
+  distinct: number
+}
+
 export interface GlossaryEntry {
   // One distinct x86 mnemonic present in the compiled asm, with a plain-English
   // meaning. `base` is the canonical opcode family; `category` matches the
@@ -220,6 +235,8 @@ export interface CompileResponse {
   branch_summary?: BranchSummary | null
   // Present for the transpile pipeline; absent/null for pyghidra.
   addressing_summary?: AddressingSummary | null
+  // Present for the transpile pipeline; absent/null for pyghidra.
+  immediate_summary?: ImmediateSummary | null
   // Glossary of the distinct mnemonics in the compiled asm (transpile pipeline).
   asm_glossary?: GlossaryEntry[]
   // Source-level arithmetic strength hints (transpile pipeline); null/absent for

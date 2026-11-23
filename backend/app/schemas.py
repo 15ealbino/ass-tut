@@ -104,6 +104,14 @@ class LineMapping(BaseModel):
     # Counts are of operands; only nonzero modes are present. Empty for the
     # pyghidra pipeline, which computes no per-line addressing map.
     addressing_counts: Dict[str, int] = Field(default_factory=dict)
+    # Immediate-value map: the distinct NUMERIC immediate constants this Python
+    # line's assembly embeds, as "$N" labels ordered by value ascending (e.g.
+    # ["$-1", "$0", "$100"]). Where addressing_counts["immediate"] counts how many
+    # operands are immediates, this names their values — the literal you typed made
+    # concrete, and the bound a cmp compares against made readable. Symbolic
+    # address-of operands ($.LC0, $main) are excluded. Empty for the pyghidra
+    # pipeline, which computes no per-line immediate map.
+    immediates: List[str] = Field(default_factory=list)
 
 
 class Hotspot(BaseModel):
@@ -218,6 +226,17 @@ class AddressingSummary(BaseModel):
     addressing_totals: Dict[str, int] = Field(default_factory=dict)
 
 
+class ImmediateSummary(BaseModel):
+    # Program-wide immediate-value map.
+    #   immediate_totals — each "$N" immediate label mapped to the number of
+    #                      instructions that reference it, ordered by numeric value
+    #                      ascending (negatives first). The companion to the
+    #                      addressing map's immediate COUNT: this names the values.
+    #   distinct         — number of distinct immediate values across the program.
+    immediate_totals: Dict[str, int] = Field(default_factory=dict)
+    distinct: int = 0
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -267,6 +286,9 @@ class CompileResponse(BaseModel):
     # Present for the transpile pipeline; None for pyghidra (no per-line
     # addressing map).
     addressing_summary: Optional[AddressingSummary] = None
+    # Present for the transpile pipeline; None for pyghidra (no per-line immediate
+    # map).
+    immediate_summary: Optional[ImmediateSummary] = None
     # Glossary of the distinct mnemonics in the compiled asm. Empty for the
     # pyghidra pipeline, which does not annotate its disassembly.
     asm_glossary: List[GlossaryEntry] = Field(default_factory=list)
