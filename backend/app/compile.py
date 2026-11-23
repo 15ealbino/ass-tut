@@ -13,6 +13,7 @@ from typing import Dict, List, Set, Tuple
 
 from app.addressing import analyze_addressing
 from app.asm_glossary import build_asm_glossary
+from app.loops import analyze_loops
 from app.strength import analyze_strength
 from app.cycle_cost import analyze_cycles
 from app.transpiler import TranspileError, build_line_map, transpile
@@ -1101,6 +1102,11 @@ async def compile_python(python_source: str) -> dict:
     # direction / target) and build the program-wide branch counts. Runs over
     # the same line_map as the other per-line passes; independent of them.
     branch_summary = analyze_branches(line_map, asm_lines)
+    # Recover loop nesting from the back-edges (the backward branches the
+    # branch-flow pass already names) and attach each Python line's loop depth —
+    # the run-count multiplier the cost/cycle passes are missing. Runs over the
+    # same line_map; independent of the passes above.
+    loop_summary = analyze_loops(line_map, asm_lines)
     # Classify each Python line's asm operands by addressing mode (immediate /
     # register / displacement / indexed / direct) — the mode a reverse-engineer
     # reads first, with the scaled-index form the fingerprint of array access.
@@ -1129,6 +1135,7 @@ async def compile_python(python_source: str) -> dict:
         "branch_sense_summary": branch_sense_summary,
         "cycle_summary": cycle_summary,
         "branch_summary": branch_summary,
+        "loop_summary": loop_summary,
         "addressing_summary": addressing_summary,
         "asm_glossary": asm_glossary,
         "strength_summary": strength_summary,
