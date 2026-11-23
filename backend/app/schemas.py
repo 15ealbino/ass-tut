@@ -23,6 +23,17 @@ class StrengthHint(BaseModel):
     message: str
 
 
+class OverflowHint(BaseModel):
+    # One integer-overflow risk hint for a Python line.
+    #   kind    — stable label: "mul-overflow" (a runtime × runtime product) or
+    #             "mul-accumulate" (an in-place `*=` inside a loop).
+    #   message — plain-English note tying the Python multiplication to the 32-bit
+    #             `imul` it becomes, and the silent signed-overflow wrap past
+    #             INT_MAX that Python's arbitrary-precision ints never suffer.
+    kind: str
+    message: str
+
+
 class Branch(BaseModel):
     # One branch instruction as it appears on a single Python line's asm.
     #   mnemonic     — lowercased opcode with any size suffix (e.g. "jle", "jmp")
@@ -76,6 +87,13 @@ class LineMapping(BaseModel):
     # the line has no flagged arithmetic, and empty for the pyghidra pipeline,
     # which computes no per-line hints.
     strength_hints: List[StrengthHint] = Field(default_factory=list)
+    # Integer-overflow risk hints: source-level notes for this Python line whose
+    # multiplication can silently overflow the 32-bit C `int` this transpiler
+    # emits — a runtime × runtime product ("mul-overflow") or an in-place `*=`
+    # accumulator inside a loop ("mul-accumulate"). Empty when the line has no
+    # flagged multiplication, and empty for the pyghidra pipeline, which computes
+    # no per-line hints.
+    overflow_hints: List[OverflowHint] = Field(default_factory=list)
     # Branch-sense map: how this line's conditional jumps split by sense
     # ("signed", "unsigned", "equality", "unconditional", "other") — the
     # signed-vs-unsigned distinction that decides whether a comparison is safe.
@@ -159,6 +177,22 @@ class StrengthSummary(BaseModel):
     #   hints       — every flagged line, ordered by (py_line, kind).
     hint_totals: Dict[str, int] = Field(default_factory=dict)
     hints: List[StrengthHintSummaryEntry] = Field(default_factory=list)
+
+
+class OverflowRiskEntry(BaseModel):
+    # One flagged Python line in the program-wide overflow summary.
+    py_line: int
+    kind: str
+    message: str
+
+
+class OverflowSummary(BaseModel):
+    # Program-wide integer-overflow risk hints.
+    #   risk_totals — each risk kind mapped to the number of lines carrying it,
+    #                 ordered by kind (mul-overflow, mul-accumulate); zeros omitted.
+    #   risks       — every flagged line, ordered by (py_line, kind).
+    risk_totals: Dict[str, int] = Field(default_factory=dict)
+    risks: List[OverflowRiskEntry] = Field(default_factory=list)
 
 
 class BranchSenseSummary(BaseModel):
@@ -273,3 +307,6 @@ class CompileResponse(BaseModel):
     # Source-level arithmetic strength hints for the transpile pipeline; None for
     # pyghidra (no per-line Python→asm mapping to hang hints off).
     strength_summary: Optional[StrengthSummary] = None
+    # Source-level integer-overflow risk hints for the transpile pipeline; None
+    # for pyghidra (no per-line Python→asm mapping to hang hints off).
+    overflow_summary: Optional[OverflowSummary] = None
