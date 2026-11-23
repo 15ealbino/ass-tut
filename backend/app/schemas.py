@@ -104,6 +104,15 @@ class LineMapping(BaseModel):
     # Counts are of operands; only nonzero modes are present. Empty for the
     # pyghidra pipeline, which computes no per-line addressing map.
     addressing_counts: Dict[str, int] = Field(default_factory=dict)
+    # Construct map: the kind of Python statement this line is — "assign",
+    # "augassign", "for", "while", "if", "funcdef", "classdef", "return",
+    # "break", "continue", "call", "import", or "expr". Empty string when the
+    # line is not one of the named statement kinds. Derived from the Python AST
+    # (needs no asm); the frontend pairs the kind with the asm shape it lowers
+    # to. Empty for the pyghidra pipeline, which computes no per-line construct.
+    # (Named construct_kind, not construct, to avoid shadowing pydantic
+    # BaseModel's deprecated `construct` classmethod.)
+    construct_kind: str = ""
 
 
 class Hotspot(BaseModel):
@@ -218,6 +227,15 @@ class AddressingSummary(BaseModel):
     addressing_totals: Dict[str, int] = Field(default_factory=dict)
 
 
+class ConstructSummary(BaseModel):
+    # Program-wide construct map: each statement kind ("assign", "for", "if",
+    # "funcdef", …) mapped to the number of MAPPED Python lines of that kind, in
+    # stable display order with zero kinds omitted. A one-glance summary of the
+    # program's structural shape. Empty for the pyghidra pipeline, which computes
+    # no per-line construct map.
+    construct_totals: Dict[str, int] = Field(default_factory=dict)
+
+
 class GlossaryEntry(BaseModel):
     # One distinct x86 mnemonic present in the compiled asm, with a plain-English
     # meaning. `base` is the canonical opcode family (e.g. "mov"), `category` is
@@ -273,3 +291,6 @@ class CompileResponse(BaseModel):
     # Source-level arithmetic strength hints for the transpile pipeline; None for
     # pyghidra (no per-line Python→asm mapping to hang hints off).
     strength_summary: Optional[StrengthSummary] = None
+    # Construct map for the transpile pipeline; None for pyghidra (no per-line
+    # Python→asm mapping to classify).
+    construct_summary: Optional[ConstructSummary] = None
