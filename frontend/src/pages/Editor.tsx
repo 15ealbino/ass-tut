@@ -15131,6 +15131,83 @@ print(leaked)
       description: 'cmpl compares the syscall number against the blocked value (1) — the 64-bit path matches and the branch denies the write; the compat int 0x80 path passes nr=4, cmpl does not match, and movl writes the attacker\'s payload (0xDEADBEEF) into the write buffer — the sandbox is bypassed because the filter only checks 64-bit syscall numbers, not the 32-bit compat table',
     },
   },
+  {
+    id: 'jit-intrinsic-overflow',
+    name: 'JIT INTRINSIC HEAP OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'A JIT compiler replaces a hot function with a native intrinsic whose size calculation silently diverges from the interpreter, writing past the allocated heap buffer.',
+    explanation:
+      'CVE-2026-114938 (Java4Shell, CVSS 9.8) is a heap-based buffer overflow in OpenJDK\'s HotSpot C2 JIT ' +
+      'compiler, disclosed November 17 2026. When java.util.Base64.Decoder becomes hot, C2 replaces it with ' +
+      'a hand-written AVX-512 VBMI intrinsic. The intrinsic processes input in 64-byte SIMD blocks but ' +
+      'miscalculates the output length when Base64 padding (\'=\' characters) is present: an integer underflow ' +
+      '(CWE-191) causes it to write 62–63 bytes past the allocated output array. The interpreted slow path ' +
+      'handles padding correctly, so the bug only manifests after the method is JIT-compiled — making it ' +
+      'invisible to unit tests that don\'t reach the compilation threshold. Researchers demonstrated RCE by ' +
+      'arranging heap layout so the overflow enlarges an adjacent array\'s length field, giving unbounded ' +
+      'read/write over the Java heap. All x86-64 JDKs from 17.0.6 through 27 were affected if the CPU ' +
+      'supports AVX-512 VBMI. CISA issued an emergency directive on November 17 2026 urging immediate patching. ' +
+      'In the assembly, the intrinsic path uses addl to combine chunk and tail sizes without subtracting ' +
+      'padding, producing a need value larger than the buffer; the subsequent movl writes to the corrupted ' +
+      'offset, clobbering adjacent heap object metadata.',
+    code:
+`# CVE pattern: JIT intrinsic size miscalc → heap overflow (Java4Shell)
+class Buffer:
+    def __init__(self, cap):
+        self.cap = cap
+        self.used = 0
+        self.next_obj = 3735928559
+
+class JitDecoder:
+    def __init__(self):
+        self.hot = 0
+        self.use_fast = 0
+
+    def slow_size(self, in_len, pad):
+        valid = in_len - pad
+        groups = valid / 4
+        out = groups * 3
+        return out
+
+    def fast_size(self, in_len, pad):
+        chunks = in_len / 64
+        tail = in_len - chunks * 64
+        out = chunks * 48 + tail + pad
+        return out
+
+    def decode(self, in_len, pad, buf):
+        self.hot += 1
+        if self.hot > 4:
+            self.use_fast = 1
+        if self.use_fast == 1:
+            need = self.fast_size(in_len, pad)
+        else:
+            need = self.slow_size(in_len, pad)
+        if need > buf.cap:
+            buf.next_obj = 0
+            buf.used = need
+        else:
+            buf.used = need
+        return need
+
+buf = Buffer(72)
+dec = JitDecoder()
+i = 0
+while i < 5:
+    dec.decode(96, 2, buf)
+    i += 1
+result = dec.decode(96, 4, buf)
+print(result)
+print(buf.next_obj)
+overflow = buf.used - buf.cap
+print(overflow)
+`,
+    badAsm: {
+      patterns: ['addl', 'movl'],
+      description: 'addl combines the SIMD chunk count and tail length without subtracting padding — the intrinsic path produces a need value (84) larger than the buffer capacity (72); the subsequent movl writes to the corrupted offset, zeroing the adjacent heap object\'s metadata (next_obj), demonstrating how a JIT compiler can silently introduce a heap overflow absent from the interpreted path',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
