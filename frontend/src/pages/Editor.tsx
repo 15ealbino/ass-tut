@@ -15208,6 +15208,85 @@ print(overflow)
       description: 'addl combines the SIMD chunk count and tail length without subtracting padding — the intrinsic path produces a need value (84) larger than the buffer capacity (72); the subsequent movl writes to the corrupted offset, zeroing the adjacent heap object\'s metadata (next_obj), demonstrating how a JIT compiler can silently introduce a heap overflow absent from the interpreted path',
     },
   },
+  {
+    id: 'refcount-race-uaf',
+    name: 'REFCOUNT RACE UAF',
+    severity: 'CRITICAL',
+    category: 'Race Condition',
+    description: 'Non-atomic reference count decrement races with a concurrent free, leaving a stale pointer to deallocated memory.',
+    explanation:
+      'Refcount race UAF (CWE-362 / CWE-416) arises when a reference-counted object\'s put() path is not ' +
+      'atomic with respect to concurrent threads. Thread A decrements the refcount from 2 to 1 — the object ' +
+      'stays alive — but before A can read from it, Thread B decrements the last reference to 0 and frees ' +
+      'the object. Thread A then dereferences a dangling pointer into freed (or reallocated) memory. ' +
+      'CVE-2024-53186 (Linux ksmbd) exposed this exact pattern: the worker thread decremented r_count on a ' +
+      'connection object, then the waiter thread decremented the last reference and freed the connection — ' +
+      'but the worker still touched the wait queue afterward, triggering a use-after-free. CVE-2025-38349 ' +
+      '(Linux epoll) had the ep refcount dropped while the mutex was still held — another thread could free ' +
+      'the epoll object while the mutex was in use. CVE-2026-53260 (Linux TCP request socket) caused a refcount ' +
+      'underflow via a race in reqsk->rsk_refcnt, leading to a syzbot-detected UAF. A UC Riverside study ' +
+      '(IEEE S&P 2022) found that refcount bugs are among the most exploitable kernel vulnerability classes. ' +
+      'In the assembly, subl decrements r_count and cmpl checks for zero — but no lock prefix or atomic ' +
+      'instruction serializes the decrement-and-test, so a concurrent thread\'s subl can interleave between ' +
+      'the decrement and the conditional branch, freeing the object before the stale addl in read_wq executes.',
+    code:
+`# CVE pattern: refcount race — waiter frees while worker still holds ref
+class SharedConn:
+    def __init__(self, fd, callback):
+        self.fd = fd
+        self.callback = callback
+        self.r_count = 2
+        self.wq_flags = 1
+        self.freed = 0
+
+    def put_ref(self):
+        self.r_count -= 1
+        if self.r_count == 0:
+            self.callback = 0
+            self.fd = 0
+            self.wq_flags = 0
+            self.freed = 1
+        return self.r_count
+
+    def read_wq(self):
+        result = self.callback + self.wq_flags
+        return result
+
+class Worker:
+    def __init__(self, wid):
+        self.wid = wid
+        self.stale_ref = 0
+
+    def drop_ref(self, conn):
+        conn.put_ref()
+        return conn.r_count
+
+    def use_conn(self, conn):
+        self.stale_ref = conn.read_wq()
+        return self.stale_ref
+
+class Waiter:
+    def __init__(self):
+        self.done = 0
+
+    def wake_and_release(self, conn):
+        conn.put_ref()
+        self.done = conn.freed
+        return self.done
+
+conn = SharedConn(3735928559, 4196352)
+worker = Worker(1)
+waiter = Waiter()
+worker.drop_ref(conn)
+waiter.wake_and_release(conn)
+leaked = worker.use_conn(conn)
+print(leaked)
+`,
+    badAsm: {
+      patterns: ['subl', 'cmpl', 'addl'],
+      description: 'subl decrements r_count without a lock prefix — no atomic instruction serializes the decrement-and-test, so a concurrent thread\'s subl can race between the decrement and the cmpl zero-check; after the waiter frees the object (movl zeroes callback and fd), the worker\'s addl in read_wq sums the freed/zeroed fields, completing the use-after-free',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
