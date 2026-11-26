@@ -15287,6 +15287,72 @@ print(leaked)
       description: 'subl decrements r_count without a lock prefix — no atomic instruction serializes the decrement-and-test, so a concurrent thread\'s subl can race between the decrement and the cmpl zero-check; after the waiter frees the object (movl zeroes callback and fd), the worker\'s addl in read_wq sums the freed/zeroed fields, completing the use-after-free',
     },
   },
+  {
+    id: 'elf-loader-bof',
+    name: 'ELF LOADER BUFFER OVERFLOW',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Buffer overflow in the ELF dynamic linker during environment variable parsing overwrites the loader\'s return address before main() executes.',
+    explanation:
+      'ELF loader buffer overflow (CWE-120 / CWE-787) targets the userspace dynamic linker (ld.so) that ' +
+      'runs before every program\'s main() function. The loader processes environment variables like ' +
+      'GLIBC_TUNABLES to configure runtime behavior, but insufficient bounds checking on the parsed ' +
+      'values allows a crafted environment string to overflow a fixed stack buffer inside the loader. ' +
+      'CVE-2023-4911 ("Looney Tunables") demonstrated this devastatingly: a GLIBC_TUNABLES value with ' +
+      'excess tunable entries overflowed the __tunables_init() stack frame in ld-linux-x86-64.so.2, ' +
+      'overwriting the saved return address. Because the loader executes with the elevated privileges ' +
+      'of SUID/SGID binaries, exploiting this single overflow grants immediate root on virtually every ' +
+      'glibc-based Linux distribution. Qualys confirmed exploitation on Fedora 37/38, Ubuntu 22.04/23.04, ' +
+      'and Debian 12/13. The flaw was introduced in glibc 2.34 (April 2021) and went undetected for over ' +
+      'two years. Within days of disclosure, public proof-of-concept exploits appeared for x86-64 and ' +
+      'aarch64. CISA added CVE-2023-4911 to the Known Exploited Vulnerabilities catalog in November 2023, ' +
+      'and the Kinsing malware family was observed exploiting it in cloud environments. ' +
+      'In the assembly, the parse loop\'s cmpl checks against the attacker-supplied tunable count but never ' +
+      'validates it against the buffer\'s allocated capacity — movl inside the loop writes past the buf3 ' +
+      'slot into the adjacent dispatch_addr field, and the loader\'s subsequent movl in execute loads the ' +
+      'corrupted address for dispatch, redirecting execution to attacker-controlled code before main() runs.',
+    code:
+`# CVE pattern: ld.so GLIBC_TUNABLES overflow — overwrites loader return addr
+class Loader:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buf0 = 0
+        self.buf1 = 0
+        self.buf2 = 0
+        self.buf3 = 0
+        self.dispatch_addr = 4196352
+
+    def parse_tunables(self, count, value):
+        i = 0
+        while i < count:
+            if i == 0:
+                self.buf0 = value
+            if i == 1:
+                self.buf1 = value
+            if i == 2:
+                self.buf2 = value
+            if i == 3:
+                self.buf3 = value
+            if i >= self.capacity:
+                self.dispatch_addr = value
+            i += 1
+        return self.dispatch_addr
+
+    def execute(self):
+        result = self.dispatch_addr
+        return result
+
+loader = Loader(4)
+loader.parse_tunables(4, 1094795585)
+loader.parse_tunables(6, 3735928559)
+hijacked = loader.execute()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['cmpl', 'movl'],
+      description: 'cmpl checks the loop index against the attacker-controlled tunable count but never validates against the buffer capacity — movl writes past buf3 into the dispatch_addr stack slot, and execute\'s movl loads the corrupted address for an indirect dispatch, redirecting the loader to attacker code before main() runs',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
