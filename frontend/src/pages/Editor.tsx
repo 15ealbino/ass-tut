@@ -15353,6 +15353,84 @@ print(hijacked)
       description: 'cmpl checks the loop index against the attacker-controlled tunable count but never validates against the buffer capacity — movl writes past buf3 into the dispatch_addr stack slot, and execute\'s movl loads the corrupted address for an indirect dispatch, redirecting the loader to attacker code before main() runs',
     },
   },
+  {
+    id: 'arb-kfree',
+    name: 'ARBITRARY KFREE',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'Attacker forces the kernel to call kfree() on a pointer they control, freeing any in-use object to create a targeted use-after-free for privilege escalation.',
+    explanation:
+      'Arbitrary kfree (CWE-761 / CWE-416 adjacent) is a kernel exploitation primitive where the attacker ' +
+      'forces the kernel to deallocate an object at an address they choose — not just double-freeing the same ' +
+      'chunk, but freeing ANY live kernel object by corrupting the pointer argument to kfree(). The freed object ' +
+      'remains referenced by other kernel subsystems, creating a targeted use-after-free. The attacker then sprays ' +
+      'the freed slab with controlled data (e.g. forged struct cred with uid=0) so the next access through the ' +
+      'dangling reference reads attacker-chosen values — achieving privilege escalation without any control-flow ' +
+      'hijack. The NDSS 2026 paper "DirtyFree" formalized this primitive, identifying 14 arbitrary-free object ' +
+      'types across the Linux kernel v6.8 and successfully exploiting 24 real-world kernel vulnerabilities using ' +
+      'only data-oriented techniques. CVE-2022-1786 (Linux io_uring, CVSS 7.8) provided an arbitrary kfree via ' +
+      'a corrupted io_identity pointer — the attacker freed a live cred struct, sprayed root credentials into the ' +
+      'reclaimed slab, and escalated to root on kernels 5.10 through 5.18. CVE-2022-34918 (Linux nf_tables, ' +
+      'CVSS 7.8) allowed arbitrary kfree through corrupted set element pointers in netfilter, used for container ' +
+      'escape in Kubernetes environments. Unlike double-free which corrupts allocator metadata, arbitrary kfree ' +
+      'targets live objects in security-critical caches (cred_jar, pid_cache, files_cache), making exploitation ' +
+      'more reliable and bypassing allocator hardening like safe-linking. ' +
+      'In the assembly, movl stores the victim cred pointer into the target_ptr field; force_free\'s movl zeroes ' +
+      'the cred data (simulating kfree); spray_root\'s movl writes uid=0 and gid=0 into the same stack offsets — ' +
+      'the subsequent addl in read_cred sums the sprayed values through the stale reference, confirming the ' +
+      'data-only privilege escalation succeeded without touching any function pointer or return address.',
+    code:
+`# CVE pattern: corrupted ptr argument to kfree — frees live cred for root
+class CredStruct:
+    def __init__(self, uid, gid, cap):
+        self.uid = uid
+        self.gid = gid
+        self.cap = cap
+        self.live = 1
+
+    def read_cred(self):
+        result = self.uid + self.gid + self.cap
+        return result
+
+class ArbFreeObj:
+    def __init__(self, target_ptr):
+        self.target_ptr = target_ptr
+        self.freed = 0
+
+    def force_free(self, cred):
+        cred.uid = 0
+        cred.gid = 0
+        cred.cap = 0
+        cred.live = 0
+        self.freed = 1
+        return self.freed
+
+class RootSpray:
+    def __init__(self, spray_count):
+        self.spray_count = spray_count
+        self.sprayed = 0
+
+    def spray_root(self, cred):
+        cred.uid = 0
+        cred.gid = 0
+        cred.cap = 4294967295
+        cred.live = 1
+        self.sprayed += 1
+        return self.sprayed
+
+victim = CredStruct(1000, 1000, 0)
+arb = ArbFreeObj(victim.uid)
+arb.force_free(victim)
+spray = RootSpray(64)
+spray.spray_root(victim)
+escalated = victim.read_cred()
+print(escalated)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores the victim cred\'s uid and gid (1000) into stack slots; force_free\'s movl zeroes all fields simulating kfree on the live object; spray_root\'s movl writes uid=0 and gid=0 with cap=0xFFFFFFFF into the same offsets — addl in read_cred sums the sprayed values through the stale reference, confirming data-only privilege escalation to root without any control-flow hijack',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
