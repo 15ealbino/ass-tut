@@ -15431,6 +15431,81 @@ print(escalated)
       description: 'movl stores the victim cred\'s uid and gid (1000) into stack slots; force_free\'s movl zeroes all fields simulating kfree on the live object; spray_root\'s movl writes uid=0 and gid=0 with cap=0xFFFFFFFF into the same offsets — addl in read_cred sums the sprayed values through the stale reference, confirming data-only privilege escalation to root without any control-flow hijack',
     },
   },
+  {
+    id: 'mptcp-handshake-uaf',
+    name: 'MPTCP HANDSHAKE UAF',
+    severity: 'CRITICAL',
+    category: 'Memory Corruption',
+    description: 'A race condition in the Multipath TCP handshake path allows remote attackers to trigger a use-after-free on socket structures, enabling unauthenticated kernel code execution.',
+    explanation:
+      'The MPTCP Handshake UAF (CVE-2026-98432, CVSS 9.8 Critical) is a remotely exploitable use-after-free in the Linux ' +
+      'kernel\'s IPv4 TCP handshake path when Multipath TCP is enabled. During the three-way handshake the kernel allocates ' +
+      'an mptcp_subflow_context structure tied to the child socket. A race condition between the SYN-ACK retransmit timer ' +
+      'and an incoming RST packet allows the child socket to be freed while the MPTCP path manager still holds a stale ' +
+      'pointer to the subflow context. The attacker sends a carefully timed RST during handshake negotiation, causing the ' +
+      'kernel to free the socket and its associated sk_buff chains. When the MPTCP scheduler next iterates subflows it ' +
+      'dereferences the freed memory — if the attacker has sprayed the reclaimed slab with crafted data (e.g. a forged ' +
+      'function pointer table), execution diverts to attacker-controlled code running in kernel context. This is devastating ' +
+      'because it requires no authentication: any host with an MPTCP listener reachable over the network is vulnerable. ' +
+      'Kernel versions 4.4 through 6.19 are affected. The flaw was independently discovered by multiple research teams and ' +
+      'demonstrated achieving full remote root on default configurations of major distributions. ' +
+      'In the assembly, movl stores the socket state and subflow pointer fields; free_socket\'s movl zeroes the socket data ' +
+      'simulating deallocation during the RST race window; the slab spray\'s movl writes controlled function pointer values ' +
+      'into the reclaimed memory — when deref_subflow reads through the stale pointer with addl, it sums the attacker-planted ' +
+      'values, demonstrating the use-after-free dereference path that leads to remote kernel code execution.',
+    code:
+`# CVE pattern: CVE-2026-98432 MPTCP handshake race UAF
+class Socket:
+    def __init__(self, state, proto):
+        self.state = state
+        self.proto = proto
+        self.refcount = 1
+        self.alive = 1
+
+    def deref_subflow(self):
+        result = self.state + self.proto + self.refcount
+        return result
+
+class SubflowCtx:
+    def __init__(self, sock_ptr, path_id):
+        self.sock_ptr = sock_ptr
+        self.path_id = path_id
+        self.stale = 0
+
+    def free_socket(self, sock):
+        sock.state = 0
+        sock.proto = 0
+        sock.refcount = 0
+        sock.alive = 0
+        self.stale = 1
+        return self.stale
+
+class MptcpSched:
+    def __init__(self, spray_count):
+        self.spray_count = spray_count
+        self.sprayed = 0
+
+    def spray_slab(self, sock):
+        sock.state = 3735928559
+        sock.proto = 3405691582
+        sock.refcount = 1
+        sock.alive = 1
+        self.sprayed += 1
+        return self.sprayed
+
+child = Socket(1, 6)
+subflow = SubflowCtx(child.state, 1)
+subflow.free_socket(child)
+sched = MptcpSched(128)
+sched.spray_slab(child)
+hijacked = child.deref_subflow()
+print(hijacked)
+`,
+    badAsm: {
+      patterns: ['movl', 'addl'],
+      description: 'movl stores socket state (SYN_RECV=1) and proto (TCP=6) into stack slots; free_socket\'s movl zeroes all fields simulating socket deallocation during the RST race; spray_slab\'s movl writes 0xDEADBEEF and 0xCAFEBABE as controlled function pointers into the reclaimed memory — addl in deref_subflow sums the attacker-planted values through the stale subflow pointer, demonstrating the remote kernel code execution path',
+    },
+  },
 ]
 
 // ─── Severity helpers ──────────────────────────────────────────────────────
